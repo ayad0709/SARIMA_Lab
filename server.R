@@ -496,27 +496,139 @@ server <- function(input, output, session) {
   #   list(df = df2, freq = f, by = by, x_label = x_label)
   # })
 
+  # ts_train_test <- reactive({
+  #   p <- prepared()
+  #   df <- p$df
+  # 
+  #   ok <- is.finite(df$y_trans)
+  #   dfm <- df[ok, , drop = FALSE]
+  #   validate(need(nrow(dfm) >= 10, "Not enough valid observations after cleaning."))
+  # 
+  #   train_n <- max(2, floor(nrow(dfm) * as.numeric(input$train_prop)))
+  #   y_tr <- dfm$y_trans[seq_len(train_n)]
+  #   y_te <- if (train_n < nrow(dfm)) dfm$y_trans[(train_n + 1):nrow(dfm)] else numeric(0)
+  # 
+  #   list(
+  #     dfm = dfm,
+  #     train_n = train_n,
+  #     test_n = length(y_te),
+  #     ts_train = ts(y_tr, start = 1, frequency = p$freq),
+  #     ts_test = if (length(y_te) > 0) ts(y_te, start = train_n + 1, frequency = p$freq) else ts(numeric(0), frequency = p$freq)
+  #   )
+  # })
+
+  
+  
+  
+  # ============================================================
+  # --- MOD: Fix Train split = 100% (no test set) bug in ts_train_test() ---
+  # Reason: ts(numeric(0)) is invalid in R ("ts must have at least one observation")
+  # Fix: store ts_test = NULL when there is no test set, and guard all downstream uses.
+  # ============================================================
   ts_train_test <- reactive({
     p <- prepared()
     df <- p$df
-
+    
     ok <- is.finite(df$y_trans)
     dfm <- df[ok, , drop = FALSE]
     validate(need(nrow(dfm) >= 10, "Not enough valid observations after cleaning."))
-
+    
     train_n <- max(2, floor(nrow(dfm) * as.numeric(input$train_prop)))
+    train_n <- min(train_n, nrow(dfm)) # MOD: hard cap so train_n never exceeds n
+    
     y_tr <- dfm$y_trans[seq_len(train_n)]
     y_te <- if (train_n < nrow(dfm)) dfm$y_trans[(train_n + 1):nrow(dfm)] else numeric(0)
-
+    
     list(
       dfm = dfm,
       train_n = train_n,
       test_n = length(y_te),
       ts_train = ts(y_tr, start = 1, frequency = p$freq),
-      ts_test = if (length(y_te) > 0) ts(y_te, start = train_n + 1, frequency = p$freq) else ts(numeric(0), frequency = p$freq)
+      
+      # --- MOD: when test is empty, keep it NULL (do NOT create ts(numeric(0))) ---
+      ts_test = if (length(y_te) > 0) {
+        ts(y_te, start = train_n + 1, frequency = p$freq)
+      } else {
+        NULL
+      }
     )
   })
-
+  
+  # ============================================================
+  # --- MOD: Helper to safely reconstruct the full series (train + test) ---
+  # Used in plots requiring the full observed sample.
+  # ============================================================
+  full_ts <- function(s) {
+    if (!is.null(s$ts_test) && length(s$ts_test) > 0) {
+      ts(
+        c(as.numeric(s$ts_train), as.numeric(s$ts_test)),
+        start = 1,
+        frequency = frequency(s$ts_train)
+      )
+    } else {
+      s$ts_train
+    }
+  }
+  
+  # ============================================================
+  # --- MOD: Replace all "ts(c(train, test))" calls by full_ts(s) ---
+  # This prevents errors when train_prop = 1 (test set absent).
+  # ============================================================
+  
+  output$season_plot <- renderPlot({
+    req(ts_train_test())
+    s <- ts_train_test()
+    x <- full_ts(s) # MOD
+    validate(need(frequency(x) >= 2, "Seasonal plots need frequency >= 2."))
+    forecast::seasonplot(x, s = frequency(x))
+  })
+  
+  output$subseries_plot <- renderPlot({
+    req(ts_train_test())
+    s <- ts_train_test()
+    x <- full_ts(s) # MOD
+    validate(need(frequency(x) >= 2, "Subseries plot needs frequency >= 2."))
+    forecast::ggsubseriesplot(x) + theme_minimal()
+  })
+  
+  output$decomp_add <- renderPlot({
+    req(ts_train_test())
+    s <- ts_train_test()
+    x <- full_ts(s) # MOD
+    validate(need(frequency(x) >= 2, "Decomposition needs frequency >= 2."))
+    validate(need(length(x) >= 2 * frequency(x), "Need at least 2 seasonal cycles."))
+    plot(decompose(x, type = "additive"))
+  })
+  
+  output$decomp_mult <- renderPlot({
+    req(ts_train_test())
+    s <- ts_train_test()
+    x <- full_ts(s) # MOD
+    validate(need(frequency(x) >= 2, "Decomposition needs frequency >= 2."))
+    validate(need(length(x) >= 2 * frequency(x), "Need at least 2 seasonal cycles."))
+    validate(need(all(x > 0, na.rm = TRUE), "Multiplicative decomposition requires strictly positive values."))
+    plot(decompose(x, type = "multiplicative"))
+  })
+  
+  output$diff_suggestion <- renderPrint({
+    req(ts_train_test())
+    s <- ts_train_test()
+    x <- full_ts(s) # MOD
+    d_rec <- tryCatch(forecast::ndiffs(x), error = function(e) NA_integer_)
+    D_rec <- tryCatch(forecast::nsdiffs(x), error = function(e) NA_integer_)
+    cat("Suggested differencing (heuristics):\n")
+    cat("- ndiffs (d):", d_rec, "\n")
+    cat("- nsdiffs (D):", D_rec, "\n")
+  })
+  
+  
+  
+  
+  
+  
+  
+  
+  
   # ---- Step 1 outputs ----
   
   
