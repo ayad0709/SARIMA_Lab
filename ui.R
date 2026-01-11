@@ -29,9 +29,8 @@ ui <- fluidPage(
       fileInput("fileData", "Upload data (CSV/XLSX)", accept = c(".csv", ".xls", ".xlsx")),
       uiOutput("dateColUI"),
       uiOutput("valueColUI"),
-      helpText("Use a Date column and one numeric column."),
 
-      hr(),
+      # hr(),
       h4("B) Time structure"),
       selectInput(
         "frequency", "Seasonal frequency (s)",
@@ -52,15 +51,15 @@ ui <- fluidPage(
       selectInput(
         "missing_policy", "Missing values handling",
         choices = c(
-          "Seasonal interpolation (na.interp)" = "seasonal",
+          "Seasonal interpolation" = "seasonal",
           "Linear interpolation" = "linear",
-          "Carry forward/backward (LOCF)" = "locf",
-          "Drop missing rows (may break spacing)" = "drop"
+          "Carry forward/backward" = "locf",
+          "Drop missing rows" = "drop"
         ),
         selected = "seasonal"
       ),
 
-      hr(),
+      # hr(),
       h4("C) Transform"),
       radioButtons(
         "transform", "Transformation",
@@ -71,14 +70,14 @@ ui <- fluidPage(
         numericInput("lambda", "λ (Box-Cox), NA = auto", value = NA, step = 0.1)
       ),
 
-      hr(),
+      # hr(),
       h4("D) Train split"),
-      sliderInput("train_prop", "Training size", min = 0.10, max = 1.00, value = 0.80, step = 0.01),
-      helpText("When training = 100%: no test set; forecasts extend into the future."),
+      sliderInput("train_prop", "Training size", min = 0.10, max = 1.00, value = 1, step = 0.01),
+      # helpText("When training = 100%: no test set; forecasts extend into the future."),
 
-      hr(),
+      # hr(),
       h4("E) Diagnostics defaults"),
-      numericInput("diag_lag", "Residual test lag (Ljung-Box)", value = 24, min = 1, step = 1),
+      numericInput("diag_lag", "Residual test lag (Ljung-Box)", value = 12, min = 1, step = 1),
       checkboxInput("show_teaching_notes", "Show teaching notes", value = TRUE),
 
       hr(),
@@ -90,7 +89,7 @@ ui <- fluidPage(
       tabsetPanel(
         id = "main_tabs",
         
-        tabPanel("0 — Roadmap",
+        tabPanel("Roadmap",
           tabsetPanel(
             tabPanel(
               title = "Roadmap",
@@ -105,7 +104,7 @@ ui <- fluidPage(
 
         # tabPanel("0 — Roadmap", uiOutput("roadmap_ui")),
 
-        tabPanel("1 — Data & descriptives",
+        tabPanel("1—Descriptives",
           uiOutput("step1_notes"),
           tabsetPanel(
 
@@ -122,7 +121,7 @@ ui <- fluidPage(
           )
         ),
 
-        tabPanel("2 — Exploration",
+        tabPanel("2——",
           uiOutput("step2_notes"),
           tabsetPanel(
             tabPanel("Time series", plotOutput("plot_series", height = 420)),
@@ -145,7 +144,7 @@ ui <- fluidPage(
         # --- ADD: New transformation + diagnostics panel (d, D, log) ---
         
         
-        tabPanel("2 — Exploration", br(),
+        tabPanel("—> Exploration", br(),
                  sidebarLayout(
                    # ======= OUTER SIDEBAR (keeps only data/transformation + stationarity inputs) =======
                    sidebarPanel(
@@ -168,7 +167,15 @@ ui <- fluidPage(
                      
                      numericInput("LagOrderADFd2St", "Lag order (k):", min = 0, step = 1, value = 10),
                      selectInput("alphaSt2", "Significance level (α):",
-                                 choices = c("0.01", "0.05", "0.1"), selected = "0.05")
+                                 choices = c("0.01", "0.05", "0.1"), selected = "0.05"),
+                     
+                     # === NEW: Use training split toggle ===
+                     checkboxInput(
+                       "use_train_explore",
+                       HTML("<b>Use training split (train only)</b>"),
+                       value = FALSE
+                     ),
+                     helpText("Uncheck to use the full series on this tab."),
                      
                      # NOTE: all plot-related controls moved into the Plot (*) tab below
                    ),
@@ -187,7 +194,7 @@ ui <- fluidPage(
                          "Plot (*)",
                          sidebarLayout(
                            sidebarPanel(
-                             width = 3,
+                             width = 2,
                              
                              # tags$strong("Plot type"),
                              selectInput(
@@ -223,8 +230,8 @@ ui <- fluidPage(
                              # hr(),
                              
                              # tags$strong("Plot size (optional)"),
-                             textInput("plot_width",  "Width (e.g., 800 or 100%)",  value = "800"),
-                             textInput("plot_height", "Height (e.g., 500 or 100%)", value = "500"),
+                             textInput("plot_width",  "Width:",  value = "800"),
+                             textInput("plot_height", "Height:", value = "500"),
                             
                              # tags$strong("Theme"),
                              selectInput(
@@ -240,11 +247,13 @@ ui <- fluidPage(
                              
 
                              
-                             hr(),
+                             # hr(),
                              uiOutput("ts_color_ui"),
-                             numericInput("tickSize",
-                                          label = HTML("<span style='color:red;'>Tick size:</span>"),
-                                          min = 6, value = 12),
+                             
+                             # numericInput("tickSize",
+                             #              label = HTML("<span style='color:red;'>Tick size:</span>"),
+                             #              min = 6, value = 12),
+                             
                              # color picker produced server-side
                              
                            ),
@@ -299,7 +308,7 @@ ui <- fluidPage(
         
 
 
-        tabPanel("3 — Decomposition",
+        tabPanel("3—Decomposition",
           uiOutput("step3_notes"),
           tabsetPanel(
             tabPanel("Classical additive", plotOutput("decomp_add", height = 420)),
@@ -309,7 +318,7 @@ ui <- fluidPage(
           )
         ),
 
-        tabPanel("4 — Stationarity & differencing",
+        tabPanel("4—Stationarity",
           uiOutput("step4_notes"),
           sidebarLayout(
             sidebarPanel(
@@ -342,48 +351,141 @@ ui <- fluidPage(
             )
           )
         ),
-
-        tabPanel("5 — Auto-ARIMA (baseline)",
-          uiOutput("step5_notes"),
-          sidebarLayout(
-            sidebarPanel(
-              width = 3,
-              checkboxInput("auto_seasonal", "Allow seasonal terms", value = TRUE),
-              checkboxInput("auto_stepwise", "Stepwise search", value = TRUE),
-              checkboxInput("auto_approx", "Approximation", value = FALSE),
-              checkboxInput("auto_allow_mean", "Allow mean/drift", value = TRUE),
-              numericInput("auto_max_order", "max.order", value = 10, min = 3, step = 1),
-              numericInput("auto_h", "Future horizon h (used when no test set)", value = NA, min = 1, step = 1),
-              actionButton("fit_auto", "Fit Auto-ARIMA", icon = icon("magic"))
-            ),
-            mainPanel(
-              width = 8,
-              tabsetPanel(
-                tabPanel("Model specification", verbatimTextOutput("auto_model_spec"), tableOutput("auto_coef_table")),
-                tabPanel("Diagnostics",
-                  fluidRow(
-                    column(6, plotOutput("auto_resid_ts", height = 240)),
-                    column(6, plotOutput("auto_resid_acf", height = 240))
-                  ),
-                  fluidRow(
-                    column(6, plotOutput("auto_resid_hist", height = 240)),
-                    column(6, plotOutput("auto_resid_qq", height = 240))
-                  ),
-                  verbatimTextOutput("auto_diag_tests")
-                ),
-                tabPanel("Forecast & accuracy",
-                  verbatimTextOutput("auto_horizon_note"),
-                  plotOutput("auto_forecast_plot", height = 420),
-                  tableOutput("auto_accuracy_table"),
-                  tableOutput("auto_forecast_table")
-                ),
-                tabPanel("APA paragraph", verbatimTextOutput("apa_auto_paragraph"))
-              )
-            )
-          )
+        
+        
+        
+        tabPanel("5—Auto-ARIMA",
+                 uiOutput("step5_notes"),
+                 sidebarLayout(
+                   sidebarPanel(
+                     width = 3,
+                     checkboxInput("auto_seasonal", "Allow seasonal terms", value = TRUE),
+                     checkboxInput("auto_stepwise", "Stepwise search", value = TRUE),
+                     checkboxInput("auto_approx", "Approximation", value = FALSE),
+                     checkboxInput("auto_allow_mean", "Allow mean/drift", value = TRUE),
+                     numericInput("auto_max_order", "max.order", value = 10, min = 3, step = 1),
+                     numericInput("auto_h", "Future horizon h (used when no test set)", value = NA, min = 1, step = 1),
+                     actionButton("fit_auto", "Fit Auto-ARIMA", icon = icon("magic"))
+                   ),
+                   mainPanel(
+                     width = 8,
+                     tabsetPanel(
+                       tabPanel(
+                         "Model specification",
+                         verbatimTextOutput("auto_model_spec"),
+                         tableOutput("auto_coef_table")
+                       ),
+                       
+                       
+                       # NEW: Model equation tab (MathJax)
+                       tabPanel(
+                         "Model equation",
+                         withMathJax(
+                           tags$div(
+                             style = "padding: 8px; line-height: 1.4;",
+                             uiOutput("auto_model_equation")
+                           )
+                         )
+                       ),
+                       
+                       
+                       # Renamed to make it clear this tab shows the plots only
+                       tabPanel(
+                         "Diagnostics (plots)",
+                         fluidRow(
+                           column(6, plotOutput("auto_resid_ts", height = 240)),
+                           column(6, plotOutput("auto_resid_acf", height = 240))
+                         ),
+                         fluidRow(
+                           column(6, plotOutput("auto_resid_hist", height = 240)),
+                           column(6, plotOutput("auto_resid_qq",  height = 240))
+                         )
+                         # NOTE: Removed the text report from here – it goes to its own tab below
+                       ),
+                       
+                       
+                       
+                       # NEW: dedicated tab for the academic residual test report
+                       tabPanel(
+                         "Residual tests (text)",
+                         tags$head(tags$style(HTML("
+                              #auto_diag_tests{
+                                height: 745px !important;
+                                max-height: 800px;
+                                width: 100% !important;
+                                white-space: pre;       /* preserve alignment */
+                                overflow-y: auto;
+                                border: 2px solid #cccccc;
+                                font-size: 13px;
+                                padding: 6px;
+                                background-color: #fafafa;
+                              }
+                            "))),
+                         verbatimTextOutput("auto_diag_tests")
+                       ),
+                       
+                       
+                       
+                       tabPanel(
+                         "Forecast & accuracy",
+                         verbatimTextOutput("auto_horizon_note"),
+                         plotOutput("auto_forecast_plot", height = 420),
+                         tableOutput("auto_accuracy_table"),
+                         tableOutput("auto_forecast_table")
+                       ),
+                       
+                       tabPanel(
+                         "APA paragraph",
+                         verbatimTextOutput("apa_auto_paragraph")
+                       )
+                     )
+                   )
+                 )
         ),
+        
+        
 
-        tabPanel("6 — Manual SARIMA (theory-driven)",
+        # tabPanel("5—Auto-ARIMA",
+        #   uiOutput("step5_notes"),
+        #   sidebarLayout(
+        #     sidebarPanel(
+        #       width = 3,
+        #       checkboxInput("auto_seasonal", "Allow seasonal terms", value = TRUE),
+        #       checkboxInput("auto_stepwise", "Stepwise search", value = TRUE),
+        #       checkboxInput("auto_approx", "Approximation", value = FALSE),
+        #       checkboxInput("auto_allow_mean", "Allow mean/drift", value = TRUE),
+        #       numericInput("auto_max_order", "max.order", value = 10, min = 3, step = 1),
+        #       numericInput("auto_h", "Future horizon h (used when no test set)", value = NA, min = 1, step = 1),
+        #       actionButton("fit_auto", "Fit Auto-ARIMA", icon = icon("magic"))
+        #     ),
+        #     mainPanel(
+        #       width = 8,
+        #       tabsetPanel(
+        #         tabPanel("Model specification", verbatimTextOutput("auto_model_spec"), tableOutput("auto_coef_table")),
+        #         tabPanel("Diagnostics",
+        #           fluidRow(
+        #             column(6, plotOutput("auto_resid_ts", height = 240)),
+        #             column(6, plotOutput("auto_resid_acf", height = 240))
+        #           ),
+        #           fluidRow(
+        #             column(6, plotOutput("auto_resid_hist", height = 240)),
+        #             column(6, plotOutput("auto_resid_qq", height = 240))
+        #           ),
+        #           verbatimTextOutput("auto_diag_tests")
+        #         ),
+        #         tabPanel("Forecast & accuracy",
+        #           verbatimTextOutput("auto_horizon_note"),
+        #           plotOutput("auto_forecast_plot", height = 420),
+        #           tableOutput("auto_accuracy_table"),
+        #           tableOutput("auto_forecast_table")
+        #         ),
+        #         tabPanel("APA paragraph", verbatimTextOutput("apa_auto_paragraph"))
+        #       )
+        #     )
+        #   )
+        # ),
+
+        tabPanel("6—Manual",
           uiOutput("step6_notes"),
           sidebarLayout(
             sidebarPanel(
@@ -429,6 +531,7 @@ ui <- fluidPage(
                   )
                 ),
                 
+                
                 tabPanel("Diagnostics",
                   fluidRow(
                     column(6, plotOutput("manual_resid_ts", height = 240)),
@@ -438,21 +541,44 @@ ui <- fluidPage(
                     column(6, plotOutput("manual_resid_hist", height = 240)),
                     column(6, plotOutput("manual_resid_qq", height = 240))
                   ),
-                  verbatimTextOutput("manual_diag_tests")
+                  # verbatimTextOutput("manual_diag_tests"),
+                  
                 ),
+                
+                tabPanel("Residual tests (text)",
+                         tags$head(tags$style(HTML("
+                              #manual_diag_tests{
+                                height: 640px !important;
+                                max-height: 700px;
+                                width: 100% !important;
+                                white-space: pre;
+                                overflow-y: auto;
+                                border: 2px solid #cccccc;
+                                font-size: 13px;
+                              }
+                            "))),
+                         verbatimTextOutput("manual_diag_tests")
+                ),
+                
+                
                 tabPanel("Forecast & accuracy",
                   verbatimTextOutput("manual_horizon_note"),
                   plotOutput("manual_forecast_plot", height = 420),
                   tableOutput("manual_accuracy_table"),
                   tableOutput("manual_forecast_table")
                 ),
+                
+                
+                
+                
+                
                 tabPanel("APA paragraph", verbatimTextOutput("apa_manual_paragraph"))
               )
             )
           )
         ),
 
-        tabPanel("7 — Comparison & Paper builder",
+        tabPanel("7—Compare",
           uiOutput("step7_notes"),
           tabsetPanel(
             tabPanel("Model comparison", tableOutput("comparison_table"), verbatimTextOutput("comparison_interpretation")),
