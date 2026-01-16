@@ -20,6 +20,7 @@ has_pkg <- function(pkg) requireNamespace(pkg, quietly = TRUE)
 
 
 
+
 # ---------- Safety helpers (add once) ----------
 
 is_finite_vec <- function(x) {
@@ -475,9 +476,28 @@ gg_forecast_plot <- function(obs_df, train_n, fc_df, title) {
 #=========================================================================================================
 
 
+pkg_status_li <- function(pkg) {
+  ok <- has_pkg(pkg)
+  tags$li(
+    if (ok) "✅" else "❌",
+    tags$span(
+      paste0(" ", pkg),
+      style = if (ok) "color: #2e7d32;" else "color: #b71c1c;"
+    )
+  )
+}
 
 
-
+# pkg_status_li <- function(pkg) {
+#   ok <- has_pkg(pkg)
+#   tags$li(
+#     tags$span(if (ok) "✅" else "❌", style = "display:inline-block; width: 1.4em;"),
+#     tags$span(
+#       pkg,
+#       style = if (ok) "color:#2e7d32;" else "color:#b71c1c;"
+#     )
+#   )
+# }
 
 
 # ---------------- Shiny server ----------------
@@ -486,24 +506,305 @@ server <- function(input, output, session) {
 
   # ---- Roadmap & teaching notes ----
 
+  # output$roadmap_ui <- renderUI({
+  #   tags$div(
+  #     style = "background:#f7f7f7;padding:12px;border-radius:8px;",
+  #     tags$h4("Roadmap (what students do, what they write)"),
+  #     tags$ol(
+  #       tags$li(tags$b("Describe the data"), ": sample size, missing values, descriptive statistics."),
+  #       tags$li(tags$b("Explore visually"), ": trend/seasonality/outliers; report observations."),
+  #       tags$li(tags$b("Decompose"), ": justify additive vs multiplicative; use STL when robust needed."),
+  #       tags$li(tags$b("Check stationarity"), ": ADF/KPSS/PP; justify differencing (d and D)."),
+  #       tags$li(tags$b("Fit a baseline model"), ": Auto-ARIMA to obtain a strong starting SARIMA."),
+  #       tags$li(tags$b("Fit a theory-driven model"), ": Manual SARIMA using ACF/PACF + tests."),
+  #       tags$li(tags$b("Diagnose & compare"), ": residual tests + forecast accuracy; choose final model."),
+  #       tags$li(tags$b("Write your paper"), ": use APA paragraphs in each step; assemble Methods/Results.")
+  #     )
+  #   )
+  # })
+  
+
+  
+  
+  
+  # Required packages (app will fail without these)
+  output$package_status <- renderPrint({
+    
+    required_pkgs <- c(
+      "shiny",        # app framework
+      "ggplot2",      # all plotting
+      "forecast",     # SARIMA, ACF/PACF, decomposition, BoxCox
+      "lubridate",    # date parsing
+      "zoo",          # na.locf, na.approx, as.yearmon
+      "tseries",      # ADF, Jarque-Bera
+      "urca",         # unit root tests
+      "DT",           # data tables
+      "scales"        # plot scales
+    )
+    
+    optional_pkgs <- c(
+      "readxl",       # only needed for XLS/XLSX upload
+      "colourpicker", # S(t) plot color pickers
+      "patchwork",    # combined plots
+      "gridExtra",    # plot layouts
+      "shinythemes",  # UI theme
+      "shinyjs",      # JS helpers (disable/enable UI)
+      "nortest",      # Anderson–Darling normality test
+      "FinTS"         # ARCH LM test
+    )
+    
+    
+    cat("Package status\n")
+    cat("==============\n\n")
+    
+    cat("Required packages:\n")
+    for (p in required_pkgs) {
+      cat(" -", p, ":", has_pkg(p), "\n")
+    }
+    
+    cat("\nOptional packages:\n")
+    for (p in optional_pkgs) {
+      cat(" -", p, ":", has_pkg(p), "\n")
+    }
+    
+    if (any(!sapply(required_pkgs, has_pkg))) {
+      cat("\n⚠️  Some required packages are missing.\n")
+      cat("Install them with:\n")
+      cat("install.packages(c(",
+          paste0('"', required_pkgs, '"', collapse = ", "),
+          "))\n")
+    } else {
+      cat("\n✅ All required packages are installed.\n")
+    }
+  })
+  
+  
+  
+
+  
+  
+  # output$package_status <- renderPrint({
+  #   
+  #   required_pkgs <- c(
+  #     "shiny", "ggplot2", "forecast", "lubridate", "zoo",
+  #     "tseries", "urca", "DT", "scales"
+  #   )
+  #   
+  #   optional_pkgs <- c(
+  #     "gridExtra", "patchwork", "colourpicker",
+  #     "nortest", "FinTS", "readxl",
+  #     "shinythemes", "shinyjs"
+  #   )
+  #   
+  #   cat("Package status\n")
+  #   cat("==============\n\n")
+  #   
+  #   cat("Required packages:\n")
+  #   for (p in required_pkgs) {
+  #     cat(" -", p, ":", has_pkg(p), "\n")
+  #   }
+  #   
+  #   cat("\nOptional packages:\n")
+  #   for (p in optional_pkgs) {
+  #     cat(" -", p, ":", has_pkg(p), "\n")
+  #   }
+  #   
+  #   if (any(!sapply(required_pkgs, has_pkg))) {
+  #     cat("\n⚠️  Some required packages are missing.\n")
+  #     cat("Install them with:\n")
+  #     cat("install.packages(c(",
+  #         paste0('"', required_pkgs, '"', collapse = ", "),
+  #         "))\n")
+  #   } else {
+  #     cat("\n✅ All required packages are installed.\n")
+  #   }
+  # })
+  
+  
+  
+  
+  
+  # output$roadmap_ui <- renderUI({
+  #   
+  #   required_pkgs <- c(
+  #     "shiny", "ggplot2", "forecast", "lubridate", "zoo",
+  #     "tseries", "urca", "DT", "scales"
+  #   )
+  #   
+  #   optional_pkgs <- c(
+  #     "readxl", "colourpicker", "patchwork", "gridExtra",
+  #     "shinythemes", "shinyjs", "nortest", "FinTS"
+  #   )
+  #   
+  #   tags$div(
+  #     style = "background:#f7f7f7;padding:12px;border-radius:8px;",
+  #     
+  #     tags$h4("\n💡 Roadmap (what students do, what they write)"),
+  #     
+  #     # 🔹 NEW: Package status block
+  #     tags$div(
+  #       style = "margin-bottom:12px;",
+  #       
+  #       tags$b("R environment check"),
+  #       
+  #       tags$ul(
+  #         style = "margin-top:6px;",
+  #         tags$li(tags$b("Required packages 📦")),
+  #         tags$ul(lapply(required_pkgs, pkg_status_li)),
+  #         # tags$li(tags$b("Optional packages ")),
+  #         tags$ul(lapply(optional_pkgs, pkg_status_li))
+  #       )
+  #     ),
+  #     
+  #     tags$hr(),
+  #     
+  #     # 🔹 Existing roadmap content
+  #     tags$ol(
+  #       tags$li(tags$b("Describe the data"), ": sample size, missing values, descriptive statistics."),
+  #       tags$li(tags$b("Explore visually"), ": trend/seasonality/outliers; report observations."),
+  #       tags$li(tags$b("Decompose"), ": justify additive vs multiplicative; use STL when robust needed."),
+  #       tags$li(tags$b("Check stationarity"), ": ADF/KPSS/PP; justify differencing (d and D)."),
+  #       tags$li(tags$b("Fit a baseline model"), ": Auto-ARIMA to obtain a strong starting SARIMA."),
+  #       tags$li(tags$b("Fit a theory-driven model"), ": Manual SARIMA using ACF/PACF + tests."),
+  #       tags$li(tags$b("Diagnose & compare"), ": residual tests + forecast accuracy; choose final model."),
+  #       tags$li(tags$b("Write your paper"), ": use APA paragraphs in each step; assemble Methods/Results.")
+  #     )
+  #   )
+  # })
+  
+  
   output$roadmap_ui <- renderUI({
-    tags$div(
-      style = "background:#f7f7f7;padding:12px;border-radius:8px;",
-      tags$h4("Roadmap (what students do, what they write)"),
-      tags$ol(
-        tags$li(tags$b("Describe the data"), ": sample size, missing values, descriptive statistics."),
-        tags$li(tags$b("Explore visually"), ": trend/seasonality/outliers; report observations."),
-        tags$li(tags$b("Decompose"), ": justify additive vs multiplicative; use STL when robust needed."),
-        tags$li(tags$b("Check stationarity"), ": ADF/KPSS/PP; justify differencing (d and D)."),
-        tags$li(tags$b("Fit a baseline model"), ": Auto-ARIMA to obtain a strong starting SARIMA."),
-        tags$li(tags$b("Fit a theory-driven model"), ": Manual SARIMA using ACF/PACF + tests."),
-        tags$li(tags$b("Diagnose & compare"), ": residual tests + forecast accuracy; choose final model."),
-        tags$li(tags$b("Write your paper"), ": use APA paragraphs in each step; assemble Methods/Results.")
+    
+    required_pkgs <- c(
+      "shiny", "ggplot2", "forecast", "lubridate", "zoo",
+      "tseries", "urca", "DT", "scales"
+    )
+    
+    optional_pkgs <- c(
+      "readxl", "colourpicker", "patchwork", "gridExtra",
+      "shinythemes", "shinyjs", "nortest", "FinTS"
+    )
+    
+    # Helper for roadmap items with icons
+    step_li <- function(ic, title_bold, rest_text) {
+      tags$li(
+        tags$span(icon(ic), style = "margin-right:8px; color:#2c3e50;"),
+        tags$b(title_bold),
+        HTML(paste0(": ", rest_text))
       )
+    }
+    
+    tags$div(
+      
+      # =========================
+      # Box 1: Roadmap steps
+      # =========================
+      tags$div(
+        style = "background:#f7f7f7;padding:12px;border-radius:8px;margin-bottom:10px;",
+        tags$h4("Roadmap (what students do, what they write)"),
+        tags$ol(
+          step_li("database",      "Describe the data",   "sample size, missing values, descriptive statistics."),
+          step_li("chart-line",    "Explore visually",    "trend/seasonality/outliers; report observations."),
+          step_li("layer-group",   "Decompose",           "justify additive vs multiplicative; use STL when robust needed."),
+          step_li("check-circle",  "Check stationarity",  "ADF/KPSS/PP; justify differencing (d and D)."),
+          step_li("robot",         "Fit a baseline model","Auto-ARIMA to obtain a strong starting SARIMA."),
+          step_li("sliders-h",     "Fit a theory-driven model","Manual SARIMA using ACF/PACF + tests."),
+          step_li("stethoscope",   "Diagnose & compare",  "residual tests + forecast accuracy; choose final model."),
+          step_li("file-alt",      "Write your paper",    "use APA paragraphs in each step; assemble Methods/Results.")
+        ),
+        tags$br(),
+      ),
+      
+      # =========================
+      # Box 2: Package status (below roadmap)
+      # =========================
+      tags$div(
+        style = "background:#eef5ff;padding:12px;border-radius:8px;",
+        tags$h4("R environment check"),
+        tags$p(
+          style = "margin-top:-6px; font-size: 13px; color:#34495e;",
+          "✅ installed  •  ❌ missing"
+        ),
+        
+        tags$br(),
+        
+        fluidRow(
+          
+          # =========================
+          # LEFT: Required packages
+          # =========================
+          column(
+            width = 2,
+            tags$b("Required packages"),
+            tags$ul(lapply(required_pkgs, pkg_status_li))
+          ),
+          
+          # =========================
+          # RIGHT: Optional packages
+          # =========================
+          column(
+            width = 2,
+            tags$b("Optional packages"),
+            tags$ul(lapply(optional_pkgs, pkg_status_li))
+          )
+        ),
+        
+        # Optional warning if required packages missing
+        if (any(!vapply(required_pkgs, has_pkg, logical(1)))) {
+          tags$div(
+            style = "margin-top:10px; color:#b71c1c; font-size:13px;",
+            tags$b("Some required packages are missing."),
+            tags$div("Install with:"),
+            tags$pre(
+              style = "background:white; padding:8px; border-radius:6px;",
+              paste0(
+                "install.packages(c(",
+                paste0('"', required_pkgs, '"', collapse = ", "),
+                "))"
+              )
+            )
+          )
+        } else NULL
+      )
+      
+      
+      
+      # tags$div(
+      #   style = "background:#eef5ff;padding:12px;border-radius:8px;",
+      #   tags$h4("R environment check"),
+      #   tags$p(
+      #     style = "margin-top:-6px; font-size: 13px; color:#34495e;",
+      #     "✅ installed  •  ❌ missing"
+      #   ),
+      #   
+      #   tags$b("Required packages"),
+      #   tags$ul(lapply(required_pkgs, pkg_status_li)),
+      #   
+      #   tags$b("Optional packages"),
+      #   tags$ul(lapply(optional_pkgs, pkg_status_li)),
+      #   
+      #   # Optional install hint (only if required missing)
+      #   if (any(!vapply(required_pkgs, has_pkg, logical(1)))) {
+      #     tags$div(
+      #       style = "margin-top:10px; color:#b71c1c; font-size: 13px;",
+      #       tags$b("Some required packages are missing."),
+      #       tags$div("Install with:"),
+      #       tags$pre(
+      #         style = "background:white; padding:8px; border-radius:6px;",
+      #         paste0(
+      #           "install.packages(c(",
+      #           paste0('"', required_pkgs, '"', collapse = ", "),
+      #           "))"
+      #         )
+      #       )
+      #     )
+      #   } else NULL
+      # )
     )
   })
   
-
+  
+  
   note_box <- function(items) {
     if (!isTRUE(input$show_teaching_notes)) return(NULL)
     tags$div(
@@ -1191,7 +1492,7 @@ server <- function(input, output, session) {
     tagList(
       if (is_liney) tagList(
         colourpicker::colourInput("stp_line_color", "Line color", value = "#2C7FB8", allowTransparent = FALSE),
-        sliderInput("stp_line_width", "Line width", min = 0.2, max = 4, value = 1, step = 0.1)
+        sliderInput("stp_line_width", "Line width", min = 0.1, max = 5, value = 0.9, step = 0.1)
       ),
       if (is_pointy) tagList(
         colourpicker::colourInput("stp_point_color", "Point color", value = "#2C7FB8", allowTransparent = FALSE),
@@ -5047,24 +5348,36 @@ server <- function(input, output, session) {
         tags$h5("Estimated coefficients"),
         tags$ul(lapply(eq$coef_lines, function(x) tags$li(HTML(x)))),
         
+        tags$br(),
+        tags$hr(),
         tags$hr(),
         
         tags$h4("General SARIMA formulation"),
         HTML(eq$eq_general),
         
+        tags$br(),
+        tags$hr(),
         tags$hr(),
         
         tags$h4("Expanded operator form"),
         HTML(eq$eq_expanded),
         
+        tags$br(),
+        tags$hr(),
         tags$hr(),
         
         tags$h4("Numerical model"),
         HTML(eq$eq_line3),
+        
+        tags$br(),
         tags$hr(),
+        tags$hr(),,
         
         # HTML("\\[\\text{------------}\\]"),
         HTML(eq$eq_line4),
+        
+        tags$br(),
+        tags$hr(),
         tags$hr(),
         
       ),
@@ -5623,16 +5936,37 @@ server <- function(input, output, session) {
       ),
       tags$div(
         style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;text-align:left;",
-        tags$h5("General SARIMA formulation"),
+        
+        tags$br(),
+        tags$hr(),
+        tags$hr(),
+        
+        tags$h5("General SARIMA formulation:"),
         HTML(eq$eq_general),
+        
+        tags$br(),
         tags$hr(),
-        tags$h5("Expanded operator form"),
+        tags$hr(),
+        
+        tags$h5("Expanded operator form:"),
         HTML(eq$eq_expanded),
+        
+        tags$br(),
         tags$hr(),
-        tags$h5("Numerical model"),
+        tags$hr(),
+        
+        tags$h5("Numerical model:"),
         HTML(eq$eq_line3),
+        
+        tags$br(),
         tags$hr(),
-        HTML(eq$eq_line4)
+        tags$hr(),
+        
+        HTML(eq$eq_line4),
+        
+        tags$br(),
+        tags$hr(),
+        tags$hr(),
       ),
       
       tags$h4("5. Residual diagnostics (adequacy of linear dynamics)"),
@@ -11389,6 +11723,63 @@ server <- function(input, output, session) {
   })
   
   
+  # ---- Manual SARIMA: Original-scale plot (observed + forecast + CIs) ----
+  output$manual_forecast_plot_original <- renderPlot({
+    req(manual_fc(), ts_train_test(), prepared())
+    
+    s <- ts_train_test()
+    p <- prepared()
+    fc <- manual_fc()$fc
+    
+    # observed series on ORIGINAL scale
+    validate(need("y_filled" %in% names(s$dfm), "Column y_filled not found in ts_train_test()$dfm."))
+    obs_df <- s$dfm[, c("x", "y_filled")]
+    names(obs_df) <- c("x", "y")
+    
+    # build forecast df (x alignment) from existing helper, then back-transform values
+    fc_df <- plot_forecast_df(obs_df, s$train_n, fc, by = p$by)
+    
+    # inverse transform helper (must match your global transform choice)
+    inv <- function(z) {
+      tr <- input$transform %||% "none"
+      z <- as.numeric(z)
+      
+      if (tr == "none") return(z)
+      
+      if (tr == "log") {
+        return(exp(z))
+      }
+      
+      if (tr == "boxcox") {
+        y0 <- prepared()$df$y_filled
+        validate(need(all(y0 > 0, na.rm = TRUE), "Box-Cox inverse requires strictly positive original values."))
+        
+        lam <- input$lambda
+        if (is.null(lam) || (length(lam) == 1 && is.na(lam))) {
+          lam <- forecast::BoxCox.lambda(y0, method = "guerrero")
+        } else {
+          lam <- as.numeric(lam)
+        }
+        return(forecast::InvBoxCox(z, lam))
+      }
+      
+      z
+    }
+    
+    # back-transform forecast mean + intervals
+    fc_df$mean <- inv(fc_df$mean)
+    if ("lo80" %in% names(fc_df)) fc_df$lo80 <- inv(fc_df$lo80)
+    if ("hi80" %in% names(fc_df)) fc_df$hi80 <- inv(fc_df$hi80)
+    if ("lo95" %in% names(fc_df)) fc_df$lo95 <- inv(fc_df$lo95)
+    if ("hi95" %in% names(fc_df)) fc_df$hi95 <- inv(fc_df$hi95)
+    
+    gg_forecast_plot(
+      obs_df, s$train_n, fc_df,
+      title = "Manual SARIMA forecast (original scale)"
+    )
+  })
+  
+  
 
   output$manual_forecast_table <- renderTable({ req(manual_fc()); head(forecast_table(manual_fc()$fc), 25) }, rownames = FALSE)
 
@@ -12734,6 +13125,1200 @@ server <- function(input, output, session) {
   
   
   
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # # ------------------------------------------------------------
+  # # (B) manual_conclusion_full_obj (eventReactive) — UI builder ONLY
+  # # ------------------------------------------------------------
+  # manual_conclusion_full_obj <- eventReactive(input$fit_manual, {
+  #   req(manual_fit(), manual_fc(), manual_equations(), ts_train_test())
+  #   
+  #   fit <- manual_fit()
+  #   fc0 <- manual_fc()
+  #   fc  <- fc0$fc
+  #   eq  <- manual_equations()
+  #   s   <- ts_train_test()
+  #   
+  #   # ---------- helpers (local + safe)
+  #   fmt_num_local <- function(x, d = 3) {
+  #     if (length(x) == 0 || all(is.na(x))) return("NA")
+  #     x <- suppressWarnings(as.numeric(x[1]))
+  #     if (!is.finite(x)) return("NA")
+  #     formatC(x, format = "f", digits = d)
+  #   }
+  #   fmt_p_local <- function(p) {
+  #     if (length(p) == 0 || all(is.na(p))) return("NA")
+  #     p <- suppressWarnings(as.numeric(p[1]))
+  #     if (!is.finite(p)) return("NA")
+  #     if (p < .001) "&lt; .001" else sprintf("= %.3f", p)
+  #   }
+  #   sig_stars <- function(p) {
+  #     p <- suppressWarnings(as.numeric(p))
+  #     if (!is.finite(p)) return("")
+  #     if (p < .001) "***" else if (p < .01) "**" else if (p < .05) "*" else if (p < .10) "†" else ""
+  #   }
+  #   safe_len <- function(x) if (is.null(x)) 0L else length(x)
+  #   
+  #   html_table <- function(df) {
+  #     if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+  #       return(tags$em("Table unavailable."))
+  #     }
+  #     tags$table(
+  #       class = "table table-striped table-condensed",
+  #       tags$thead(tags$tr(lapply(names(df), function(nm) tags$th(nm)))),
+  #       tags$tbody(
+  #         lapply(seq_len(nrow(df)), function(i) {
+  #           tags$tr(lapply(df[i, , drop = FALSE], function(cell) tags$td(HTML(as.character(cell)))))
+  #         })
+  #       )
+  #     )
+  #   }
+  #   
+  #   # ---------- sample sizes (safe)
+  #   n_train <- suppressWarnings(as.integer(s$train_n))
+  #   if (!is.finite(n_train) || n_train < 1) n_train <- tryCatch(length(residuals(fit)), error = function(e) 0L)
+  #   
+  #   n_test <- suppressWarnings(as.integer(s$test_n))
+  #   if (!is.finite(n_test) || n_test < 0) n_test <- 0L
+  #   
+  #   N <- n_train + n_test
+  #   
+  #   # ---------- lag choice (safe)
+  #   L_in <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_in) && L_in > 0) L_in else 12L
+  #   
+  #   # ============================================================
+  #   # ---------- IC (safe + robust AICc fallback)
+  #   # ============================================================
+  #   AIC_val <- suppressWarnings(tryCatch(as.numeric(stats::AIC(fit)), error = function(e) NA_real_))
+  #   BIC_val <- suppressWarnings(tryCatch(as.numeric(stats::BIC(fit)), error = function(e) NA_real_))
+  #   
+  #   AICc_val <- suppressWarnings(tryCatch(as.numeric(forecast::AICc(fit)), error = function(e) NA_real_))
+  #   
+  #   if (!is.finite(AICc_val) && is.finite(AIC_val)) {
+  #     n_fit <- suppressWarnings(tryCatch(stats::nobs(fit), error = function(e) NA_integer_))
+  #     if (!is.finite(n_fit) || n_fit <= 0) {
+  #       r <- suppressWarnings(tryCatch(as.numeric(residuals(fit)), error = function(e) numeric(0)))
+  #       n_fit <- sum(is.finite(r))
+  #     }
+  #     if (!is.finite(n_fit) || n_fit <= 0) n_fit <- n_train
+  #     
+  #     k <- suppressWarnings(tryCatch(length(stats::coef(fit)), error = function(e) NA_integer_))
+  #     if (!is.finite(k) || k < 0) k <- 0L
+  #     k <- k + 1L
+  #     
+  #     if (is.finite(n_fit) && n_fit > (k + 1)) {
+  #       AICc_val <- AIC_val + (2 * k * (k + 1)) / (n_fit - k - 1)
+  #     } else {
+  #       AICc_val <- NA_real_
+  #     }
+  #   }
+  #   
+  #   ic_df <- data.frame(
+  #     Criterion = c("AIC", "AICc", "BIC"),
+  #     Value     = c(fmt_num_local(AIC_val, 2), fmt_num_local(AICc_val, 2), fmt_num_local(BIC_val, 2)),
+  #     check.names = FALSE
+  #   )
+  #   
+  #   # ---------- coefficients + significance (robust)
+  #   est <- suppressWarnings(tryCatch(stats::coef(fit), error = function(e) NULL))
+  #   V   <- suppressWarnings(tryCatch(stats::vcov(fit), error = function(e) NULL))
+  #   if (is.null(V)) V <- suppressWarnings(tryCatch(fit$var.coef, error = function(e) NULL))
+  #   
+  #   coef_df <- NULL
+  #   if (!is.null(est) && length(est) > 0) {
+  #     est <- as.numeric(est)
+  #     nm  <- names(stats::coef(fit))
+  #     if (is.null(nm)) nm <- paste0("param_", seq_along(est))
+  #     
+  #     se <- rep(NA_real_, length(est))
+  #     if (!is.null(V)) {
+  #       dV <- tryCatch(diag(V), error = function(e) rep(NA_real_, length(est)))
+  #       if (length(dV) == length(est)) se <- sqrt(pmax(dV, 0))
+  #     }
+  #     z  <- est / se
+  #     p  <- 2 * stats::pnorm(-abs(z))
+  #     
+  #     coef_df <- data.frame(
+  #       Term     = nm,
+  #       Estimate = sprintf("%.6f", est),
+  #       SE       = ifelse(is.finite(se), sprintf("%.6f", se), "NA"),
+  #       `z/t`    = ifelse(is.finite(z),  sprintf("%.3f",  z),  "NA"),
+  #       `p`      = ifelse(is.finite(p),  sprintf("%.3f",  p),  "NA"),
+  #       Sig      = vapply(p, sig_stars, character(1)),
+  #       check.names = FALSE
+  #     )
+  #   }
+  #   
+  #   n_sig <- if (!is.null(coef_df)) sum(suppressWarnings(as.numeric(coef_df$p)) < 0.05, na.rm = TRUE) else 0L
+  #   
+  #   # ---------- residuals (safe)
+  #   res <- suppressWarnings(tryCatch(as.numeric(residuals(fit)), error = function(e) numeric(0)))
+  #   res <- res[is.finite(res)]
+  #   n_res <- length(res)
+  #   
+  #   fitdf <- if (!is.null(est)) length(est) else 0L
+  #   
+  #   lb_lag <- min(L, max(1L, floor(n_res / 3)))
+  #   lb <- if (n_res >= 5) {
+  #     tryCatch(stats::Box.test(res, lag = lb_lag, type = "Ljung-Box", fitdf = fitdf), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   bp <- if (n_res >= 5) {
+  #     tryCatch(stats::Box.test(res, lag = lb_lag, type = "Box-Pierce", fitdf = fitdf), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   jb <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 5) {
+  #     tryCatch(tseries::jarque.bera.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   sw <- if (n_res >= 3 && n_res <= 5000) {
+  #     tryCatch(stats::shapiro.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   arch <- if (requireNamespace("FinTS", quietly = TRUE) && n_res >= 10) {
+  #     tryCatch(FinTS::ArchTest(res, lags = min(12L, max(1L, floor(L / 2)))), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   runs <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 10) {
+  #     tryCatch(tseries::runs.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   ad <- if (requireNamespace("nortest", quietly = TRUE) && n_res >= 8) {
+  #     tryCatch(nortest::ad.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   test_rows <- list()
+  #   add_test <- function(name, stat, pval, note = "") {
+  #     test_rows[[length(test_rows) + 1L]] <<- data.frame(
+  #       Test = name,
+  #       Statistic = if (is.null(stat)) "NA" else fmt_num_local(stat, 3),
+  #       `p-value` = if (is.null(pval)) "NA" else fmt_p_local(pval),
+  #       Interpretation = note,
+  #       check.names = FALSE
+  #     )
+  #   }
+  #   
+  #   add_test(
+  #     "Ljung–Box (residuals)",
+  #     if (!is.null(lb)) unname(lb$statistic) else NULL,
+  #     if (!is.null(lb)) unname(lb$p.value) else NULL,
+  #     if (!is.null(lb)) {
+  #       if (is.finite(lb$p.value) && lb$p.value >= 0.05) "No evidence of remaining autocorrelation (white-noise compatible)."
+  #       else "Evidence of remaining autocorrelation (model may be under-specified)."
+  #     } else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "Box–Pierce (residuals)",
+  #     if (!is.null(bp)) unname(bp$statistic) else NULL,
+  #     if (!is.null(bp)) unname(bp$p.value) else NULL,
+  #     if (!is.null(bp)) {
+  #       if (is.finite(bp$p.value) && bp$p.value >= 0.05) "Consistent with uncorrelated residuals."
+  #       else "Suggests residual autocorrelation."
+  #     } else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "Jarque–Bera (normality)",
+  #     if (!is.null(jb)) unname(jb$statistic) else NULL,
+  #     if (!is.null(jb)) unname(jb$p.value) else NULL,
+  #     if (!is.null(jb)) {
+  #       if (is.finite(jb$p.value) && jb$p.value >= 0.05) "No evidence against normality."
+  #       else "Residuals deviate from normality (common in real series)."
+  #     } else "Package 'tseries' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Shapiro–Wilk (normality)",
+  #     if (!is.null(sw)) unname(sw$statistic) else NULL,
+  #     if (!is.null(sw)) unname(sw$p.value) else NULL,
+  #     if (!is.null(sw)) {
+  #       if (is.finite(sw$p.value) && sw$p.value >= 0.05) "No evidence against normality."
+  #       else "Evidence against normality."
+  #     } else if (n_res > 5000) "Not computed (n > 5000)." else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "ARCH LM (heteroskedasticity)",
+  #     if (!is.null(arch)) unname(arch$statistic) else NULL,
+  #     if (!is.null(arch)) unname(arch$p.value) else NULL,
+  #     if (!is.null(arch)) {
+  #       if (is.finite(arch$p.value) && arch$p.value >= 0.05) "No evidence of remaining ARCH effects."
+  #       else "Evidence of ARCH effects → consider GARCH for variance."
+  #     } else "Package 'FinTS' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Runs test (randomness)",
+  #     if (!is.null(runs)) unname(runs$statistic) else NULL,
+  #     if (!is.null(runs)) unname(runs$p.value) else NULL,
+  #     if (!is.null(runs)) {
+  #       if (is.finite(runs$p.value) && runs$p.value >= 0.05) "No evidence against randomness."
+  #       else "Evidence of non-randomness (structure may remain)."
+  #     } else "Package 'tseries' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Anderson–Darling (normality)",
+  #     if (!is.null(ad)) unname(ad$statistic) else NULL,
+  #     if (!is.null(ad)) unname(ad$p.value) else NULL,
+  #     if (!is.null(ad)) {
+  #       if (is.finite(ad$p.value) && ad$p.value >= 0.05) "No evidence against normality."
+  #       else "Evidence against normality (sensitive in tails)."
+  #     } else "Package 'nortest' missing or test unavailable."
+  #   )
+  #   
+  #   tests_df <- if (length(test_rows)) do.call(rbind, test_rows) else data.frame()
+  #   
+  #   # ---------- forecast accuracy (safe)
+  #   acc_df <- NULL
+  #   acc_sentence <- "No holdout test set was detected; therefore, out-of-sample accuracy was not computed."
+  #   
+  #   y_test <- s$ts_test
+  #   has_test <- !is.null(y_test) && safe_len(y_test) > 0 && n_test > 0
+  #   
+  #   if (has_test) {
+  #     y_test_num <- as.numeric(y_test)
+  #     y_hat_num  <- suppressWarnings(tryCatch(as.numeric(fc$mean), error = function(e) rep(NA_real_, length(y_test_num))))
+  #     h <- min(length(y_test_num), length(y_hat_num))
+  #     if (h >= 1) {
+  #       e <- y_test_num[seq_len(h)] - y_hat_num[seq_len(h)]
+  #       rmse <- sqrt(mean(e^2, na.rm = TRUE))
+  #       mae  <- mean(abs(e), na.rm = TRUE)
+  #       mape <- mean(abs(e) / pmax(abs(y_test_num[seq_len(h)]), .Machine$double.eps), na.rm = TRUE)
+  #       
+  #       acc_df <- data.frame(
+  #         Metric = c("RMSE", "MAE", "MAPE"),
+  #         Value  = c(fmt_num_local(rmse, 3), fmt_num_local(mae, 3), paste0(fmt_num_local(100*mape, 2), "%")),
+  #         check.names = FALSE
+  #       )
+  #       
+  #       acc_sentence <- paste0(
+  #         "Over the holdout period (test n = ", h, "), forecast performance was ",
+  #         "RMSE = ", fmt_num_local(rmse, 3), ", ",
+  #         "MAE = ", fmt_num_local(mae, 3), ", ",
+  #         "MAPE = ", fmt_num_local(100*mape, 2), "%."
+  #       )
+  #     }
+  #   }
+  #   
+  #   # ---------- horizon narrative
+  #   horizon_txt <- if (has_test) {
+  #     paste0("Validation mode was used: the forecast horizon was forced to match the test length (h = ", n_test, ").")
+  #   } else {
+  #     paste0("Future mode was used: forecasts were produced beyond the training sample (h = ", fc0$h, ").")
+  #   }
+  #   
+  #   # ---------- model string
+  #   season_txt <- suppressWarnings(as.integer(eq$s))
+  #   s_txt <- if (is.finite(season_txt) && season_txt > 0) as.character(season_txt) else "s"
+  #   
+  #   model_str <- sprintf(
+  #     "SARIMA(%d,%d,%d)(%d,%d,%d)[%s]",
+  #     eq$p, eq$d, eq$q, eq$P, eq$D, eq$Q, s_txt
+  #   )
+  #   
+  #   # ---------- diagnostic verdict
+  #   lb_ok <- !is.null(lb) && is.finite(lb$p.value) && lb$p.value >= 0.05
+  #   arch_ok <- is.null(arch) || (is.finite(arch$p.value) && arch$p.value >= 0.05)
+  #   diag_verdict <- paste0(
+  #     if (lb_ok) "Residual autocorrelation was not statistically detected (Ljung–Box p ≥ .05). "
+  #     else "Residual autocorrelation may remain (Ljung–Box p < .05). ",
+  #     if (arch_ok) "No clear evidence of residual ARCH effects was found (or test unavailable)."
+  #     else "Residual ARCH effects were detected → a GARCH extension is recommended."
+  #   )
+  #   
+  #   # ---------- build report UI (NO output$ definitions here)
+  #   tagList(
+  #     tags$h3("Manual SARIMA: Full academic conclusion (report-ready)"),
+  #     
+  #     
+  #     # 1. Objective and modelling rationale
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("1. Objective and modelling rationale")),
+  #     tags$p(
+  #       "A manually specified seasonal ARIMA (SARIMA) model was estimated to represent linear temporal dependence,",
+  #       " including seasonal structure, and to provide an interpretable baseline for forecasting."
+  #     ),
+  #     
+  #     
+  #     # 2. Data design and sample split
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("2. Data design and sample split")),
+  #     tags$p(HTML(paste0(
+  #       "The analysis used <b>N = ", N, "</b> observations (training <b>n = ", n_train, "</b>",
+  #       if (has_test) paste0(", test <b>n = ", n_test, "</b>") else "",
+  #       ")."
+  #     ))),
+  #     tags$p(tags$b("Forecast design. "), horizon_txt),
+  #     
+  #     
+  #     # 3. Identification visuals (time series + ACF/PACF)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("3. Identification visuals (time series + ACF/PACF)")),
+  #     tags$p(
+  #       "The plots below summarize the observed series (with the train/test split, if applicable), ",
+  #       "followed by ACF/PACF for the training series and for the differenced series implied by the chosen (d, D, s)."
+  #     ),
+  #     
+  #     tags$br(), 
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure A. Time series with split marker")),
+  #     plotOutput("manual_report_ts_plot", height = 360),
+  #     
+  #     # 4. Stationarity assessment (ADF, KPSS, and Phillips–Perron)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("4. Stationarity assessment (ADF, KPSS, and Phillips–Perron)")),
+  #     tags$p("Stationarity tests were applied to the training series to evaluate whether differencing is required before SARIMA identification and estimation."),
+  #     tags$hr(),
+  #     uiOutput("manual_report_stationarity"),
+  #     
+  #     
+  #     # 5. Transformed series: differencing and seasonality
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("5. Transformed series: differencing and seasonality")),
+  #     
+  # 
+  #     tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure B. Seasonal subseries")),
+  #     plotOutput("manual_report_subseries", height = 360),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure C. Seasonal box-plot")),
+  #     plotOutput("manual_report_seasonal_box", height = 360),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure D. Transformed training series and differenced (d, D, s) series")),
+  #     plotOutput("manual_report_ts_trans_and_diff", height = 360),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure E. ACF and PACF (training series)")),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_report_acf",  height = 280)),
+  #       column(6, plotOutput("manual_report_pacf", height = 280))
+  #     ),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure F. ACF and PACF (modified / differenced series using current d, D, s)")),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_report_acf_mod",  height = 280)),
+  #       column(6, plotOutput("manual_report_pacf_mod", height = 280))
+  #     ),
+  #     
+  #     
+  #     tags$hr(), tags$br(),
+  #     uiOutput("manual_report_stationarity_mod"),
+  #     
+  #     # 6. Final model specification and fit quality
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("6. Final model specification and fit quality")),
+  #     tags$p(HTML(paste0(
+  #       "The final manual specification was <b>", model_str, "</b>",
+  #       if (isTRUE(input$manual_drift)) " including drift/mean." else " without drift/mean.",
+  #       " Model adequacy was assessed using information criteria, coefficient inference, residual diagnostics, and forecast performance."
+  #     ))),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table A. Goodness-of-fit (information criteria)")),
+  #     html_table(ic_df),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table B. Parameter estimates and significance (approx. z/t tests)")),
+  #     if (!is.null(coef_df)) html_table(coef_df) else tags$em("No coefficients available."),
+  #     tags$p(HTML(paste0(
+  #       "In total, <b>", n_sig, "</b> parameter(s) were significant at α = .05 (marked by *, **, ***)."
+  #     ))),
+  #     
+  #     
+  #     
+  #     # 7. Model equations (replication-ready
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("7. Model equations (replication-ready)")),
+  #     tags$p(
+  #       "The fitted model is reported below in operator notation (general form), expanded form, and the numerical equation",
+  #       " based on the estimated parameters."
+  #     ),
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;",
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       tags$h5("General SARIMA formulation"),
+  #       HTML(eq$eq_general),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       tags$h5("Expanded operator form"),
+  #       HTML(eq$eq_expanded),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       tags$h5("Numerical model"),
+  #       HTML(eq$eq_line3),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       HTML(eq$eq_line4),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #     ),
+  #     
+  #     
+  #     
+  #     # 8. Residual diagnostics (graphical evidence
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("8. Residual diagnostics (graphical evidence)")),
+  #     tags$p(
+  #       "Graphical diagnostics evaluate whether residuals resemble white noise (no systematic autocorrelation),",
+  #       " approximate normality (Q–Q and histogram), and stable variance."
+  #     ),
+  #     
+  #     fluidRow(
+  #       column(6, plotOutput("manual_resid_ts",   height = 220)),
+  #       column(6, plotOutput("manual_resid_acf",  height = 220))
+  #     ),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_resid_hist", height = 220)),
+  #       column(6, plotOutput("manual_resid_qq",   height = 220))
+  #     ),
+  #     
+  #     
+  #     tags$h5("Ljung–Box p-values by lag"),
+  #     plotOutput("manual_resid_lb_pvals", height = 260),
+  #     
+  #     
+  #     
+  #     # "9. Residual tests (formal inference
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("9. Residual tests (formal inference)")),
+  #     tags$p(
+  #       "Formal tests complement the plots: Ljung–Box/Box–Pierce assess remaining autocorrelation;",
+  #       " Jarque–Bera/Shapiro–Wilk/Anderson–Darling assess normality;",
+  #       " ARCH LM tests conditional heteroskedasticity; the runs test checks randomness."
+  #     ),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table C. Residual test summary")),
+  #     html_table(tests_df),
+  #     tags$p(tags$b("Diagnostic synthesis. "), diag_verdict),
+  #     
+  #     
+  #     
+  #     # 10. Forecasting results and predictive performance
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("10. Forecasting results and predictive performance")),
+  #     tags$p(acc_sentence),
+  #     
+  #     if (!is.null(acc_df)) tagList(
+  #       tags$h5("Table D. Holdout accuracy (test set)"),
+  #       html_table(acc_df)
+  #     ) else NULL,
+  #     
+  #     tags$hr(),  tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Forecast plot")),
+  #     plotOutput("manual_forecast_plot", height = 420),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Forecast table")),
+  #     tableOutput("manual_forecast_table"),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Accuracy table (your app output)")),
+  #     tableOutput("manual_accuracy_table"),
+  #     
+  #     
+  #     # 11. Final conclusion (academic)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("11. Final conclusion")),
+  #     tags$p(
+  #       "Overall, the manually specified SARIMA model provides a coherent and interpretable representation of seasonal linear dynamics,",
+  #       " supported by information criteria, statistically interpretable parameters, and diagnostic checks.",
+  #       " When diagnostics indicate remaining autocorrelation, refinement should prioritize revising differencing (d, D) and AR/MA orders guided by ACF/PACF and Ljung–Box.",
+  #       " When conditional heteroskedasticity is detected (ARCH LM), a volatility model (e.g., GARCH) should be added to the mean equation to better represent time-varying variance."
+  #     ),
+  #     tags$p(
+  #       "For reporting, the results above provide the full chain of evidence typically expected in academic manuscripts:",
+  #       " (i) specification + IC, (ii) parameter inference, (iii) equation reporting, (iv) residual validation with plots and tests, and (v) forecasting with accuracy assessment."
+  #     ),
+  #     
+  #     tags$br(), tags$hr(), tags$br(), tags$br(),
+  #     
+  #   )
+  # })
+  
+  
+  
+  
+  
+  # # ------------------------------------------------------------
+  # # (B) manual_conclusion_full_obj (eventReactive) — UI builder ONLY
+  # # ------------------------------------------------------------
+  # manual_conclusion_full_obj <- eventReactive(input$fit_manual, {
+  #   req(manual_fit(), manual_fc(), manual_equations(), ts_train_test())
+  #   
+  #   fit <- manual_fit()
+  #   fc0 <- manual_fc()
+  #   fc  <- fc0$fc
+  #   eq  <- manual_equations()
+  #   s   <- ts_train_test()
+  #   
+  #   # ---------- helpers (local + safe)
+  #   `%||%` <- function(x, y) {
+  #     if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
+  #   }
+  #   
+  #   fmt_num_local <- function(x, d = 3) {
+  #     if (length(x) == 0 || all(is.na(x))) return("NA")
+  #     x <- suppressWarnings(as.numeric(x[1]))
+  #     if (!is.finite(x)) return("NA")
+  #     formatC(x, format = "f", digits = d)
+  #   }
+  #   fmt_p_local <- function(p) {
+  #     if (length(p) == 0 || all(is.na(p))) return("NA")
+  #     p <- suppressWarnings(as.numeric(p[1]))
+  #     if (!is.finite(p)) return("NA")
+  #     if (p < .001) "&lt; .001" else sprintf("= %.3f", p)
+  #   }
+  #   sig_stars <- function(p) {
+  #     p <- suppressWarnings(as.numeric(p))
+  #     if (!is.finite(p)) return("")
+  #     if (p < .001) "***" else if (p < .01) "**" else if (p < .05) "*" else if (p < .10) "†" else ""
+  #   }
+  #   safe_len <- function(x) if (is.null(x)) 0L else length(x)
+  #   
+  #   html_table <- function(df) {
+  #     if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+  #       return(tags$em("Table unavailable."))
+  #     }
+  #     tags$table(
+  #       class = "table table-striped table-condensed",
+  #       tags$thead(tags$tr(lapply(names(df), function(nm) tags$th(nm)))),
+  #       tags$tbody(
+  #         lapply(seq_len(nrow(df)), function(i) {
+  #           tags$tr(lapply(df[i, , drop = FALSE], function(cell) tags$td(HTML(as.character(cell)))))
+  #         })
+  #       )
+  #     )
+  #   }
+  #   
+  #   # ---------- sample sizes (safe)
+  #   n_train <- suppressWarnings(as.integer(s$train_n))
+  #   if (!is.finite(n_train) || n_train < 1) n_train <- tryCatch(length(residuals(fit)), error = function(e) 0L)
+  #   
+  #   n_test <- suppressWarnings(as.integer(s$test_n))
+  #   if (!is.finite(n_test) || n_test < 0) n_test <- 0L
+  #   
+  #   N <- n_train + n_test
+  #   
+  #   # ---------- lag choice (safe)
+  #   L_in <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_in) && L_in > 0) L_in else 12L
+  #   
+  #   # ============================================================
+  #   # ---------- IC (safe + robust AICc fallback)
+  #   # ============================================================
+  #   AIC_val <- suppressWarnings(tryCatch(as.numeric(stats::AIC(fit)), error = function(e) NA_real_))
+  #   BIC_val <- suppressWarnings(tryCatch(as.numeric(stats::BIC(fit)), error = function(e) NA_real_))
+  #   
+  #   AICc_val <- suppressWarnings(tryCatch(as.numeric(forecast::AICc(fit)), error = function(e) NA_real_))
+  #   
+  #   if (!is.finite(AICc_val) && is.finite(AIC_val)) {
+  #     n_fit <- suppressWarnings(tryCatch(stats::nobs(fit), error = function(e) NA_integer_))
+  #     if (!is.finite(n_fit) || n_fit <= 0) {
+  #       r <- suppressWarnings(tryCatch(as.numeric(residuals(fit)), error = function(e) numeric(0)))
+  #       n_fit <- sum(is.finite(r))
+  #     }
+  #     if (!is.finite(n_fit) || n_fit <= 0) n_fit <- n_train
+  #     
+  #     k <- suppressWarnings(tryCatch(length(stats::coef(fit)), error = function(e) NA_integer_))
+  #     if (!is.finite(k) || k < 0) k <- 0L
+  #     k <- k + 1L
+  #     
+  #     if (is.finite(n_fit) && n_fit > (k + 1)) {
+  #       AICc_val <- AIC_val + (2 * k * (k + 1)) / (n_fit - k - 1)
+  #     } else {
+  #       AICc_val <- NA_real_
+  #     }
+  #   }
+  #   
+  #   ic_df <- data.frame(
+  #     Criterion = c("AIC", "AICc", "BIC"),
+  #     Value     = c(fmt_num_local(AIC_val, 2), fmt_num_local(AICc_val, 2), fmt_num_local(BIC_val, 2)),
+  #     check.names = FALSE
+  #   )
+  #   
+  #   # ---------- coefficients + significance (robust)
+  #   est <- suppressWarnings(tryCatch(stats::coef(fit), error = function(e) NULL))
+  #   V   <- suppressWarnings(tryCatch(stats::vcov(fit), error = function(e) NULL))
+  #   if (is.null(V)) V <- suppressWarnings(tryCatch(fit$var.coef, error = function(e) NULL))
+  #   
+  #   coef_df <- NULL
+  #   if (!is.null(est) && length(est) > 0) {
+  #     est <- as.numeric(est)
+  #     nm  <- names(stats::coef(fit))
+  #     if (is.null(nm)) nm <- paste0("param_", seq_along(est))
+  #     
+  #     se <- rep(NA_real_, length(est))
+  #     if (!is.null(V)) {
+  #       dV <- tryCatch(diag(V), error = function(e) rep(NA_real_, length(est)))
+  #       if (length(dV) == length(est)) se <- sqrt(pmax(dV, 0))
+  #     }
+  #     z  <- est / se
+  #     p  <- 2 * stats::pnorm(-abs(z))
+  #     
+  #     coef_df <- data.frame(
+  #       Term     = nm,
+  #       Estimate = sprintf("%.6f", est),
+  #       SE       = ifelse(is.finite(se), sprintf("%.6f", se), "NA"),
+  #       `z/t`    = ifelse(is.finite(z),  sprintf("%.3f",  z),  "NA"),
+  #       `p`      = ifelse(is.finite(p),  sprintf("%.3f",  p),  "NA"),
+  #       Sig      = vapply(p, sig_stars, character(1)),
+  #       check.names = FALSE
+  #     )
+  #   }
+  #   
+  #   n_sig <- if (!is.null(coef_df)) sum(suppressWarnings(as.numeric(coef_df$p)) < 0.05, na.rm = TRUE) else 0L
+  #   
+  #   # ---------- residuals (safe)
+  #   res <- suppressWarnings(tryCatch(as.numeric(residuals(fit)), error = function(e) numeric(0)))
+  #   res <- res[is.finite(res)]
+  #   n_res <- length(res)
+  #   
+  #   fitdf <- if (!is.null(est)) length(est) else 0L
+  #   
+  #   lb_lag <- min(L, max(1L, floor(n_res / 3)))
+  #   lb <- if (n_res >= 5) {
+  #     tryCatch(stats::Box.test(res, lag = lb_lag, type = "Ljung-Box", fitdf = fitdf), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   bp <- if (n_res >= 5) {
+  #     tryCatch(stats::Box.test(res, lag = lb_lag, type = "Box-Pierce", fitdf = fitdf), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   jb <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 5) {
+  #     tryCatch(tseries::jarque.bera.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   sw <- if (n_res >= 3 && n_res <= 5000) {
+  #     tryCatch(stats::shapiro.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   arch <- if (requireNamespace("FinTS", quietly = TRUE) && n_res >= 10) {
+  #     tryCatch(FinTS::ArchTest(res, lags = min(12L, max(1L, floor(L / 2)))), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   runs <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 10) {
+  #     tryCatch(tseries::runs.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   ad <- if (requireNamespace("nortest", quietly = TRUE) && n_res >= 8) {
+  #     tryCatch(nortest::ad.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   test_rows <- list()
+  #   add_test <- function(name, stat, pval, note = "") {
+  #     test_rows[[length(test_rows) + 1L]] <<- data.frame(
+  #       Test = name,
+  #       Statistic = if (is.null(stat)) "NA" else fmt_num_local(stat, 3),
+  #       `p-value` = if (is.null(pval)) "NA" else fmt_p_local(pval),
+  #       Interpretation = note,
+  #       check.names = FALSE
+  #     )
+  #   }
+  #   
+  #   add_test(
+  #     "Ljung–Box (residuals)",
+  #     if (!is.null(lb)) unname(lb$statistic) else NULL,
+  #     if (!is.null(lb)) unname(lb$p.value) else NULL,
+  #     if (!is.null(lb)) {
+  #       if (is.finite(lb$p.value) && lb$p.value >= 0.05) "No evidence of remaining autocorrelation (white-noise compatible)."
+  #       else "Evidence of remaining autocorrelation (model may be under-specified)."
+  #     } else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "Box–Pierce (residuals)",
+  #     if (!is.null(bp)) unname(bp$statistic) else NULL,
+  #     if (!is.null(bp)) unname(bp$p.value) else NULL,
+  #     if (!is.null(bp)) {
+  #       if (is.finite(bp$p.value) && bp$p.value >= 0.05) "Consistent with uncorrelated residuals."
+  #       else "Suggests residual autocorrelation."
+  #     } else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "Jarque–Bera (normality)",
+  #     if (!is.null(jb)) unname(jb$statistic) else NULL,
+  #     if (!is.null(jb)) unname(jb$p.value) else NULL,
+  #     if (!is.null(jb)) {
+  #       if (is.finite(jb$p.value) && jb$p.value >= 0.05) "No evidence against normality."
+  #       else "Residuals deviate from normality (common in real series)."
+  #     } else "Package 'tseries' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Shapiro–Wilk (normality)",
+  #     if (!is.null(sw)) unname(sw$statistic) else NULL,
+  #     if (!is.null(sw)) unname(sw$p.value) else NULL,
+  #     if (!is.null(sw)) {
+  #       if (is.finite(sw$p.value) && sw$p.value >= 0.05) "No evidence against normality."
+  #       else "Evidence against normality."
+  #     } else if (n_res > 5000) "Not computed (n > 5000)." else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "ARCH LM (heteroskedasticity)",
+  #     if (!is.null(arch)) unname(arch$statistic) else NULL,
+  #     if (!is.null(arch)) unname(arch$p.value) else NULL,
+  #     if (!is.null(arch)) {
+  #       if (is.finite(arch$p.value) && arch$p.value >= 0.05) "No evidence of remaining ARCH effects."
+  #       else "Evidence of ARCH effects → consider GARCH for variance."
+  #     } else "Package 'FinTS' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Runs test (randomness)",
+  #     if (!is.null(runs)) unname(runs$statistic) else NULL,
+  #     if (!is.null(runs)) unname(runs$p.value) else NULL,
+  #     if (!is.null(runs)) {
+  #       if (is.finite(runs$p.value) && runs$p.value >= 0.05) "No evidence against randomness."
+  #       else "Evidence of non-randomness (structure may remain)."
+  #     } else "Package 'tseries' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Anderson–Darling (normality)",
+  #     if (!is.null(ad)) unname(ad$statistic) else NULL,
+  #     if (!is.null(ad)) unname(ad$p.value) else NULL,
+  #     if (!is.null(ad)) {
+  #       if (is.finite(ad$p.value) && ad$p.value >= 0.05) "No evidence against normality."
+  #       else "Evidence against normality (sensitive in tails)."
+  #     } else "Package 'nortest' missing or test unavailable."
+  #   )
+  #   
+  #   tests_df <- if (length(test_rows)) do.call(rbind, test_rows) else data.frame()
+  #   
+  #   # ---------- forecast accuracy (safe)  [NOTE: this is on the model scale]
+  #   acc_df <- NULL
+  #   acc_sentence <- "No holdout test set was detected; therefore, out-of-sample accuracy was not computed."
+  #   
+  #   y_test <- s$ts_test
+  #   has_test <- !is.null(y_test) && safe_len(y_test) > 0 && n_test > 0
+  #   
+  #   if (has_test) {
+  #     y_test_num <- as.numeric(y_test)
+  #     y_hat_num  <- suppressWarnings(tryCatch(as.numeric(fc$mean), error = function(e) rep(NA_real_, length(y_test_num))))
+  #     h <- min(length(y_test_num), length(y_hat_num))
+  #     if (h >= 1) {
+  #       e <- y_test_num[seq_len(h)] - y_hat_num[seq_len(h)]
+  #       rmse <- sqrt(mean(e^2, na.rm = TRUE))
+  #       mae  <- mean(abs(e), na.rm = TRUE)
+  #       mape <- mean(abs(e) / pmax(abs(y_test_num[seq_len(h)]), .Machine$double.eps), na.rm = TRUE)
+  #       
+  #       acc_df <- data.frame(
+  #         Metric = c("RMSE", "MAE", "MAPE"),
+  #         Value  = c(fmt_num_local(rmse, 3), fmt_num_local(mae, 3), paste0(fmt_num_local(100*mape, 2), "%")),
+  #         check.names = FALSE
+  #       )
+  #       
+  #       acc_sentence <- paste0(
+  #         "Over the holdout period (test n = ", h, "), forecast performance was ",
+  #         "RMSE = ", fmt_num_local(rmse, 3), ", ",
+  #         "MAE = ", fmt_num_local(mae, 3), ", ",
+  #         "MAPE = ", fmt_num_local(100*mape, 2), "%."
+  #       )
+  #     }
+  #   }
+  #   
+  #   # ---------- horizon narrative
+  #   horizon_txt <- if (has_test) {
+  #     paste0("Validation mode was used: the forecast horizon was forced to match the test length (h = ", n_test, ").")
+  #   } else {
+  #     paste0("Future mode was used: forecasts were produced beyond the training sample (h = ", fc0$h, ").")
+  #   }
+  #   
+  #   # ---------- model string
+  #   season_txt <- suppressWarnings(as.integer(eq$s))
+  #   s_txt <- if (is.finite(season_txt) && season_txt > 0) as.character(season_txt) else "s"
+  #   
+  #   model_str <- sprintf(
+  #     "SARIMA(%d,%d,%d)(%d,%d,%d)[%s]",
+  #     eq$p, eq$d, eq$q, eq$P, eq$D, eq$Q, s_txt
+  #   )
+  #   
+  #   # ---------- diagnostic verdict
+  #   lb_ok <- !is.null(lb) && is.finite(lb$p.value) && lb$p.value >= 0.05
+  #   arch_ok <- is.null(arch) || (is.finite(arch$p.value) && arch$p.value >= 0.05)
+  #   diag_verdict <- paste0(
+  #     if (lb_ok) "Residual autocorrelation was not statistically detected (Ljung–Box p ≥ .05). "
+  #     else "Residual autocorrelation may remain (Ljung–Box p < .05). ",
+  #     if (arch_ok) "No clear evidence of residual ARCH effects was found (or test unavailable)."
+  #     else "Residual ARCH effects were detected → a GARCH extension is recommended."
+  #   )
+  #   
+  #   # ============================================================
+  #   # ---------- NEW: Inverse transform equation + bias-adjusted back-forecasts
+  #   # ============================================================
+  #   tr_global <- input$transform %||% "none"
+  #   
+  #   # We need the same lambda as the transform step uses.
+  #   # apply_transform() uses forecast::BoxCox.lambda(y, lower=0) when input$lambda is NA.
+  #   p_obj <- NULL
+  #   lambda_used <- NA_real_
+  #   if (identical(tr_global, "boxcox")) {
+  #     p_obj <- tryCatch(prepared(), error = function(e) NULL)
+  #     lam_in <- input$lambda
+  #     if (is.null(lam_in) || (length(lam_in) == 1 && is.na(lam_in))) {
+  #       lambda_used <- tryCatch(
+  #         forecast::BoxCox.lambda(p_obj$df$y_filled, lower = 0),
+  #         error = function(e) NA_real_
+  #       )
+  #     } else {
+  #       lambda_used <- suppressWarnings(as.numeric(lam_in))
+  #     }
+  #   }
+  #   
+  #   # Forecasts are on TRANSFORMED scale:
+  #   mu_t <- suppressWarnings(as.numeric(fc$mean))
+  #   se_t <- suppressWarnings(as.numeric(fc$se))
+  #   sigma2_t <- ifelse(is.finite(se_t), se_t^2, NA_real_)
+  #   
+  #   lo_t <- tryCatch(fc$lower, error = function(e) NULL)
+  #   hi_t <- tryCatch(fc$upper, error = function(e) NULL)
+  #   lvl_names <- tryCatch(colnames(fc$lower), error = function(e) NULL)
+  #   
+  #   inv_equation_html <- NULL
+  #   inv_note_html <- NULL
+  #   
+  #   inv_mean <- mu_t
+  #   inv_lo   <- lo_t
+  #   inv_hi   <- hi_t
+  #   
+  #   # helper: nice TeX if tex_display exists, else plain
+  #   tex_or_plain <- function(tex, plain) {
+  #     if (exists("tex_display", mode = "function")) HTML(tex_display(tex)) else HTML(plain)
+  #   }
+  #   
+  #   if (identical(tr_global, "log")) {
+  #     # unbiased mean under lognormal assumption: E[Y] = exp(mu + 0.5*sigma^2)
+  #     inv_mean <- exp(mu_t + 0.5 * sigma2_t)
+  #     
+  #     # interval bounds: back-transform quantiles (standard practice)
+  #     if (!is.null(lo_t) && !is.null(hi_t)) {
+  #       inv_lo <- exp(lo_t)
+  #       inv_hi <- exp(hi_t)
+  #     }
+  #     
+  #     inv_equation_html <- tex_or_plain(
+  #       "y = \\exp(z) \\quad \\text{where } z = \\ln(y)",
+  #       "y = exp(z), where z = log(y)"
+  #     )
+  #     inv_note_html <- HTML(
+  #       "<span style='font-size:12px;color:#444;'>Point forecasts are bias-adjusted (lognormal): <b>exp(μ + 0.5·σ²)</b>. Interval bounds are back-transformed using <b>exp()</b>.</span>"
+  #     )
+  #     
+  #   } else if (identical(tr_global, "boxcox")) {
+  #     lam <- lambda_used
+  #     
+  #     inv_mean <- tryCatch(
+  #       forecast::InvBoxCox(mu_t, lam, biasadj = TRUE, sigma2 = sigma2_t),
+  #       error = function(e) rep(NA_real_, length(mu_t))
+  #     )
+  #     
+  #     if (!is.null(lo_t) && !is.null(hi_t)) {
+  #       inv_lo <- tryCatch(forecast::InvBoxCox(lo_t, lam), error = function(e) lo_t)
+  #       inv_hi <- tryCatch(forecast::InvBoxCox(hi_t, lam), error = function(e) hi_t)
+  #     }
+  #     
+  #     if (is.finite(lam) && abs(lam) < 1e-6) {
+  #       inv_equation_html <- tex_or_plain("y = \\exp(z) \\quad (\\lambda \\approx 0)", "y = exp(z)  (lambda ≈ 0)")
+  #     } else {
+  #       inv_equation_html <- tex_or_plain("y = (\\lambda z + 1)^{1/\\lambda}", "y = (lambda*z + 1)^(1/lambda)")
+  #     }
+  #     
+  #     inv_note_html <- HTML(paste0(
+  #       "<span style='font-size:12px;color:#444;'>λ used = <b>",
+  #       if (is.finite(lambda_used)) formatC(lambda_used, digits = 4, format = "f") else "NA",
+  #       "</b>. Point forecasts use <b>InvBoxCox(..., biasadj=TRUE, sigma2=se²)</b>.</span>"
+  #     ))
+  #   }
+  #   
+  #   # Build an ORIGINAL-SCALE forecast table (bias-adjusted mean + back-transformed intervals)
+  #   fc_orig_df <- data.frame(
+  #     Horizon = seq_along(inv_mean),
+  #     Mean_original = as.numeric(inv_mean),
+  #     stringsAsFactors = FALSE
+  #   )
+  #   
+  #   if (!is.null(inv_lo) && !is.null(inv_hi) && !is.null(lvl_names)) {
+  #     for (j in seq_along(lvl_names)) {
+  #       lvl <- lvl_names[j]
+  #       fc_orig_df[[paste0("Lo_", lvl)]] <- as.numeric(inv_lo[, j])
+  #       fc_orig_df[[paste0("Hi_", lvl)]] <- as.numeric(inv_hi[, j])
+  #     }
+  #   }
+  #   
+  #   # format numeric columns for HTML display
+  #   fc_orig_df_fmt <- fc_orig_df
+  #   for (nm in names(fc_orig_df_fmt)) {
+  #     if (is.numeric(fc_orig_df_fmt[[nm]])) {
+  #       fc_orig_df_fmt[[nm]] <- ifelse(is.finite(fc_orig_df_fmt[[nm]]),
+  #                                      sprintf("%.6f", fc_orig_df_fmt[[nm]]),
+  #                                      "NA")
+  #     }
+  #   }
+  #   
+  #   # ---------- build report UI (NO output$ definitions here)
+  #   tagList(
+  #     tags$h3("Manual SARIMA: Full academic conclusion (report-ready)"),
+  #     
+  #     # 1. Objective and modelling rationale
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("1. Objective and modelling rationale")),
+  #     tags$p(
+  #       "A manually specified seasonal ARIMA (SARIMA) model was estimated to represent linear temporal dependence,",
+  #       " including seasonal structure, and to provide an interpretable baseline for forecasting."
+  #     ),
+  #     
+  #     # 2. Data design and sample split
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("2. Data design and sample split")),
+  #     tags$p(HTML(paste0(
+  #       "The analysis used <b>N = ", N, "</b> observations (training <b>n = ", n_train, "</b>",
+  #       if (has_test) paste0(", test <b>n = ", n_test, "</b>") else "",
+  #       ")."
+  #     ))),
+  #     tags$p(tags$b("Forecast design. "), horizon_txt),
+  #     
+  #     # 3. Identification visuals (time series + ACF/PACF)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("3. Identification visuals (time series + ACF/PACF)")),
+  #     tags$p(
+  #       "The plots below summarize the observed series (with the train/test split, if applicable), ",
+  #       "followed by ACF/PACF for the training series and for the differenced series implied by the chosen (d, D, s)."
+  #     ),
+  #     
+  #     tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure A. Time series with split marker")),
+  #     plotOutput("manual_report_ts_plot", height = 360),
+  #     
+  #     # 4. Stationarity assessment (ADF, KPSS, and Phillips–Perron)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("4. Stationarity assessment (ADF, KPSS, and Phillips–Perron)")),
+  #     tags$p("Stationarity tests were applied to the training series to evaluate whether differencing is required before SARIMA identification and estimation."),
+  #     tags$hr(),
+  #     uiOutput("manual_report_stationarity"),
+  #     
+  #     # 5. Transformed series: differencing and seasonality
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("5. Transformed series: differencing and seasonality")),
+  #     
+  #     tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure B. Seasonal subseries")),
+  #     plotOutput("manual_report_subseries", height = 360),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure C. Seasonal box-plot")),
+  #     plotOutput("manual_report_seasonal_box", height = 360),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure D. Transformed training series and differenced (d, D, s) series")),
+  #     plotOutput("manual_report_ts_trans_and_diff", height = 360),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure E. ACF and PACF (training series)")),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_report_acf",  height = 280)),
+  #       column(6, plotOutput("manual_report_pacf", height = 280))
+  #     ),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure F. ACF and PACF (modified / differenced series using current d, D, s)")),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_report_acf_mod",  height = 280)),
+  #       column(6, plotOutput("manual_report_pacf_mod", height = 280))
+  #     ),
+  #     
+  #     tags$hr(), tags$br(),
+  #     uiOutput("manual_report_stationarity_mod"),
+  #     
+  #     # 6. Final model specification and fit quality
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("6. Final model specification and fit quality")),
+  #     tags$p(HTML(paste0(
+  #       "The final manual specification was <b>", model_str, "</b>",
+  #       if (isTRUE(input$manual_drift)) " including drift/mean." else " without drift/mean.",
+  #       " Model adequacy was assessed using information criteria, coefficient inference, residual diagnostics, and forecast performance."
+  #     ))),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table A. Goodness-of-fit (information criteria)")),
+  #     html_table(ic_df),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table B. Parameter estimates and significance (approx. z/t tests)")),
+  #     if (!is.null(coef_df)) html_table(coef_df) else tags$em("No coefficients available."),
+  #     tags$p(HTML(paste0(
+  #       "In total, <b>", n_sig, "</b> parameter(s) were significant at α = .05 (marked by *, **, ***)."
+  #     ))),
+  #     
+  #     # 7. Model equations (replication-ready)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("7. Model equations (replication-ready)")),
+  #     tags$p(
+  #       "The fitted model is reported below in operator notation (general form), expanded form, and the numerical equation",
+  #       " based on the estimated parameters."
+  #     ),
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;",
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       tags$h5("General SARIMA formulation"),
+  #       HTML(eq$eq_general),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       tags$h5("Expanded operator form"),
+  #       HTML(eq$eq_expanded),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       tags$h5("Numerical model"),
+  #       HTML(eq$eq_line3),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr(),
+  #       
+  #       HTML(eq$eq_line4),
+  #       
+  #       tags$br(),
+  #       tags$hr(),
+  #       tags$hr()
+  #     ),
+  #     
+  #     # 8. Residual diagnostics (graphical evidence)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("8. Residual diagnostics (graphical evidence)")),
+  #     tags$p(
+  #       "Graphical diagnostics evaluate whether residuals resemble white noise (no systematic autocorrelation),",
+  #       " approximate normality (Q–Q and histogram), and stable variance."
+  #     ),
+  #     
+  #     fluidRow(
+  #       column(6, plotOutput("manual_resid_ts",   height = 220)),
+  #       column(6, plotOutput("manual_resid_acf",  height = 220))
+  #     ),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_resid_hist", height = 220)),
+  #       column(6, plotOutput("manual_resid_qq",   height = 220))
+  #     ),
+  #     
+  #     tags$h5("Ljung–Box p-values by lag"),
+  #     plotOutput("manual_resid_lb_pvals", height = 260),
+  #     
+  #     # 9. Residual tests (formal inference)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("9. Residual tests (formal inference)")),
+  #     tags$p(
+  #       "Formal tests complement the plots: Ljung–Box/Box–Pierce assess remaining autocorrelation;",
+  #       " Jarque–Bera/Shapiro–Wilk/Anderson–Darling assess normality;",
+  #       " ARCH LM tests conditional heteroskedasticity; the runs test checks randomness."
+  #     ),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table C. Residual test summary")),
+  #     html_table(tests_df),
+  #     tags$p(tags$b("Diagnostic synthesis. "), diag_verdict),
+  #     
+  #     # 10. Forecasting results and predictive performance
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("10. Forecasting results and predictive performance")),
+  #     tags$p(acc_sentence),
+  #     
+  #     if (!is.null(acc_df)) tagList(
+  #       tags$h5("Table D. Holdout accuracy (test set)"),
+  #       html_table(acc_df)
+  #     ) else NULL,
+  #     
+  #     tags$hr(),  tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Forecast plot")),
+  #     plotOutput("manual_forecast_plot", height = 420),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Forecast table")),
+  #     tableOutput("manual_forecast_table"),
+  #     
+  #     tags$hr(), tags$br(),
+  #     tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Accuracy table (your app output)")),
+  #     tableOutput("manual_accuracy_table"),
+  #     
+  #     # ---------- NEW: Back-transformed forecasts (original scale)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("10.B Back-transformed forecasts (original scale)")),
+  #     if (!identical(tr_global, "none")) tagList(
+  #       tags$p("Because the model was estimated on the transformed series, forecasts are reported below on the original measurement scale using an appropriate bias adjustment for the point forecasts."),
+  #       tags$div(
+  #         style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;",
+  #         tags$h5("Inverse transform equation (simple form)"),
+  #         inv_equation_html,
+  #         tags$br(),
+  #         inv_note_html
+  #       ),
+  #       tags$br(),
+  #       tags$h5("Back-transformed forecast table (original scale)"),
+  #       html_table(fc_orig_df_fmt)
+  #     ) else tags$em("No transformation was applied; forecasts are already on the original scale."),
+  #     
+  #     # 11. Final conclusion (academic)
+  #     tags$hr(), tags$br(),
+  #     tags$h4(tags$strong("11. Final conclusion")),
+  #     tags$p(
+  #       "Overall, the manually specified SARIMA model provides a coherent and interpretable representation of seasonal linear dynamics,",
+  #       " supported by information criteria, statistically interpretable parameters, and diagnostic checks.",
+  #       " When diagnostics indicate remaining autocorrelation, refinement should prioritize revising differencing (d, D) and AR/MA orders guided by ACF/PACF and Ljung–Box.",
+  #       " When conditional heteroskedasticity is detected (ARCH LM), a volatility model (e.g., GARCH) should be added to the mean equation to better represent time-varying variance."
+  #     ),
+  #     tags$p(
+  #       "For reporting, the results above provide the full chain of evidence typically expected in academic manuscripts:",
+  #       " (i) specification + IC, (ii) parameter inference, (iii) equation reporting, (iv) residual validation with plots and tests, and (v) forecasting with accuracy assessment."
+  #     ),
+  #     
+  #     tags$br(), tags$hr(), tags$br(), tags$br()
+  #   )
+  # })
+  
+  
+  
+  
   # ------------------------------------------------------------
   # (B) manual_conclusion_full_obj (eventReactive) — UI builder ONLY
   # ------------------------------------------------------------
@@ -12747,6 +14332,10 @@ server <- function(input, output, session) {
     s   <- ts_train_test()
     
     # ---------- helpers (local + safe)
+    `%||%` <- function(x, y) {
+      if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
+    }
+    
     fmt_num_local <- function(x, d = 3) {
       if (length(x) == 0 || all(is.na(x))) return("NA")
       x <- suppressWarnings(as.numeric(x[1]))
@@ -12978,7 +14567,7 @@ server <- function(input, output, session) {
     
     tests_df <- if (length(test_rows)) do.call(rbind, test_rows) else data.frame()
     
-    # ---------- forecast accuracy (safe)
+    # ---------- forecast accuracy (safe)  [NOTE: this is on the model scale]
     acc_df <- NULL
     acc_sentence <- "No holdout test set was detected; therefore, out-of-sample accuracy was not computed."
     
@@ -13036,10 +14625,144 @@ server <- function(input, output, session) {
       else "Residual ARCH effects were detected → a GARCH extension is recommended."
     )
     
+    # ============================================================
+    # ---------- Inverse transform equation + bias-adjusted back-forecasts
+    # ============================================================
+    tr_global <- input$transform %||% "none"
+    
+    # lambda consistent with your transform step:
+    # apply_transform() uses forecast::BoxCox.lambda(y, lower=0) when input$lambda is NA
+    lambda_used <- NA_real_
+    if (identical(tr_global, "boxcox")) {
+      p_obj <- tryCatch(prepared(), error = function(e) NULL)
+      lam_in <- input$lambda
+      if (is.null(lam_in) || (length(lam_in) == 1 && is.na(lam_in))) {
+        lambda_used <- tryCatch(
+          forecast::BoxCox.lambda(p_obj$df$y_filled, lower = 0),
+          error = function(e) NA_real_
+        )
+      } else {
+        lambda_used <- suppressWarnings(as.numeric(lam_in))
+      }
+    }
+    
+    # Forecasts are on TRANSFORMED scale:
+    mu_t <- suppressWarnings(as.numeric(fc$mean))
+    
+    # se can be NULL / missing; handle safely
+    se_t <- tryCatch(as.numeric(fc$se), error = function(e) rep(NA_real_, length(mu_t)))
+    if (length(se_t) != length(mu_t)) se_t <- rep(NA_real_, length(mu_t))
+    var_t <- se_t^2  # forecast variance on transformed scale (when available)
+    
+    lo_t <- tryCatch(fc$lower, error = function(e) NULL)
+    hi_t <- tryCatch(fc$upper, error = function(e) NULL)
+    lvl_names <- tryCatch(colnames(fc$lower), error = function(e) NULL)
+    
+    inv_equation_html <- NULL
+    inv_note_html <- NULL
+    
+    inv_mean <- mu_t
+    inv_lo   <- lo_t
+    inv_hi   <- hi_t
+    
+    tex_or_plain <- function(tex, plain) {
+      if (exists("tex_display", mode = "function")) HTML(tex_display(tex)) else HTML(plain)
+    }
+    
+    if (identical(tr_global, "log")) {
+      
+      # Always-available back-transform (median)
+      inv_mean <- exp(mu_t)
+      
+      # Bias-adjusted mean where variance is available
+      ok <- is.finite(var_t)
+      inv_mean[ok] <- exp(mu_t[ok] + 0.5 * var_t[ok])
+      
+      # Interval bounds: back-transform quantiles
+      if (!is.null(lo_t) && !is.null(hi_t)) {
+        inv_lo <- exp(lo_t)
+        inv_hi <- exp(hi_t)
+      }
+      
+      inv_equation_html <- tex_or_plain(
+        "y = \\exp(z) \\quad \\text{where } z = \\ln(y)",
+        "y = exp(z), where z = log(y)"
+      )
+      inv_note_html <- HTML(
+        "<span style='font-size:12px;color:#444;'>
+        Point forecasts use <b>exp(μ + 0.5·σ²)</b> when σ² is available; otherwise they fall back to <b>exp(μ)</b>.
+        Interval bounds are back-transformed using <b>exp()</b>.
+      </span>"
+      )
+      
+    } else if (identical(tr_global, "boxcox")) {
+      
+      validate(need(is.finite(lambda_used), "Box–Cox lambda is missing/invalid; cannot compute inverse forecasts."))
+      lam <- lambda_used
+      
+      # Always-available back-transform (median)
+      inv_mean <- forecast::InvBoxCox(mu_t, lam)
+      
+      # Bias-adjusted mean where variance is available
+      ok <- is.finite(var_t)
+      inv_mean[ok] <- forecast::InvBoxCox(mu_t[ok], lam, biasadj = TRUE, var = var_t[ok])
+      
+      if (!is.null(lo_t) && !is.null(hi_t)) {
+        inv_lo <- tryCatch(forecast::InvBoxCox(lo_t, lam), error = function(e) lo_t)
+        inv_hi <- tryCatch(forecast::InvBoxCox(hi_t, lam), error = function(e) hi_t)
+      }
+      
+      if (is.finite(lam) && abs(lam) < 1e-6) {
+        inv_equation_html <- tex_or_plain(
+          "y = \\exp(z) \\quad (\\lambda \\approx 0)",
+          "y = exp(z)  (lambda ≈ 0)"
+        )
+      } else {
+        inv_equation_html <- tex_or_plain(
+          "y = (\\lambda z + 1)^{1/\\lambda}",
+          "y = (lambda*z + 1)^(1/lambda)"
+        )
+      }
+      
+      inv_note_html <- HTML(paste0(
+        "<span style='font-size:12px;color:#444;'>
+        λ used = <b>", if (is.finite(lambda_used)) formatC(lambda_used, digits = 4, format = "f") else "NA", "</b>.
+        Point forecasts use <b>InvBoxCox(μ, λ, biasadj=TRUE, var=se²)</b> when se² is available; otherwise they fall back to <b>InvBoxCox(μ, λ)</b>.
+        Interval bounds are back-transformed using <b>InvBoxCox()</b>.
+      </span>"
+      ))
+    }
+    
+    # Build an ORIGINAL-SCALE forecast table (bias-adjusted mean + back-transformed intervals)
+    fc_orig_df <- data.frame(
+      Horizon = seq_along(inv_mean),
+      Mean_original = as.numeric(inv_mean),
+      stringsAsFactors = FALSE
+    )
+    
+    if (!is.null(inv_lo) && !is.null(inv_hi) && !is.null(lvl_names)) {
+      for (j in seq_along(lvl_names)) {
+        lvl <- lvl_names[j]
+        fc_orig_df[[paste0("Lo_", lvl)]] <- as.numeric(inv_lo[, j])
+        fc_orig_df[[paste0("Hi_", lvl)]] <- as.numeric(inv_hi[, j])
+      }
+    }
+    
+    # format numeric columns for HTML display
+    fc_orig_df_fmt <- fc_orig_df
+    for (nm in names(fc_orig_df_fmt)) {
+      if (is.numeric(fc_orig_df_fmt[[nm]])) {
+        fc_orig_df_fmt[[nm]] <- ifelse(
+          is.finite(fc_orig_df_fmt[[nm]]),
+          sprintf("%.6f", fc_orig_df_fmt[[nm]]),
+          "NA"
+        )
+      }
+    }
+    
     # ---------- build report UI (NO output$ definitions here)
     tagList(
       tags$h3("Manual SARIMA: Full academic conclusion (report-ready)"),
-      
       
       # 1. Objective and modelling rationale
       tags$hr(), tags$br(),
@@ -13048,7 +14771,6 @@ server <- function(input, output, session) {
         "A manually specified seasonal ARIMA (SARIMA) model was estimated to represent linear temporal dependence,",
         " including seasonal structure, and to provide an interpretable baseline for forecasting."
       ),
-      
       
       # 2. Data design and sample split
       tags$hr(), tags$br(),
@@ -13060,7 +14782,6 @@ server <- function(input, output, session) {
       ))),
       tags$p(tags$b("Forecast design. "), horizon_txt),
       
-      
       # 3. Identification visuals (time series + ACF/PACF)
       tags$hr(), tags$br(),
       tags$h4(tags$strong("3. Identification visuals (time series + ACF/PACF)")),
@@ -13069,7 +14790,7 @@ server <- function(input, output, session) {
         "followed by ACF/PACF for the training series and for the differenced series implied by the chosen (d, D, s)."
       ),
       
-      tags$br(), 
+      tags$br(),
       tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure A. Time series with split marker")),
       plotOutput("manual_report_ts_plot", height = 360),
       
@@ -13080,12 +14801,10 @@ server <- function(input, output, session) {
       tags$hr(),
       uiOutput("manual_report_stationarity"),
       
-      
       # 5. Transformed series: differencing and seasonality
       tags$hr(), tags$br(),
       tags$h4(tags$strong("5. Transformed series: differencing and seasonality")),
       
-
       tags$br(),
       tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure B. Seasonal subseries")),
       plotOutput("manual_report_subseries", height = 360),
@@ -13112,7 +14831,6 @@ server <- function(input, output, session) {
         column(6, plotOutput("manual_report_pacf_mod", height = 280))
       ),
       
-      
       tags$hr(), tags$br(),
       uiOutput("manual_report_stationarity_mod"),
       
@@ -13136,9 +14854,7 @@ server <- function(input, output, session) {
         "In total, <b>", n_sig, "</b> parameter(s) were significant at α = .05 (marked by *, **, ***)."
       ))),
       
-      
-      
-      # 7. Model equations (replication-ready
+      # 7. Model equations (replication-ready)
       tags$hr(), tags$br(),
       tags$h4(tags$strong("7. Model equations (replication-ready)")),
       tags$p(
@@ -13147,21 +14863,26 @@ server <- function(input, output, session) {
       ),
       tags$div(
         style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;",
+        
+        tags$br(), tags$hr(), tags$hr(),
         tags$h5("General SARIMA formulation"),
         HTML(eq$eq_general),
-        tags$hr(),
+        
+        tags$br(), tags$hr(), tags$hr(),
         tags$h5("Expanded operator form"),
         HTML(eq$eq_expanded),
-        tags$hr(),
+        
+        tags$br(), tags$hr(), tags$hr(),
         tags$h5("Numerical model"),
         HTML(eq$eq_line3),
-        tags$hr(),
-        HTML(eq$eq_line4)
+        
+        tags$br(), tags$hr(), tags$hr(),
+        HTML(eq$eq_line4),
+        
+        tags$br(), tags$hr(), tags$hr()
       ),
       
-      
-      
-      # 8. Residual diagnostics (graphical evidence
+      # 8. Residual diagnostics (graphical evidence)
       tags$hr(), tags$br(),
       tags$h4(tags$strong("8. Residual diagnostics (graphical evidence)")),
       tags$p(
@@ -13178,13 +14899,10 @@ server <- function(input, output, session) {
         column(6, plotOutput("manual_resid_qq",   height = 220))
       ),
       
-      
       tags$h5("Ljung–Box p-values by lag"),
       plotOutput("manual_resid_lb_pvals", height = 260),
       
-      
-      
-      # "9. Residual tests (formal inference
+      # 9. Residual tests (formal inference)
       tags$hr(), tags$br(),
       tags$h4(tags$strong("9. Residual tests (formal inference)")),
       tags$p(
@@ -13197,8 +14915,6 @@ server <- function(input, output, session) {
       tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table C. Residual test summary")),
       html_table(tests_df),
       tags$p(tags$b("Diagnostic synthesis. "), diag_verdict),
-      
-      
       
       # 10. Forecasting results and predictive performance
       tags$hr(), tags$br(),
@@ -13222,6 +14938,28 @@ server <- function(input, output, session) {
       tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Accuracy table (your app output)")),
       tableOutput("manual_accuracy_table"),
       
+      # ---------- Back-transformed forecasts (original scale) + plot placeholder
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("10.B Back-transformed forecasts (original scale)")),
+      if (!identical(tr_global, "none")) tagList(
+        tags$p("Because the model was estimated on the transformed series, forecasts are reported below on the original measurement scale using an appropriate bias adjustment for the point forecasts."),
+        tags$div(
+          style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;",
+          tags$h5("Inverse transform equation (simple form)"),
+          inv_equation_html,
+          tags$br(),
+          inv_note_html
+        ),
+        
+        tags$hr(), tags$br(),
+        tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Original-scale plot (observed + forecast + CIs)")),
+        # NOTE: you must define output$manual_forecast_plot_original <- renderPlot(...) elsewhere in server
+        plotOutput("manual_forecast_plot_original", height = 420),
+        
+        tags$hr(), tags$br(),
+        tags$h5("Back-transformed forecast table (original scale)"),
+        html_table(fc_orig_df_fmt)
+      ) else tags$em("No transformation was applied; forecasts are already on the original scale."),
       
       # 11. Final conclusion (academic)
       tags$hr(), tags$br(),
@@ -13237,10 +14975,14 @@ server <- function(input, output, session) {
         " (i) specification + IC, (ii) parameter inference, (iii) equation reporting, (iv) residual validation with plots and tests, and (v) forecasting with accuracy assessment."
       ),
       
-      tags$br(), tags$hr(), tags$br(), tags$br(),
-      
+      tags$br(), tags$hr(), tags$br(), tags$br()
     )
   })
+  
+  
+  
+  
+  
   
   
   

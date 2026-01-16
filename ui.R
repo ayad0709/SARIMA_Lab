@@ -145,10 +145,20 @@ ui <- fluidPage(
           "Roadmap",
           tabsetPanel(
             tabPanel(title = "Roadmap", uiOutput("roadmap_ui")),
+            # tabPanel(title = "Environment",verbatimTextOutput("package_status")),
             tabPanel(title = "Roadmap (Detailed Ang)", uiOutput("roadmap_Detailed_Ang_ui")),
-            tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui"))
+            tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui")),
           )
         ),
+        
+        # tabPanel(
+        #   "Roadmap",
+        #   tabsetPanel(
+        #     tabPanel(title = "Roadmap", uiOutput("roadmap_ui")),
+        #     tabPanel(title = "Roadmap (Detailed Ang)", uiOutput("roadmap_Detailed_Ang_ui")),
+        #     tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui"))
+        #   )
+        # ),
         
         #---------------------
         #  1️ 1—Descriptives
@@ -282,7 +292,7 @@ ui <- fluidPage(
                     ),
                     
                     # =============== Labels size ===============
-                    sliderInput("stp_base_size", "Base font size", min = 8, max = 20, value = 12, step = 1),
+                    sliderInput("stp_base_size", "Base font size", min = 8, max = 40, value = 12, step = 1),
                     
                     # =============== Output size ===============
                     wellPanel(
