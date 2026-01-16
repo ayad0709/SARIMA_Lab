@@ -145,7 +145,7 @@ ui <- fluidPage(
           "Roadmap",
           tabsetPanel(
             tabPanel(title = "Roadmap", uiOutput("roadmap_ui")),
-            # tabPanel(title = "Environment",verbatimTextOutput("package_status")),
+            tabPanel(title = "Environment",uiOutput("package_status")),
             tabPanel(title = "Roadmap (Detailed Ang)", uiOutput("roadmap_Detailed_Ang_ui")),
             tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui")),
           )
@@ -844,13 +844,13 @@ ui <- fluidPage(
                   "Residual tests",
                   tags$head(tags$style(HTML("
                     #manual_diag_tests{
-                      height: 640px !important;
-                      max-height: 700px;
-                      width: 100% !important;
+                      height: 750px !important;
+                      max-height: 800px;
+                      width: 120% !important;
                       white-space: pre;
                       overflow-y: auto;
                       border: 2px solid #cccccc;
-                      font-size: 13px;
+                      font-size: 14px;
                     }
                   "))),
                   verbatimTextOutput("manual_diag_tests")
