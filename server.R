@@ -8,12 +8,120 @@ library(lubridate)
 library(zoo)
 library(tseries)
 library(urca)
+library(gridExtra)
+library(colourpicker)
+library(patchwork)
+library(scales)
+library(DT)
 
 
 has_pkg <- function(pkg) requireNamespace(pkg, quietly = TRUE)
 
 
 
+
+# ---------- Safety helpers (add once) ----------
+
+is_finite_vec <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  length(x) > 0 && any(is.finite(x))
+}
+
+safe_range <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  if (length(x) == 0) return(NULL)
+  r <- suppressWarnings(range(x, na.rm = TRUE, finite = TRUE))
+  if (length(r) != 2 || any(!is.finite(r))) return(NULL)
+  if (diff(r) == 0) return(NULL)
+  r
+}
+
+# Safely extract and standardize coefficient table from MANY model types
+coef_table_safe <- function(fit) {
+  sm <- tryCatch(summary(fit), error = function(e) NULL)
+  if (is.null(sm)) return(data.frame())
+  
+  # try common places:
+  co <- NULL
+  if (!is.null(sm$coef)) co <- sm$coef
+  if (is.null(co) && !is.null(sm$coefficients)) co <- sm$coefficients
+  if (is.null(co)) return(data.frame())
+  
+  co <- as.data.frame(co)
+  co$term <- rownames(co)
+  rownames(co) <- NULL
+  
+  # normalize column names
+  nm <- names(co)
+  nm0 <- tolower(gsub("[^a-z]+", "", nm))
+  
+  # Attempt to find estimate/se/t/p columns flexibly
+  pick <- function(keys) {
+    idx <- which(nm0 %in% keys)
+    if (length(idx) == 0) NA_integer_ else idx[1]
+  }
+  
+  i_est <- pick(c("estimate", "est", "coef", "value"))
+  i_se  <- pick(c("se", "stderror", "stderr", "sestd"))
+  i_t   <- pick(c("tvalue", "tstat", "zvalue", "zstat", "statistic"))
+  i_p   <- pick(c("prtz", "prgtz", "prgt", "prtt", "prgtz", "pvalue", "pr", "prt"))
+  
+  out <- data.frame(
+    term = co$term,
+    est  = if (!is.na(i_est)) suppressWarnings(as.numeric(co[[i_est]])) else NA_real_,
+    se   = if (!is.na(i_se))  suppressWarnings(as.numeric(co[[i_se]]))  else NA_real_,
+    stat = if (!is.na(i_t))   suppressWarnings(as.numeric(co[[i_t]]))   else NA_real_,
+    p    = if (!is.na(i_p))   suppressWarnings(as.numeric(co[[i_p]]))   else NA_real_,
+    stringsAsFactors = FALSE
+  )
+  
+  out
+}
+
+sig_stars <- function(p) {
+  if (!is.finite(p)) return("")
+  if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else if (p < 0.1) "." else ""
+}
+
+
+
+
+
+
+build_xreg_split <- function(df, cols, train_n, test_n, scale_x = FALSE) {
+  if (length(cols) == 0) return(list(x_train = NULL, x_test = NULL, x_all = NULL))
+  
+  X <- df[, cols, drop = FALSE]
+  
+  # keep numeric columns only (convert logical to numeric)
+  for (nm in names(X)) {
+    if (is.logical(X[[nm]])) X[[nm]] <- as.numeric(X[[nm]])
+  }
+  # force numeric
+  X <- data.frame(lapply(X, function(z) suppressWarnings(as.numeric(z))), check.names = FALSE)
+  
+  # handle missing values in xreg (simple: linear interpolation + LOCF fallback)
+  for (j in seq_along(X)) {
+    v <- X[[j]]
+    idx <- which(is.finite(v))
+    if (length(idx) >= 2) {
+      v[!is.finite(v)] <- approx(x = idx, y = v[idx], xout = which(!is.finite(v)), method = "linear", rule = 2)$y
+    }
+    # if still NA (all missing), set 0
+    v[!is.finite(v)] <- 0
+    X[[j]] <- v
+  }
+  
+  if (isTRUE(scale_x)) {
+    X <- as.data.frame(scale(X), check.names = FALSE)
+  }
+  
+  X_mat <- as.matrix(X)
+  x_train <- X_mat[seq_len(train_n), , drop = FALSE]
+  x_test  <- if (test_n > 0) X_mat[(train_n + 1):(train_n + test_n), , drop = FALSE] else NULL
+  
+  list(x_train = x_train, x_test = x_test, x_all = X_mat)
+}
 
 
 
@@ -65,10 +173,21 @@ fmt_p <- function(p) {
   paste0("p = ", s)
 }
 
-fmt_num <- function(x, digits = 2) {
-  if (is.na(x)) return("NA")
-  format(round(x, digits), nsmall = digits, trim = TRUE)
+
+
+fmt_num <- function(x, digits = 4, trim = TRUE) {
+  x <- suppressWarnings(as.numeric(x))
+  if (length(x) == 0 || !is.finite(x)) return("NA")
+  format(round(x, digits), nsmall = digits, trim = trim)
 }
+
+# fmt_num <- function(x, digits = 2) {
+#   if (is.na(x)) return("NA")
+#   format(round(x, digits), nsmall = digits, trim = TRUE)
+# }
+
+
+
 
 fmt_pct <- function(x, digits = 1) {
   if (is.na(x)) return("NA")
@@ -77,21 +196,21 @@ fmt_pct <- function(x, digits = 1) {
 
 # ---------------- Dates & time grid ----------------
 
-parse_dates <- function(x) {
-  if (inherits(x, "Date")) return(x)
-  if (is.numeric(x)) return(as.Date(x, origin = "1899-12-30"))
-  x_chr <- as.character(x)
-
-  d <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr)))
-  if (all(is.na(d))) {
-    d <- suppressWarnings(lubridate::parse_date_time(
-      x_chr,
-      orders = c("ymd", "dmy", "mdy", "Ymd", "Y-m-d", "d-m-Y", "m/d/Y", "Y", "ym", "my", "bY", "Y-b", "any")
-    ))
-    d <- as.Date(d)
-  }
-  d
-}
+# parse_dates <- function(x) {
+#   if (inherits(x, "Date")) return(x)
+#   if (is.numeric(x)) return(as.Date(x, origin = "1899-12-30"))
+#   x_chr <- as.character(x)
+# 
+#   d <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr)))
+#   if (all(is.na(d))) {
+#     d <- suppressWarnings(lubridate::parse_date_time(
+#       x_chr,
+#       orders = c("ymd", "dmy", "mdy", "Ymd", "Y-m-d", "d-m-Y", "m/d/Y", "Y", "ym", "my", "bY", "Y-b", "any")
+#     ))
+#     d <- as.Date(d)
+#   }
+#   d
+# }
 
 freq_value <- function(input) {
   if (identical(input$frequency, "other")) as.numeric(input$customFrequency) else as.numeric(input$frequency)
@@ -302,6 +421,64 @@ gg_forecast_plot <- function(obs_df, train_n, fc_df, title) {
 
   p + geom_line(data = fc_df, aes(x = x, y = mean, color = "Forecast"), linewidth = 1)
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+#=========================================================================================================
+
+
+
+
+
+
 
 # ---------------- Shiny server ----------------
 
@@ -577,9 +754,74 @@ server <- function(input, output, session) {
   # ============================================================
   # --- MOD: display Date columns as readable strings in the preview table ---
   # ============================================================
+  
+  # output$full_data_table <- DT::renderDataTable({
+  #   req(raw_data())
+  #   
+  #   df <- raw_data()
+  #   
+  #   # optional: make Date/POSIX columns print nicely
+  #   for (nm in names(df)) {
+  #     if (inherits(df[[nm]], "Date")) df[[nm]] <- format(df[[nm]], "%Y-%m-%d")
+  #     if (inherits(df[[nm]], "POSIXt")) df[[nm]] <- format(df[[nm]], "%Y-%m-%d %H:%M:%S")
+  #   }
+  #   
+  #   DT::datatable(
+  #     df,
+  #     rownames = FALSE,
+  #     filter = "top",
+  #     extensions = c("Scroller"),
+  #     options = list(
+  #       deferRender = TRUE,
+  #       scrollX = TRUE,
+  #       scrollY = 520,
+  #       scroller = TRUE,
+  #       pageLength = 25,
+  #       lengthMenu = list(c(10, 25, 50, 100, -1), c("10", "25", "50", "100", "All"))
+  #     )
+  #   )
+  # })
+  
+  output$full_data_table <- DT::renderDataTable({
+    req(raw_data())
+    
+    df <- raw_data()
+    
+    # ✅ Force Date & POSIX columns to Day-Month-Year
+    for (nm in names(df)) {
+      if (inherits(df[[nm]], "Date")) {
+        df[[nm]] <- format(df[[nm]], "%d-%m-%Y")
+      }
+      if (inherits(df[[nm]], "POSIXt")) {
+        df[[nm]] <- format(df[[nm]], "%d-%m-%Y %H:%M:%S")
+      }
+    }
+    
+    DT::datatable(
+      df,
+      rownames = FALSE,
+      filter = "top",
+      extensions = "Scroller",
+      options = list(
+        deferRender = TRUE,
+        scrollX = TRUE,
+        scrollY = 520,
+        scroller = TRUE,
+        pageLength = 25,
+        lengthMenu = list(
+          c(10, 25, 50, 100, -1),
+          c("10", "25", "50", "100", "All")
+        )
+      )
+    )
+  })
+  
+  
+  
   output$data_preview <- renderTable({
     req(prepared())
-    df <- head(prepared()$df, 12)
+    # df <- head(prepared()$df, 12)
+    df <- prepared()$df
     
     # MOD: ensure Date columns print nicely (Shiny sometimes prints Date as numeric)
     for (nm in intersect(c("date", "x"), names(df))) {
@@ -608,16 +850,16 @@ server <- function(input, output, session) {
   # output$data_preview <- renderTable({ req(prepared()); head(prepared()$df, 12) }, rownames = FALSE)
   
   
-  output$basic_stats <- renderTable({ req(prepared()); basic_stats_df(prepared()$df$y_filled) }, rownames = FALSE)
+  # output$basic_stats <- renderTable({ req(prepared()); basic_stats_df(prepared()$df$y_filled) }, rownames = FALSE)
 
-  output$hist_plot <- renderPlot({
-    req(prepared())
-    df <- prepared()$df
-    ggplot(df, aes(x = y_filled)) +
-      geom_histogram(bins = 30) +
-      theme_minimal() +
-      labs(title = "Distribution (filled values)", x = "Value", y = "Count")
-  })
+  # output$hist_plot <- renderPlot({
+  #   req(prepared())
+  #   df <- prepared()$df
+  #   ggplot(df, aes(x = y_filled)) +
+  #     geom_histogram(bins = 30) +
+  #     theme_minimal() +
+  #     labs(title = "Distribution (filled values)", x = "Value", y = "Count")
+  # })
 
   output$missing_text <- renderPrint({
     req(prepared())
@@ -659,35 +901,58 @@ server <- function(input, output, session) {
   })
 
   # ---- Step 2 outputs ----
+  
+  output$plot_series <- renderPlot(
+    {
+      req(prepared(), ts_train_test())
+      p <- prepared()
+      s <- ts_train_test()
+      df <- s$dfm
+      df$set <- ifelse(seq_len(nrow(df)) <= s$train_n, "Train", "Test/Future")
+      
+      ggplot(df, aes(x = x, y = y_trans, color = set)) +
+        geom_line(linewidth = 0.9) +
+        theme_minimal() +
+        labs(
+          title = "Time series (transformed)",
+          x = p$x_label,
+          y = "Value",
+          color = NULL
+        ) +
+        theme(legend.position = "bottom")
+    },
+    width = 1000,
+    height = 650
+  )
 
-  output$plot_series <- renderPlot({
-    req(prepared(), ts_train_test())
-    p <- prepared()
-    s <- ts_train_test()
-    df <- s$dfm
-    df$set <- ifelse(seq_len(nrow(df)) <= s$train_n, "Train", "Test/Future")
-    ggplot(df, aes(x = x, y = y_trans, color = set)) +
-      geom_line(linewidth = 0.9) +
-      theme_minimal() +
-      labs(title = "Time series (transformed)", x = p$x_label, y = "Value", color = NULL) +
-      theme(legend.position = "bottom")
-  })
+  # output$plot_series <- renderPlot({
+  #   req(prepared(), ts_train_test())
+  #   p <- prepared()
+  #   s <- ts_train_test()
+  #   df <- s$dfm
+  #   df$set <- ifelse(seq_len(nrow(df)) <= s$train_n, "Train", "Test/Future")
+  #   ggplot(df, aes(x = x, y = y_trans, color = set)) +
+  #     geom_line(linewidth = 0.9) +
+  #     theme_minimal() +
+  #     labs(title = "Time series (transformed)", x = p$x_label, y = "Value", color = NULL) +
+  #     theme(legend.position = "bottom")
+  # })
 
-  output$season_plot <- renderPlot({
-    req(ts_train_test())
-    s <- ts_train_test()
-    x <- ts(c(as.numeric(s$ts_train), as.numeric(s$ts_test)), start = 1, frequency = frequency(s$ts_train))
-    validate(need(frequency(x) >= 2, "Seasonal plots need frequency >= 2."))
-    forecast::seasonplot(x, s = frequency(x))
-  })
+  # output$season_plot <- renderPlot({
+  #   req(ts_train_test())
+  #   s <- ts_train_test()
+  #   x <- ts(c(as.numeric(s$ts_train), as.numeric(s$ts_test)), start = 1, frequency = frequency(s$ts_train))
+  #   validate(need(frequency(x) >= 2, "Seasonal plots need frequency >= 2."))
+  #   forecast::seasonplot(x, s = frequency(x))
+  # })
 
-  output$subseries_plot <- renderPlot({
-    req(ts_train_test())
-    s <- ts_train_test()
-    x <- ts(c(as.numeric(s$ts_train), as.numeric(s$ts_test)), start = 1, frequency = frequency(s$ts_train))
-    validate(need(frequency(x) >= 2, "Subseries plot needs frequency >= 2."))
-    forecast::ggsubseriesplot(x) + theme_minimal()
-  })
+  # output$subseries_plot <- renderPlot({
+  #   req(ts_train_test())
+  #   s <- ts_train_test()
+  #   x <- ts(c(as.numeric(s$ts_train), as.numeric(s$ts_test)), start = 1, frequency = frequency(s$ts_train))
+  #   validate(need(frequency(x) >= 2, "Subseries plot needs frequency >= 2."))
+  #   forecast::ggsubseriesplot(x) + theme_minimal()
+  # })
 
   output$acf_plot <- renderPlot({ req(ts_train_test()); x <- ts_train_test()$ts_train; plot(acf(x, lag.max = min(60, length(x) - 1)), main = "ACF (training)") })
   output$pacf_plot <- renderPlot({ req(ts_train_test()); x <- ts_train_test()$ts_train; plot(pacf(x, lag.max = min(60, length(x) - 1)), main = "PACF (training)") })
@@ -704,6 +969,2680 @@ server <- function(input, output, session) {
     )
   })
 
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  
+  
+  
+  
+  
+  # ============================================================
+  # S(t) plots tab (SERVER) — paste INSIDE server()
+  # ============================================================
+  
+  # ---- helpers ----
+  to_num <- function(x, d = NA_real_) {
+    y <- suppressWarnings(as.numeric(x))
+    ifelse(is.finite(y), y, d)
+  }
+  
+  # fmt_num <- function(x, d = 4) {
+  #   if (!is.finite(x)) return("NA")
+  #   format(round(x, d), nsmall = d)
+  # }
+  
+  # ============================================================
+  # 0) Scope control: prevent "Training only" when train_prop == 1.00
+  # ============================================================
+  output$stp_scope_ui <- renderUI({
+    tp <- to_num(input$train_prop, 1)
+    has_test <- isTRUE(tp < 1)
+    
+    if (!has_test) {
+      radioButtons(
+        "stp_scope",
+        label = NULL,
+        choices = c("Full series" = "full"),
+        selected = "full"
+      )
+    } else {
+      radioButtons(
+        "stp_scope",
+        label = NULL,
+        choices = c("Full series" = "full", "Training only" = "train"),
+        selected = input$stp_scope %||% "full"
+      )
+    }
+  })
+  
+  output$stp_scope_warning <- renderUI({
+    tp <- to_num(input$train_prop, 1)
+    if (isTRUE(tp >= 1)) {
+      tags$div(
+        style = "color:#b22222; font-size:12px; margin-top:-6px;",
+        "No test set → training = full series"
+      )
+    } else NULL
+  })
+  
+  observeEvent(input$train_prop, {
+    tp <- to_num(input$train_prop, 1)
+    if (isTRUE(tp >= 1) && identical(input$stp_scope, "train")) {
+      updateRadioButtons(session, "stp_scope", selected = "full")
+    }
+  }, ignoreInit = TRUE)
+  
+  # ============================================================
+  # 1) Global transform info (read-only)
+  # ============================================================
+  output$stp_transform_info <- renderPrint({
+    tr <- input$transform %||% "none"
+    if (tr == "boxcox") {
+      lam <- input$lambda
+      cat("Transformation:", "Box-Cox", "\n")
+      cat("λ:", if (is.null(lam) || (length(lam) == 1 && is.na(lam))) "auto (estimated)" else as.character(lam), "\n")
+    } else if (tr == "log") {
+      cat("Transformation:", "Log (ln y)", "\n")
+    } else {
+      cat("Transformation:", "None", "\n")
+    }
+  })
+  
+  output$stp_transform_note <- renderUI({
+    tr <- input$transform %||% "none"
+    lam <- input$lambda
+    
+    tr_lbl <- switch(tr,
+                     "none" = "None",
+                     "log" = "Log (ln y)",
+                     "boxcox" = "Box-Cox",
+                     tr)
+    
+    if (identical(tr, "boxcox")) {
+      tags$div(
+        style = "font-size:12px;",
+        tags$b("Transformation (global): "), tr_lbl, " — ",
+        tags$b("λ: "), if (is.null(lam) || is.na(lam)) "auto" else as.character(lam)
+      )
+    } else {
+      tags$div(
+        style = "font-size:12px;",
+        tags$b("Transformation (global): "), tr_lbl
+      )
+    }
+  })
+  
+  # ============================================================
+  # 2) Theme/palette helpers  (IMPORTANT: rotation is controlled here)
+  # ============================================================
+  stp_theme_picker <- function(key) {
+    switch(
+      key,
+      "Minimal" = ggplot2::theme_minimal(),
+      "Classic" = ggplot2::theme_classic(),
+      "Light"   = ggplot2::theme_light(),
+      "Dark"    = ggplot2::theme_dark(),
+      "BW"      = ggplot2::theme_bw(),
+      "Void"    = ggplot2::theme_void(),
+      ggplot2::theme_gray()
+    )
+  }
+  
+  stp_apply_theme <- function(g) {
+    ang <- to_num(input$stp_x_angle, 30)
+    rot <- isTRUE(input$stp_x_rotate %||% TRUE)
+    
+    g +
+      stp_theme_picker(input$stp_theme %||% "Minimal") +
+      ggplot2::theme(
+        text = ggplot2::element_text(size = to_num(input$stp_base_size, 12)),
+        plot.title = ggplot2::element_text(hjust = 0.5),
+        
+        # ✅ rotation is applied HERE so it always wins over the theme preset
+        axis.text.x = ggplot2::element_text(
+          angle = if (rot) ang else 0,
+          hjust = if (!rot || ang == 0) 0.5 else 1,
+          vjust = if (!rot || ang == 0) 0.5 else 1
+        )
+      )
+  }
+  
+  stp_apply_palette <- function(g) {
+    pal <- input$stp_palette %||% "Paired (brewer)"
+    rev <- isTRUE(input$stp_palette_rev)
+    
+    if (pal == "Viridis") {
+      g +
+        ggplot2::scale_color_viridis_d(direction = ifelse(rev, -1, 1)) +
+        ggplot2::scale_fill_viridis_d(direction = ifelse(rev, -1, 1))
+    } else {
+      brewer_name <- sub(" \\(brewer\\)$", "", pal)
+      g +
+        ggplot2::scale_color_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1)) +
+        ggplot2::scale_fill_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1))
+    }
+  }
+  
+  # ============================================================
+  # 3) Conditional style UI (COLOUR PICKERS)
+  # ============================================================
+  output$stp_style_ui <- renderUI({
+    req(input$stp_plot_type)
+    pt <- input$stp_plot_type
+    
+    if (!requireNamespace("colourpicker", quietly = TRUE)) {
+      return(tags$div(
+        style = "color:#b22222; font-size:12px;",
+        "Package 'colourpicker' is required for color pickers. Install it: install.packages('colourpicker')"
+      ))
+    }
+    
+    is_liney <- pt %in% c("Line", "Line + Points", "Smoothed (LOESS)", "Moving average",
+                          "Cumulative sum", "Seasonal plot", "Seasonal subseries",
+                          "Polar seasonal", "Periodogram",
+                          "Classical decomposition (additive)", "Classical decomposition (multiplicative)",
+                          "STL decomposition")
+    
+    is_pointy <- pt %in% c("Points", "Line + Points", "Smoothed (LOESS)",
+                           "Lag-1 scatter", "Lag plot (1..m)", "QQ plot")
+    
+    is_filly  <- pt %in% c("Histogram", "Density", "Seasonal boxplot")
+    
+    tagList(
+      if (is_liney) tagList(
+        colourpicker::colourInput("stp_line_color", "Line color", value = "#2C7FB8", allowTransparent = FALSE),
+        sliderInput("stp_line_width", "Line width", min = 0.2, max = 4, value = 1, step = 0.1)
+      ),
+      if (is_pointy) tagList(
+        colourpicker::colourInput("stp_point_color", "Point color", value = "#2C7FB8", allowTransparent = FALSE),
+        sliderInput("stp_point_size", "Point size", min = 0.5, max = 8, value = 2, step = 0.5)
+      ),
+      if (is_filly) tagList(
+        colourpicker::colourInput("stp_fill_color", "Fill color", value = "#2C7FB8", allowTransparent = FALSE)
+      )
+    )
+  })
+  
+  # ============================================================
+  # 4) Data reactive: choose scope + apply GLOBAL transform
+  # ============================================================
+  stp_data <- reactive({
+    req(prepared(), ts_train_test())
+    p <- prepared()
+    s <- ts_train_test()
+    
+    df_all <- p$df
+    req(df_all)
+    
+    validate(need("y_filled" %in% names(df_all), "prepared()$df must contain column y_filled."))
+    
+    if (!("x" %in% names(df_all))) df_all$x <- seq_len(nrow(df_all))
+    
+    df_all <- df_all[is.finite(df_all$y_filled), , drop = FALSE]
+    validate(need(nrow(df_all) >= 5, "Not enough data to plot."))
+    
+    train_n <- s$train_n %||% floor(nrow(df_all) * to_num(input$train_prop, 1))
+    train_n <- max(2, min(as.integer(train_n), nrow(df_all)))
+    
+    has_test <- isTRUE(to_num(input$train_prop, 1) < 1)
+    scope_in <- input$stp_scope %||% "full"
+    scope <- if (!has_test) "full" else scope_in
+    
+    df_use <- if (identical(scope, "train")) df_all[seq_len(train_n), , drop = FALSE] else df_all
+    
+    tr <- input$transform %||% "none"
+    y <- df_use$y_filled
+    y_plot <- y
+    lambda_used <- NA_real_
+    
+    if (tr == "log") {
+      validate(need(all(y > 0, na.rm = TRUE), "Log transform requires strictly positive values."))
+      y_plot <- log(y)
+    } else if (tr == "boxcox") {
+      validate(need(all(y > 0, na.rm = TRUE), "Box-Cox transform requires strictly positive values."))
+      lam <- input$lambda
+      if (is.null(lam) || (length(lam) == 1 && is.na(lam))) {
+        lam <- forecast::BoxCox.lambda(y, method = "guerrero")
+      } else {
+        lam <- as.numeric(lam)
+      }
+      lambda_used <- lam
+      y_plot <- forecast::BoxCox(y, lam)
+    }
+    
+    df_use$y_plot <- as.numeric(y_plot)
+    
+    freq_use <- p$freq %||% 1
+    ts_use <- stats::ts(df_use$y_plot, start = 1, frequency = freq_use)
+    
+    list(
+      df = df_use,
+      ts = ts_use,
+      freq = freq_use,
+      scope = scope,
+      train_n = train_n,
+      n_total = nrow(df_all),
+      transform = tr,
+      lambda_used = lambda_used,
+      x_is_date = inherits(df_use$x, "Date"),
+      x_is_dt   = inherits(df_use$x, "POSIXct") || inherits(df_use$x, "POSIXt")
+    )
+  })
+  
+  # ============================================================
+  # 5) Labels helper (teaching subtitle)
+  # ============================================================
+  stp_labels <- function(d, default_title = "S(t)", default_y = "Value") {
+    title_in <- input$stp_title %||% ""
+    sub_in   <- input$stp_subtitle %||% ""
+    x_in     <- input$stp_xlab %||% ""
+    y_in     <- input$stp_ylab %||% ""
+    
+    scope_txt <- if (identical(d$scope, "train")) "training" else "full"
+    n_txt <- paste0("n=", nrow(d$df))
+    s_txt <- paste0("s=", d$freq)
+    
+    tr_txt <- switch(
+      d$transform,
+      "log" = "transform=log",
+      "boxcox" = paste0("transform=BoxCox(λ=", ifelse(is.finite(d$lambda_used), fmt_num(d$lambda_used, 3), "auto"), ")"),
+      "none" = "transform=none",
+      "transform=none"
+    )
+    
+    teaching_sub <- paste(scope_txt, n_txt, s_txt, tr_txt, sep = " • ")
+    
+    list(
+      title = if (nzchar(title_in)) title_in else default_title,
+      subtitle = if (nzchar(sub_in)) sub_in else teaching_sub,
+      x = if (nzchar(x_in)) x_in else "Time",
+      y = if (nzchar(y_in)) y_in else default_y
+    )
+  }
+  
+  # ============================================================
+  # 6) Smart date axis (NO ROTATION here)
+  # ============================================================
+  # stp_apply_x_scale <- function(g, d) {
+  #   if (!isTRUE(d$x_is_date) && !isTRUE(d$x_is_dt)) return(g)
+  #   
+  #   n_ticks <- as.integer(to_num(input$stp_x_ticks, 8))
+  #   
+  #   fmt_choice <- input$stp_date_format %||% "auto"
+  #   fmt_custom <- input$stp_date_format_custom %||% "%Y-%m"
+  #   fmt <- if (identical(fmt_choice, "custom")) fmt_custom else fmt_choice
+  #   
+  #   if (identical(fmt, "auto")) {
+  #     n <- nrow(d$df)
+  #     if (n <= 24) fmt <- "%b %Y"
+  #     else if (n <= 120) fmt <- "%Y-%m"
+  #     else fmt <- "%Y"
+  #   }
+  #   
+  #   if (isTRUE(d$x_is_date)) {
+  #     g + ggplot2::scale_x_date(
+  #       labels = scales::date_format(fmt),
+  #       breaks = scales::pretty_breaks(n = n_ticks)
+  #     )
+  #   } else {
+  #     g + ggplot2::scale_x_datetime(
+  #       labels = scales::date_format(fmt),
+  #       breaks = scales::pretty_breaks(n = n_ticks)
+  #     )
+  #   }
+  # }
+  
+  # stp_apply_x_scale <- function(g, d) {
+  #   if (!isTRUE(d$x_is_date) && !isTRUE(d$x_is_dt)) return(g)
+  #   
+  #   n_ticks <- as.integer(to_num(input$stp_x_ticks, 8))
+  #   
+  #   fmt_choice <- input$stp_date_format %||% "auto"
+  #   fmt_custom <- input$stp_date_format_custom %||% "%Y-%m"
+  #   lang <- input$stp_date_lang %||% "en"
+  #   
+  #   # ---- format selection ----
+  #   fmt <- if (identical(fmt_choice, "custom")) fmt_custom else fmt_choice
+  #   
+  #   if (identical(fmt, "auto")) {
+  #     n <- nrow(d$df)
+  #     if (n <= 24) fmt <- "%b %Y"
+  #     else if (n <= 120) fmt <- "%Y-%m"
+  #     else fmt <- "%Y"
+  #   }
+  #   
+  #   # ---- locale mapping ----
+  #   locale_map <- c(
+  #     "en" = "en",
+  #     "fr" = "fr",
+  #     "ar" = "ar"
+  #   )
+  #   locale_use <- locale_map[[lang]] %||% "en"
+  #   
+  #   label_fun <- scales::label_date(
+  #     format = fmt,
+  #     locale = locale_use
+  #   )
+  #   
+  #   if (isTRUE(d$x_is_date)) {
+  #     g + ggplot2::scale_x_date(
+  #       labels = label_fun,
+  #       breaks = scales::pretty_breaks(n = n_ticks)
+  #     )
+  #   } else {
+  #     g + ggplot2::scale_x_datetime(
+  #       labels = label_fun,
+  #       breaks = scales::pretty_breaks(n = n_ticks)
+  #     )
+  #   }
+  # }
+  
+  
+  stp_apply_x_scale <- function(g, d) {
+    if (!isTRUE(d$x_is_date) && !isTRUE(d$x_is_dt)) return(g)
+    
+    n_ticks <- as.integer(to_num(input$stp_x_ticks, 8))
+    
+    fmt_choice <- input$stp_date_format %||% "auto"
+    fmt_custom <- input$stp_date_format_custom %||% "%Y-%m"
+    lang <- input$stp_date_lang %||% "en"
+    
+    # ---- format selection ----
+    fmt <- if (identical(fmt_choice, "custom")) fmt_custom else fmt_choice
+    
+    if (identical(fmt, "auto")) {
+      n <- nrow(d$df)
+      if (n <= 24) fmt <- "%b %Y"
+      else if (n <= 120) fmt <- "%Y-%m"
+      else fmt <- "%Y"
+    }
+    
+    # ---- locale mapping ----
+    locale_map <- c(
+      "en" = "en",
+      "fr" = "fr",
+      "ar" = "ar"
+    )
+    locale_use <- locale_map[[lang]] %||% "en"
+    
+    # ---- label function (locale-aware) ----
+    base_label_fun <- scales::label_date(
+      format = fmt,
+      locale = locale_use
+    )
+    
+    # ---- force Western digits for Arabic labels only ----
+    label_fun <- function(x) {
+      lab <- base_label_fun(x)
+      
+      if (identical(lang, "ar")) {
+        # Arabic-Indic: ٠١٢٣٤٥٦٧٨٩
+        arabic_indic <- c("٠","١","٢","٣","٤","٥","٦","٧","٨","٩")
+        # Eastern Arabic-Indic (Persian): ۰۱۲۳۴۵۶۷۸۹
+        eastern_arabic_indic <- c("۰","۱","۲","۳","۴","۵","۶","۷","۸","۹")
+        western <- as.character(0:9)
+        
+        lab <- as.character(lab)
+        for (i in 0:9) {
+          lab <- gsub(arabic_indic[i + 1], western[i + 1], lab, fixed = TRUE)
+          lab <- gsub(eastern_arabic_indic[i + 1], western[i + 1], lab, fixed = TRUE)
+        }
+      }
+      
+      lab
+    }
+    
+    if (isTRUE(d$x_is_date)) {
+      g + ggplot2::scale_x_date(
+        labels = label_fun,
+        breaks = scales::pretty_breaks(n = n_ticks)
+      )
+    } else {
+      g + ggplot2::scale_x_datetime(
+        labels = label_fun,
+        breaks = scales::pretty_breaks(n = n_ticks)
+      )
+    }
+  }
+  
+  
+  
+  # ============================================================
+  # 7) UI dispatcher for multi-panel plot types
+  # ============================================================
+  # output$stp_plot_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   pt <- input$stp_plot_type
+  #   h <- to_num(input$stp_plot_height_px, 520)
+  #   
+  #   if (pt == "ACF+PACF") {
+  #     fluidRow(
+  #       column(6, plotOutput("stp_acf",  width = "100%", height = h)),
+  #       column(6, plotOutput("stp_pacf", width = "100%", height = h))
+  #     )
+  #   } else if (pt == "Time + ACF+PACF") {
+  #     tagList(
+  #       plotOutput("stp_main", width = "100%", height = round(h * 0.9)),
+  #       fluidRow(
+  #         column(6, plotOutput("stp_acf",  width = "100%", height = round(h * 0.8))),
+  #         column(6, plotOutput("stp_pacf", width = "100%", height = round(h * 0.8)))
+  #       )
+  #     )
+  #   } else if (pt == "Lag plot (1..m)") {
+  #     plotOutput("stp_lag_grid", width = "100%", height = round(h * 1.2))
+  #   } else if (pt == "ACF") {
+  #     plotOutput("stp_acf", width = "100%", height = h)
+  #   } else if (pt == "PACF") {
+  #     plotOutput("stp_pacf", width = "100%", height = h)
+  #   } else {
+  #     plotOutput("stp_main", width = "100%", height = h)
+  #   }
+  # })
+  
+  # output$stp_plot_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   pt <- input$stp_plot_type
+  #   h  <- to_num(input$stp_plot_height_px, 520)
+  #   
+  #   if (pt == "ACF+PACF") {
+  #     
+  #     fluidRow(
+  #       column(6, plotOutput("stp_acf",  width = "100%", height = h)),
+  #       column(6, plotOutput("stp_pacf", width = "100%", height = h))
+  #     )
+  #     
+  #   } else if (pt == "Time + ACF+PACF") {
+  #     
+  #     fluidRow(
+  #       column(
+  #         12,
+  #         
+  #         # TOP: same container width as bottom
+  #         plotOutput("stp_main", width = "100%", height = round(h * 0.9)),
+  #         
+  #         # BOTTOM: ACF + PACF inside SAME column(12)
+  #         fluidRow(
+  #           column(6, plotOutput("stp_acf",  width = "100%", height = round(h * 0.8))),
+  #           column(6, plotOutput("stp_pacf", width = "100%", height = round(h * 0.8)))
+  #         )
+  #       )
+  #     )
+  #     
+  #   } else if (pt == "Lag plot (1..m)") {
+  #     
+  #     plotOutput("stp_lag_grid", width = "100%", height = round(h * 1.2))
+  #     
+  #   } else if (pt == "ACF") {
+  #     
+  #     plotOutput("stp_acf", width = "100%", height = h)
+  #     
+  #   } else if (pt == "PACF") {
+  #     
+  #     plotOutput("stp_pacf", width = "100%", height = h)
+  #     
+  #   } else {
+  #     
+  #     plotOutput("stp_main", width = "100%", height = h)
+  #     
+  #   }
+  # })
+  
+  
+  
+  output$stp_plot_ui <- renderUI({
+    req(input$stp_plot_type)
+    pt <- input$stp_plot_type
+    h  <- to_num(input$stp_plot_height_px, 520)
+    
+    if (pt == "ACF+PACF") {
+      
+      fluidRow(
+        column(6, plotOutput("stp_acf",  width = "100%", height = h)),
+        column(6, plotOutput("stp_pacf", width = "100%", height = h))
+      )
+      
+    } else if (pt == "Time + ACF+PACF") {
+      
+      gap_px <- round(h * 0.12)  # height of empty middle row
+      
+      fluidRow(
+        column(
+          12,
+          
+          # ── Row 1: Time plot ──
+          plotOutput("stp_main", width = "100%", height = round(h * 0.9)),
+          
+          # ── Row 2: empty spacer row ──
+          fluidRow(
+            column(
+              12,
+              div(style = paste0("height:", gap_px, "px;"))
+            )
+          ),
+          
+          # ── Row 3: ACF (left-indented) + PACF (right-indented) ──
+          fluidRow(
+            column(
+              6,
+              div(
+                style = "padding-left: 24px;",
+                plotOutput("stp_acf", width = "100%", height = round(h * 0.6))
+              )
+            ),
+            column(
+              6,
+              div(
+                style = "padding-right: 24px;",
+                plotOutput("stp_pacf", width = "100%", height = round(h * 0.6))
+              )
+            )
+          )
+        )
+      )
+      
+    } else if (pt == "Lag plot (1..m)") {
+      
+      plotOutput("stp_lag_grid", width = "100%", height = round(h * 1.2))
+      
+    } else if (pt == "ACF") {
+      
+      plotOutput("stp_acf", width = "100%", height = h)
+      
+    } else if (pt == "PACF") {
+      
+      plotOutput("stp_pacf", width = "100%", height = h)
+      
+    } else {
+      
+      plotOutput("stp_main", width = "100%", height = h)
+      
+    }
+  })
+  
+  
+  
+  
+  # ============================================================
+  # 8) Main plot  (FIXED ORDER: theme first, x-scale last)
+  # ============================================================
+  output$stp_main <- renderPlot({
+    d <- stp_data()
+    df <- d$df
+    pt <- input$stp_plot_type %||% "Line"
+    
+    line_col <- input$stp_line_color %||% "#2C7FB8"
+    lw       <- to_num(input$stp_line_width, 1)
+    pt_col   <- input$stp_point_color %||% line_col
+    ps       <- to_num(input$stp_point_size, 2)
+    fill_col <- input$stp_fill_color %||% line_col
+    a        <- to_num(input$stp_alpha, 1)
+    
+    labs0 <- stp_labels(d, default_title = "S(t)", default_y = "Value")
+    
+    base <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y_plot)) +
+      ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = labs0$y)
+    
+    # ---- plot switch ----
+    if (pt == "Line") {
+      g <- base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a)
+      g <- stp_apply_theme(g)
+      g <- stp_apply_x_scale(g, d)
+      return(g)
+    }
+    
+    if (pt == "Points") {
+      g <- base + ggplot2::geom_point(color = pt_col, size = ps, alpha = a)
+      g <- stp_apply_theme(g)
+      g <- stp_apply_x_scale(g, d)
+      return(g)
+    }
+    
+    if (pt == "Line + Points") {
+      g <- base +
+        ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+        ggplot2::geom_point(color = pt_col, size = ps, alpha = a)
+      g <- stp_apply_theme(g)
+      g <- stp_apply_x_scale(g, d)
+      return(g)
+    }
+    
+    if (pt == "Smoothed (LOESS)") {
+      span <- to_num(input$stp_loess_span, 0.4)
+      g <- base +
+        ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+        ggplot2::geom_smooth(method = "loess", span = span, se = TRUE,
+                             color = line_col, linewidth = lw, alpha = 0.2)
+      g <- stp_apply_theme(g)
+      g <- stp_apply_x_scale(g, d)
+      return(g)
+    }
+    
+    if (pt == "Moving average") {
+      k <- as.integer(to_num(input$stp_ma_k, 5))
+      show_raw <- isTRUE(input$stp_ma_show_raw)
+      
+      df2 <- df
+      df2$ma <- zoo::rollmean(df2$y_plot, k = k, fill = NA, align = "center")
+      
+      g <- ggplot2::ggplot(df2, ggplot2::aes(x = x)) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = labs0$y)
+      
+      if (show_raw) {
+        g <- g + ggplot2::geom_line(ggplot2::aes(y = y_plot), color = "gray60", linewidth = 0.6, alpha = 0.7)
+      }
+      g <- g + ggplot2::geom_line(ggplot2::aes(y = ma), color = line_col, linewidth = lw, alpha = a)
+      
+      g <- stp_apply_theme(g)
+      g <- stp_apply_x_scale(g, d)
+      return(g)
+    }
+    
+    if (pt == "Cumulative sum") {
+      df2 <- df
+      df2$cs <- cumsum(df2$y_plot)
+      
+      g <- ggplot2::ggplot(df2, ggplot2::aes(x = x, y = cs)) +
+        ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = "Cumsum")
+      
+      g <- stp_apply_theme(g)
+      g <- stp_apply_x_scale(g, d)
+      return(g)
+    }
+    
+    
+    # ---- Seasonal plots ----
+    if (pt %in% c("Seasonal plot", "Seasonal subseries", "Polar seasonal", "Seasonal boxplot")) {
+      validate(need(is.finite(d$freq) && d$freq >= 2, "Seasonal plots require frequency >= 2."))
+      
+      x_ts <- d$ts  # ts object built from y_plot + frequency
+      
+      if (pt == "Seasonal plot") {
+        g <- forecast::ggseasonplot(x_ts, polar = FALSE) +
+          ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+        g <- stp_apply_palette(g)
+        g <- stp_apply_theme(g)
+        return(g)
+      }
+      
+      if (pt == "Polar seasonal") {
+        g <- forecast::ggseasonplot(x_ts, polar = TRUE) +
+          ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+        g <- stp_apply_palette(g)
+        g <- stp_apply_theme(g)
+        return(g)
+      }
+      
+      if (pt == "Seasonal subseries") {
+        g <- forecast::ggsubseriesplot(x_ts) +
+          ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+        g <- stp_apply_theme(g)
+        return(g)
+      }
+      
+      if (pt == "Seasonal boxplot") {
+        df2 <- data.frame(season = factor(stats::cycle(x_ts)), y = as.numeric(x_ts))
+        g <- ggplot2::ggplot(df2, ggplot2::aes(x = season, y = y, fill = season)) +
+          ggplot2::geom_boxplot(alpha = 0.6) +
+          ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "Season", y = labs0$y)
+        g <- stp_apply_palette(g)
+        g <- stp_apply_theme(g)
+        return(g)
+      }
+    }
+    
+    # ---- Decomposition plots ----
+    if (pt %in% c("Classical decomposition (additive)", "Classical decomposition (multiplicative)")) {
+      validate(need(is.finite(d$freq) && d$freq >= 2, "Decomposition requires frequency >= 2."))
+      
+      x_ts <- d$ts
+      type <- if (pt == "Classical decomposition (multiplicative)") "multiplicative" else "additive"
+      
+      # multiplicative requires strictly positive values
+      if (type == "multiplicative") {
+        validate(need(all(as.numeric(x_ts) > 0), "Multiplicative decomposition requires strictly positive values."))
+      }
+      
+      dc <- stats::decompose(x_ts, type = type)
+      g <- forecast::autoplot(dc) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+      g <- stp_apply_theme(g)
+      return(g)
+    }
+    
+    if (pt == "STL decomposition") {
+      validate(need(is.finite(d$freq) && d$freq >= 2, "STL requires frequency >= 2."))
+      
+      x_ts <- d$ts
+      fit <- stats::stl(x_ts, s.window = "periodic", robust = TRUE)
+      
+      g <- forecast::autoplot(fit) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+      g <- stp_apply_theme(g)
+      return(g)
+    }
+    
+    
+    
+    
+    if (pt == "Histogram") {
+      bins <- as.integer(to_num(input$stp_hist_bins, 30))
+      g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+        ggplot2::geom_histogram(bins = bins, fill = fill_col, alpha = a) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$y, y = "Count")
+      return(stp_apply_theme(g))
+    }
+    
+    if (pt == "Density") {
+      bw_adj <- to_num(input$stp_bw_adj, 1)
+      g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+        ggplot2::geom_density(adjust = bw_adj, fill = fill_col, alpha = 0.25) +
+        ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$y, y = "Density")
+      return(stp_apply_theme(g))
+    }
+    
+    if (pt == "QQ plot") {
+      g <- ggplot2::ggplot(df, ggplot2::aes(sample = y_plot)) +
+        ggplot2::stat_qq(color = pt_col, alpha = a) +
+        ggplot2::stat_qq_line(color = line_col, linewidth = lw) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "Theoretical", y = "Sample")
+      return(stp_apply_theme(g))
+    }
+    
+    if (pt == "Lag-1 scatter") {
+      y <- df$y_plot
+      validate(need(length(y) >= 3, "Not enough observations for lag scatter."))
+      dfl <- data.frame(x = y[-length(y)], y = y[-1])
+      g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+        ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+        ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "S(t-1)", y = "S(t)")
+      return(stp_apply_theme(g))
+    }
+    
+    # (seasonal/decomposition/periodogram parts unchanged...)
+    stp_apply_theme(base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a))
+    
+  }, width  = function() to_num(input$stp_plot_width_px, 980),
+  height = function() to_num(input$stp_plot_height_px, 520))
+  
+  # ============================================================
+  # 9) ACF/PACF panels
+  # ============================================================
+  output$stp_acf <- renderPlot({
+    d <- stp_data()
+    x_ts <- d$ts
+    L <- min(60, length(x_ts) - 1)
+    g <- forecast::ggAcf(x_ts, lag.max = L) +
+      ggplot2::labs(title = "ACF", subtitle = stp_labels(d)$subtitle)
+    stp_apply_theme(g)
+  })
+  
+  output$stp_pacf <- renderPlot({
+    d <- stp_data()
+    x_ts <- d$ts
+    L <- min(60, length(x_ts) - 1)
+    g <- forecast::ggPacf(x_ts, lag.max = L) +
+      ggplot2::labs(title = "PACF", subtitle = stp_labels(d)$subtitle)
+    stp_apply_theme(g)
+  })
+  
+  # ============================================================
+  # 10) Lag grid (1..m)
+  # ============================================================
+  output$stp_lag_grid <- renderPlot({
+    d <- stp_data()
+    df <- d$df
+    
+    m <- as.integer(to_num(input$stp_lag_m, 12))
+    validate(need(m >= 1, "m must be >= 1."))
+    
+    y <- df$y_plot
+    validate(need(length(y) >= (m + 2), "Not enough observations for requested lag grid."))
+    
+    out <- lapply(1:m, function(k) {
+      data.frame(
+        lag = paste0("Lag ", k),
+        x = y[seq_len(length(y) - k)],
+        y = y[(k + 1):length(y)]
+      )
+    })
+    dfl <- do.call(rbind, out)
+    
+    pt_col <- input$stp_point_color %||% "#2C7FB8"
+    ps <- to_num(input$stp_point_size, 2)
+    a  <- to_num(input$stp_alpha, 1)
+    
+    g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+      ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+      ggplot2::facet_wrap(~ lag, scales = "free", ncol = 3) +
+      ggplot2::labs(title = "Lag plots (1..m)", subtitle = stp_labels(d)$subtitle, x = "S(t-k)", y = "S(t)")
+    
+    stp_apply_theme(g)
+    
+  }, width  = function() to_num(input$stp_plot_width_px, 980),
+  height = function() round(to_num(input$stp_plot_height_px, 520) * 1.2))
+  
+  
+  
+  
+  # 
+  # 
+  # # ============================================================
+  # # S(t) plots tab (SERVER) — paste INSIDE server()
+  # # ============================================================
+  # 
+  # # ---- helpers ----
+  # to_num <- function(x, d = NA_real_) {
+  #   y <- suppressWarnings(as.numeric(x))
+  #   ifelse(is.finite(y), y, d)
+  # }
+  # 
+  # fmt_num <- function(x, d = 4) {
+  #   if (!is.finite(x)) return("NA")
+  #   format(round(x, d), nsmall = d)
+  # }
+  # 
+  # # ============================================================
+  # # 0) Scope control: prevent "Training only" when train_prop == 1.00
+  # # ============================================================
+  # output$stp_scope_ui <- renderUI({
+  #   tp <- to_num(input$train_prop, 1)
+  #   has_test <- isTRUE(tp < 1)
+  #   
+  #   if (!has_test) {
+  #     radioButtons(
+  #       "stp_scope",
+  #       label = NULL,
+  #       choices = c("Full series" = "full"),
+  #       selected = "full"
+  #     )
+  #   } else {
+  #     radioButtons(
+  #       "stp_scope",
+  #       label = NULL,
+  #       choices = c("Full series" = "full", "Training only" = "train"),
+  #       selected = input$stp_scope %||% "full"
+  #     )
+  #   }
+  # })
+  # 
+  # output$stp_scope_warning <- renderUI({
+  #   tp <- to_num(input$train_prop, 1)
+  #   if (isTRUE(tp >= 1)) {
+  #     tags$div(
+  #       style = "color:#b22222; font-size:12px; margin-top:-6px;",
+  #       "No test set → training = full series (Training-only is disabled)."
+  #     )
+  #   } else NULL
+  # })
+  # 
+  # observeEvent(input$train_prop, {
+  #   tp <- to_num(input$train_prop, 1)
+  #   if (isTRUE(tp >= 1) && identical(input$stp_scope, "train")) {
+  #     updateRadioButtons(session, "stp_scope", selected = "full")
+  #   }
+  # }, ignoreInit = TRUE)
+  # 
+  # # ============================================================
+  # # 1) Global transform info (read-only)
+  # # ============================================================
+  # output$stp_transform_info <- renderPrint({
+  #   tr <- input$transform %||% "none"
+  #   if (tr == "boxcox") {
+  #     lam <- input$lambda
+  #     cat("Transformation:", "Box-Cox", "\n")
+  #     cat("λ:", if (is.null(lam) || (length(lam) == 1 && is.na(lam))) "auto (estimated)" else as.character(lam), "\n")
+  #   } else if (tr == "log") {
+  #     cat("Transformation:", "Log (ln y)", "\n")
+  #   } else {
+  #     cat("Transformation:", "None", "\n")
+  #   }
+  # })
+  # 
+  # output$stp_transform_note <- renderUI({
+  #   tr <- input$transform %||% "none"
+  #   lam <- input$lambda
+  #   
+  #   tr_lbl <- switch(tr,
+  #                    "none" = "None",
+  #                    "log" = "Log (ln y)",
+  #                    "boxcox" = "Box-Cox",
+  #                    tr)
+  #   
+  #   if (identical(tr, "boxcox")) {
+  #     tags$div(
+  #       style = "font-size:12px;",
+  #       tags$b("Transformation (global): "), tr_lbl, " — ",
+  #       tags$b("λ: "), if (is.null(lam) || is.na(lam)) "auto" else as.character(lam)
+  #     )
+  #   } else {
+  #     tags$div(
+  #       style = "font-size:12px;",
+  #       tags$b("Transformation (global): "), tr_lbl
+  #     )
+  #   }
+  # })
+  # 
+  # # ============================================================
+  # # 2) Theme/palette helpers  (IMPORTANT: no forced axis rotation here)
+  # # ============================================================
+  # stp_theme_picker <- function(key) {
+  #   switch(
+  #     key,
+  #     "Minimal" = ggplot2::theme_minimal(),
+  #     "Classic" = ggplot2::theme_classic(),
+  #     "Light"   = ggplot2::theme_light(),
+  #     "Dark"    = ggplot2::theme_dark(),
+  #     "BW"      = ggplot2::theme_bw(),
+  #     "Void"    = ggplot2::theme_void(),
+  #     ggplot2::theme_gray()
+  #   )
+  # }
+  # 
+  # 
+  # stp_apply_theme <- function(g) {
+  #   ang <- to_num(input$stp_x_angle, 30)
+  #   rot <- isTRUE(input$stp_x_rotate %||% TRUE)
+  #   
+  #   g +
+  #     stp_theme_picker(input$stp_theme %||% "Minimal") +
+  #     ggplot2::theme(
+  #       text = ggplot2::element_text(size = to_num(input$stp_base_size, 12)),
+  #       plot.title = ggplot2::element_text(hjust = 0.5),
+  #       axis.text.x = ggplot2::element_text(
+  #         angle = if (rot) ang else 0,
+  #         hjust = if (!rot || ang == 0) 0.5 else 1,
+  #         vjust = if (!rot || ang == 0) 0.5 else 1
+  #       )
+  #     )
+  # }
+  # 
+  # 
+  # 
+  # # stp_apply_theme <- function(g) {
+  # #   g +
+  # #     stp_theme_picker(input$stp_theme %||% "Minimal") +
+  # #     ggplot2::theme(
+  # #       text = ggplot2::element_text(size = to_num(input$stp_base_size, 12)),
+  # #       plot.title = ggplot2::element_text(hjust = 0.5)
+  # #       # NOTE: do NOT set axis.text.x angle here
+  # #     )
+  # # }
+  # 
+  # stp_apply_palette <- function(g) {
+  #   pal <- input$stp_palette %||% "Paired (brewer)"
+  #   rev <- isTRUE(input$stp_palette_rev)
+  #   
+  #   if (pal == "Viridis") {
+  #     g +
+  #       ggplot2::scale_color_viridis_d(direction = ifelse(rev, -1, 1)) +
+  #       ggplot2::scale_fill_viridis_d(direction = ifelse(rev, -1, 1))
+  #   } else {
+  #     brewer_name <- sub(" \\(brewer\\)$", "", pal)
+  #     g +
+  #       ggplot2::scale_color_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1)) +
+  #       ggplot2::scale_fill_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1))
+  #   }
+  # }
+  # 
+  # # ============================================================
+  # # 3) Conditional style UI (COLOUR PICKERS)
+  # # ============================================================
+  # output$stp_style_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   pt <- input$stp_plot_type
+  #   
+  #   if (!requireNamespace("colourpicker", quietly = TRUE)) {
+  #     return(tags$div(
+  #       style = "color:#b22222; font-size:12px;",
+  #       "Package 'colourpicker' is required for color pickers. Install it: install.packages('colourpicker')"
+  #     ))
+  #   }
+  #   
+  #   is_liney <- pt %in% c("Line", "Line + Points", "Smoothed (LOESS)", "Moving average",
+  #                         "Cumulative sum", "Seasonal plot", "Seasonal subseries",
+  #                         "Polar seasonal", "Periodogram",
+  #                         "Classical decomposition (additive)", "Classical decomposition (multiplicative)",
+  #                         "STL decomposition")
+  #   
+  #   is_pointy <- pt %in% c("Points", "Line + Points", "Smoothed (LOESS)",
+  #                          "Lag-1 scatter", "Lag plot (1..m)", "QQ plot")
+  #   
+  #   is_filly  <- pt %in% c("Histogram", "Density", "Seasonal boxplot")
+  #   
+  #   tagList(
+  #     if (is_liney) tagList(
+  #       colourpicker::colourInput("stp_line_color", "Line color", value = "#2C7FB8", allowTransparent = FALSE),
+  #       sliderInput("stp_line_width", "Line width", min = 0.2, max = 4, value = 1, step = 0.1)
+  #     ),
+  #     if (is_pointy) tagList(
+  #       colourpicker::colourInput("stp_point_color", "Point color", value = "#2C7FB8", allowTransparent = FALSE),
+  #       sliderInput("stp_point_size", "Point size", min = 0.5, max = 8, value = 2, step = 0.5)
+  #     ),
+  #     if (is_filly) tagList(
+  #       colourpicker::colourInput("stp_fill_color", "Fill color", value = "#2C7FB8", allowTransparent = FALSE)
+  #     )
+  #   )
+  # })
+  # 
+  # # ============================================================
+  # # 4) Data reactive: choose scope + apply GLOBAL transform
+  # # ============================================================
+  # stp_data <- reactive({
+  #   req(prepared(), ts_train_test())
+  #   p <- prepared()
+  #   s <- ts_train_test()
+  #   
+  #   df_all <- p$df
+  #   req(df_all)
+  #   
+  #   validate(need("y_filled" %in% names(df_all), "prepared()$df must contain column y_filled."))
+  #   
+  #   if (!("x" %in% names(df_all))) df_all$x <- seq_len(nrow(df_all))
+  #   
+  #   df_all <- df_all[is.finite(df_all$y_filled), , drop = FALSE]
+  #   validate(need(nrow(df_all) >= 5, "Not enough data to plot."))
+  #   
+  #   train_n <- s$train_n %||% floor(nrow(df_all) * to_num(input$train_prop, 1))
+  #   train_n <- max(2, min(as.integer(train_n), nrow(df_all)))
+  #   
+  #   has_test <- isTRUE(to_num(input$train_prop, 1) < 1)
+  #   scope_in <- input$stp_scope %||% "full"
+  #   scope <- if (!has_test) "full" else scope_in
+  #   
+  #   df_use <- if (identical(scope, "train")) df_all[seq_len(train_n), , drop = FALSE] else df_all
+  #   
+  #   tr <- input$transform %||% "none"
+  #   y <- df_use$y_filled
+  #   y_plot <- y
+  #   lambda_used <- NA_real_
+  #   
+  #   if (tr == "log") {
+  #     validate(need(all(y > 0, na.rm = TRUE), "Log transform requires strictly positive values."))
+  #     y_plot <- log(y)
+  #   } else if (tr == "boxcox") {
+  #     validate(need(all(y > 0, na.rm = TRUE), "Box-Cox transform requires strictly positive values."))
+  #     lam <- input$lambda
+  #     if (is.null(lam) || (length(lam) == 1 && is.na(lam))) {
+  #       lam <- forecast::BoxCox.lambda(y, method = "guerrero")
+  #     } else {
+  #       lam <- as.numeric(lam)
+  #     }
+  #     lambda_used <- lam
+  #     y_plot <- forecast::BoxCox(y, lam)
+  #   }
+  #   
+  #   df_use$y_plot <- as.numeric(y_plot)
+  #   
+  #   freq_use <- p$freq %||% 1
+  #   ts_use <- stats::ts(df_use$y_plot, start = 1, frequency = freq_use)
+  #   
+  #   list(
+  #     df = df_use,
+  #     ts = ts_use,
+  #     freq = freq_use,
+  #     scope = scope,
+  #     train_n = train_n,
+  #     n_total = nrow(df_all),
+  #     transform = tr,
+  #     lambda_used = lambda_used,
+  #     x_is_date = inherits(df_use$x, "Date"),
+  #     x_is_dt   = inherits(df_use$x, "POSIXct") || inherits(df_use$x, "POSIXt")
+  #   )
+  # })
+  # 
+  # # ============================================================
+  # # 5) Labels helper (teaching subtitle)
+  # # ============================================================
+  # stp_labels <- function(d, default_title = "S(t)", default_y = "Value") {
+  #   title_in <- input$stp_title %||% ""
+  #   sub_in   <- input$stp_subtitle %||% ""
+  #   x_in     <- input$stp_xlab %||% ""
+  #   y_in     <- input$stp_ylab %||% ""
+  #   
+  #   scope_txt <- if (identical(d$scope, "train")) "training" else "full"
+  #   n_txt <- paste0("n=", nrow(d$df))
+  #   s_txt <- paste0("s=", d$freq)
+  #   
+  #   tr_txt <- switch(
+  #     d$transform,
+  #     "log" = "transform=log",
+  #     "boxcox" = paste0("transform=BoxCox(λ=", ifelse(is.finite(d$lambda_used), fmt_num(d$lambda_used, 3), "auto"), ")"),
+  #     "none" = "transform=none",
+  #     "transform=none"
+  #   )
+  #   
+  #   teaching_sub <- paste(scope_txt, n_txt, s_txt, tr_txt, sep = " • ")
+  #   
+  #   list(
+  #     title = if (nzchar(title_in)) title_in else default_title,
+  #     subtitle = if (nzchar(sub_in)) sub_in else teaching_sub,
+  #     x = if (nzchar(x_in)) x_in else "Time",
+  #     y = if (nzchar(y_in)) y_in else default_y
+  #   )
+  # }
+  # 
+  # # ============================================================
+  # # 6) Smart date axis + ROTATION (THIS is where rotation belongs)
+  # # ============================================================
+  # 
+  # stp_apply_x_scale <- function(g, d) {
+  #   if (!isTRUE(d$x_is_date) && !isTRUE(d$x_is_dt)) return(g)
+  #   
+  #   n_ticks <- as.integer(to_num(input$stp_x_ticks, 8))
+  #   
+  #   fmt_choice <- input$stp_date_format %||% "auto"
+  #   fmt_custom <- input$stp_date_format_custom %||% "%Y-%m"
+  #   fmt <- if (identical(fmt_choice, "custom")) fmt_custom else fmt_choice
+  #   
+  #   if (identical(fmt, "auto")) {
+  #     n <- nrow(d$df)
+  #     if (n <= 24) fmt <- "%b %Y"
+  #     else if (n <= 120) fmt <- "%Y-%m"
+  #     else fmt <- "%Y"
+  #   }
+  #   
+  #   if (isTRUE(d$x_is_date)) {
+  #     g + ggplot2::scale_x_date(
+  #       labels = scales::date_format(fmt),
+  #       breaks = scales::pretty_breaks(n = n_ticks)
+  #     )
+  #   } else {
+  #     g + ggplot2::scale_x_datetime(
+  #       labels = scales::date_format(fmt),
+  #       breaks = scales::pretty_breaks(n = n_ticks)
+  #     )
+  #   }
+  # }
+  # 
+  # 
+  # 
+  # # stp_apply_x_scale <- function(g, d) {
+  # #   if (!isTRUE(d$x_is_date) && !isTRUE(d$x_is_dt)) return(g)
+  # #   
+  # #   smart   <- isTRUE(input$stp_date_smart %||% TRUE)
+  # #   n_ticks <- as.integer(to_num(input$stp_x_ticks, 8))
+  # #   
+  # #   fmt_choice <- input$stp_date_format %||% "auto"
+  # #   fmt_custom <- input$stp_date_format_custom %||% "%Y-%m"
+  # #   fmt <- if (identical(fmt_choice, "custom")) fmt_custom else fmt_choice
+  # #   
+  # #   if (identical(fmt, "auto")) {
+  # #     n <- nrow(d$df)
+  # #     if (n <= 24) fmt <- "%b %Y"
+  # #     else if (n <= 120) fmt <- "%Y-%m"
+  # #     else fmt <- "%Y"
+  # #   }
+  # #   
+  # #   rot <- isTRUE(input$stp_x_rotate %||% TRUE)
+  # #   ang <- to_num(input$stp_x_angle, 30)
+  # #   
+  # #   g2 <- g
+  # #   
+  # #   # (smart vs non-smart kept for future extension; both limit ticks now)
+  # #   if (isTRUE(d$x_is_date)) {
+  # #     g2 <- g2 + ggplot2::scale_x_date(
+  # #       labels = scales::date_format(fmt),
+  # #       breaks = scales::pretty_breaks(n = n_ticks)
+  # #     )
+  # #   } else {
+  # #     g2 <- g2 + ggplot2::scale_x_datetime(
+  # #       labels = scales::date_format(fmt),
+  # #       breaks = scales::pretty_breaks(n = n_ticks)
+  # #     )
+  # #   }
+  # #   
+  # #   # ✅ rotation with correct justification
+  # #   if (rot) {
+  # #     g2 <- g2 + ggplot2::theme(
+  # #       axis.text.x = ggplot2::element_text(
+  # #         angle = ang,
+  # #         hjust = ifelse(ang == 0, 0.5, 1),
+  # #         vjust = ifelse(ang == 0, 0.5, 1)
+  # #       )
+  # #     )
+  # #   } else {
+  # #     g2 <- g2 + ggplot2::theme(
+  # #       axis.text.x = ggplot2::element_text(angle = 0, hjust = 0.5, vjust = 0.5)
+  # #     )
+  # #   }
+  # #   
+  # #   g2
+  # # }
+  # 
+  # # ============================================================
+  # # 7) UI dispatcher for multi-panel plot types
+  # # ============================================================
+  # output$stp_plot_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   pt <- input$stp_plot_type
+  #   h <- to_num(input$stp_plot_height_px, 520)
+  #   
+  #   if (pt == "ACF+PACF") {
+  #     fluidRow(
+  #       column(6, plotOutput("stp_acf",  width = "100%", height = h)),
+  #       column(6, plotOutput("stp_pacf", width = "100%", height = h))
+  #     )
+  #   } else if (pt == "Time + ACF+PACF") {
+  #     tagList(
+  #       plotOutput("stp_main", width = "100%", height = round(h * 0.9)),
+  #       fluidRow(
+  #         column(6, plotOutput("stp_acf",  width = "100%", height = round(h * 0.8))),
+  #         column(6, plotOutput("stp_pacf", width = "100%", height = round(h * 0.8)))
+  #       )
+  #     )
+  #   } else if (pt == "Lag plot (1..m)") {
+  #     plotOutput("stp_lag_grid", width = "100%", height = round(h * 1.2))
+  #   } else if (pt == "ACF") {
+  #     plotOutput("stp_acf", width = "100%", height = h)
+  #   } else if (pt == "PACF") {
+  #     plotOutput("stp_pacf", width = "100%", height = h)
+  #   } else {
+  #     plotOutput("stp_main", width = "100%", height = h)
+  #   }
+  # })
+  # 
+  # # ============================================================
+  # # 8) Main plot
+  # # ============================================================
+  # output$stp_main <- renderPlot({
+  #   d <- stp_data()
+  #   df <- d$df
+  #   pt <- input$stp_plot_type %||% "Line"
+  #   
+  #   line_col <- input$stp_line_color %||% "#2C7FB8"
+  #   lw       <- to_num(input$stp_line_width, 1)
+  #   pt_col   <- input$stp_point_color %||% line_col
+  #   ps       <- to_num(input$stp_point_size, 2)
+  #   fill_col <- input$stp_fill_color %||% line_col
+  #   a        <- to_num(input$stp_alpha, 1)
+  #   
+  #   labs0 <- stp_labels(d, default_title = "S(t)", default_y = "Value")
+  #   
+  #   base <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y_plot)) +
+  #     ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = labs0$y)
+  #   
+  #   # ✅ apply date scale + rotation BEFORE theme
+  #   base <- stp_apply_x_scale(base, d)
+  #   
+  #   if (pt == "Line") {
+  #     return(stp_apply_theme(base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a)))
+  #   }
+  #   
+  #   if (pt == "Points") {
+  #     return(stp_apply_theme(base + ggplot2::geom_point(color = pt_col, size = ps, alpha = a)))
+  #   }
+  #   
+  #   if (pt == "Line + Points") {
+  #     g <- base +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::geom_point(color = pt_col, size = ps, alpha = a)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Smoothed (LOESS)") {
+  #     span <- to_num(input$stp_loess_span, 0.4)
+  #     g <- base +
+  #       ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #       ggplot2::geom_smooth(method = "loess", span = span, se = TRUE,
+  #                            color = line_col, linewidth = lw, alpha = 0.2)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Moving average") {
+  #     k <- as.integer(to_num(input$stp_ma_k, 5))
+  #     show_raw <- isTRUE(input$stp_ma_show_raw)
+  #     
+  #     df2 <- df
+  #     df2$ma <- zoo::rollmean(df2$y_plot, k = k, fill = NA, align = "center")
+  #     
+  #     g <- ggplot2::ggplot(df2, ggplot2::aes(x = x)) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = labs0$y)
+  #     
+  #     g <- stp_apply_x_scale(g, d)
+  #     
+  #     if (show_raw) g <- g + ggplot2::geom_line(ggplot2::aes(y = y_plot), color = "gray60", linewidth = 0.6, alpha = 0.7)
+  #     g <- g + ggplot2::geom_line(ggplot2::aes(y = ma), color = line_col, linewidth = lw, alpha = a)
+  #     
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Cumulative sum") {
+  #     df2 <- df
+  #     df2$cs <- cumsum(df2$y_plot)
+  #     g <- ggplot2::ggplot(df2, ggplot2::aes(x = x, y = cs)) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = "Cumsum")
+  #     g <- stp_apply_x_scale(g, d)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Histogram") {
+  #     bins <- as.integer(to_num(input$stp_hist_bins, 30))
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+  #       ggplot2::geom_histogram(bins = bins, fill = fill_col, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$y, y = "Count")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Density") {
+  #     bw_adj <- to_num(input$stp_bw_adj, 1)
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+  #       ggplot2::geom_density(adjust = bw_adj, fill = fill_col, alpha = 0.25) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$y, y = "Density")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "QQ plot") {
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(sample = y_plot)) +
+  #       ggplot2::stat_qq(color = pt_col, alpha = a) +
+  #       ggplot2::stat_qq_line(color = line_col, linewidth = lw) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "Theoretical", y = "Sample")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Lag-1 scatter") {
+  #     y <- df$y_plot
+  #     validate(need(length(y) >= 3, "Not enough observations for lag scatter."))
+  #     dfl <- data.frame(x = y[-length(y)], y = y[-1])
+  #     g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+  #       ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "S(t-1)", y = "S(t)")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   # (seasonal/decomposition/periodogram parts unchanged...)
+  #   stp_apply_theme(base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a))
+  #   
+  # }, width  = function() to_num(input$stp_plot_width_px, 980),
+  # height = function() to_num(input$stp_plot_height_px, 520))
+  # 
+  # # ============================================================
+  # # 9) ACF/PACF panels
+  # # ============================================================
+  # output$stp_acf <- renderPlot({
+  #   d <- stp_data()
+  #   x_ts <- d$ts
+  #   L <- min(60, length(x_ts) - 1)
+  #   g <- forecast::ggAcf(x_ts, lag.max = L) + ggplot2::labs(title = "ACF", subtitle = stp_labels(d)$subtitle)
+  #   stp_apply_theme(g)
+  # })
+  # 
+  # output$stp_pacf <- renderPlot({
+  #   d <- stp_data()
+  #   x_ts <- d$ts
+  #   L <- min(60, length(x_ts) - 1)
+  #   g <- forecast::ggPacf(x_ts, lag.max = L) + ggplot2::labs(title = "PACF", subtitle = stp_labels(d)$subtitle)
+  #   stp_apply_theme(g)
+  # })
+  # 
+  # # ============================================================
+  # # 10) Lag grid (1..m)
+  # # ============================================================
+  # output$stp_lag_grid <- renderPlot({
+  #   d <- stp_data()
+  #   df <- d$df
+  #   
+  #   m <- as.integer(to_num(input$stp_lag_m, 12))
+  #   validate(need(m >= 1, "m must be >= 1."))
+  #   
+  #   y <- df$y_plot
+  #   validate(need(length(y) >= (m + 2), "Not enough observations for requested lag grid."))
+  #   
+  #   out <- lapply(1:m, function(k) {
+  #     data.frame(
+  #       lag = paste0("Lag ", k),
+  #       x = y[seq_len(length(y) - k)],
+  #       y = y[(k + 1):length(y)]
+  #     )
+  #   })
+  #   dfl <- do.call(rbind, out)
+  #   
+  #   pt_col <- input$stp_point_color %||% "#2C7FB8"
+  #   ps <- to_num(input$stp_point_size, 2)
+  #   a  <- to_num(input$stp_alpha, 1)
+  #   
+  #   g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+  #     ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #     ggplot2::facet_wrap(~ lag, scales = "free", ncol = 3) +
+  #     ggplot2::labs(title = "Lag plots (1..m)", subtitle = stp_labels(d)$subtitle, x = "S(t-k)", y = "S(t)")
+  #   
+  #   stp_apply_theme(g)
+  #   
+  # }, width  = function() to_num(input$stp_plot_width_px, 980),
+  # height = function() round(to_num(input$stp_plot_height_px, 520) * 1.2))
+  # 
+  # 
+  # 
+  
+  
+  
+  
+
+  # # ============================================================
+  # # S(t) plots tab (SERVER) — paste INSIDE server()
+  # # ============================================================
+  # 
+  # # ---- helpers ----
+  # # `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
+  # 
+  # to_num <- function(x, d = NA_real_) {
+  #   y <- suppressWarnings(as.numeric(x))
+  #   ifelse(is.finite(y), y, d)
+  # }
+  # 
+  # fmt_num <- function(x, d = 4) {
+  #   if (!is.finite(x)) return("NA")
+  #   format(round(x, d), nsmall = d)
+  # }
+  # 
+  # # ============================================================
+  # # 0) Scope control: prevent "Training only" when train_prop == 1.00
+  # #    (Use this if your UI uses uiOutput("stp_scope_ui") + uiOutput("stp_scope_warning"))
+  # # ============================================================
+  # output$stp_scope_ui <- renderUI({
+  #   tp <- to_num(input$train_prop, 1)
+  #   has_test <- isTRUE(tp < 1)
+  #   
+  #   if (!has_test) {
+  #     radioButtons(
+  #       "stp_scope",
+  #       label = NULL,
+  #       choices = c("Full series" = "full"),
+  #       selected = "full"
+  #     )
+  #   } else {
+  #     radioButtons(
+  #       "stp_scope",
+  #       label = NULL,
+  #       choices = c("Full series" = "full", "Training only" = "train"),
+  #       selected = input$stp_scope %||% "full"
+  #     )
+  #   }
+  # })
+  # 
+  # output$stp_scope_warning <- renderUI({
+  #   tp <- to_num(input$train_prop, 1)
+  #   if (isTRUE(tp >= 1)) {
+  #     tags$div(
+  #       style = "color:#b22222; font-size:12px; margin-top:-6px;",
+  #       "No test set → training = full series (Training-only is disabled)."
+  #     )
+  #   } else NULL
+  # })
+  # 
+  # observeEvent(input$train_prop, {
+  #   tp <- to_num(input$train_prop, 1)
+  #   if (isTRUE(tp >= 1) && identical(input$stp_scope, "train")) {
+  #     updateRadioButtons(session, "stp_scope", selected = "full")
+  #   }
+  # }, ignoreInit = TRUE)
+  # 
+  # # ============================================================
+  # # 1) Global transform info (read-only)
+  # #    - Keep renderPrint for compatibility if you still use verbatimTextOutput("stp_transform_info")
+  # #    - Add renderUI note for the newer UI (uiOutput("stp_transform_note"))
+  # # ============================================================
+  # output$stp_transform_info <- renderPrint({
+  #   tr <- input$transform %||% "none"
+  #   if (tr == "boxcox") {
+  #     lam <- input$lambda
+  #     cat("Transformation:", "Box-Cox", "\n")
+  #     cat("λ:", if (is.null(lam) || (length(lam) == 1 && is.na(lam))) "auto (estimated)" else as.character(lam), "\n")
+  #   } else if (tr == "log") {
+  #     cat("Transformation:", "Log (ln y)", "\n")
+  #   } else {
+  #     cat("Transformation:", "None", "\n")
+  #   }
+  # })
+  # 
+  # output$stp_transform_note <- renderUI({
+  #   tr <- input$transform %||% "none"
+  #   lam <- input$lambda
+  #   
+  #   tr_lbl <- switch(tr,
+  #                    "none" = "None",
+  #                    "log" = "Log (ln y)",
+  #                    "boxcox" = "Box-Cox",
+  #                    tr)
+  #   
+  #   if (identical(tr, "boxcox")) {
+  #     tags$div(
+  #       style = "font-size:12px;",
+  #       tags$b("Transformation (global): "), tr_lbl, " — ",
+  #       tags$b("λ: "), if (is.null(lam) || is.na(lam)) "auto" else as.character(lam)
+  #     )
+  #   } else {
+  #     tags$div(
+  #       style = "font-size:12px;",
+  #       tags$b("Transformation (global): "), tr_lbl
+  #     )
+  #   }
+  # })
+  # 
+  # # ============================================================
+  # # 2) Theme/palette helpers
+  # # ============================================================
+  # stp_theme_picker <- function(key) {
+  #   switch(
+  #     key,
+  #     "Minimal" = ggplot2::theme_minimal(),
+  #     "Classic" = ggplot2::theme_classic(),
+  #     "Light"   = ggplot2::theme_light(),
+  #     "Dark"    = ggplot2::theme_dark(),
+  #     "BW"      = ggplot2::theme_bw(),
+  #     "Void"    = ggplot2::theme_void(),
+  #     ggplot2::theme_gray()
+  #   )
+  # }
+  # 
+  # stp_apply_theme <- function(g) {
+  #   g +
+  #     stp_theme_picker(input$stp_theme %||% "Minimal") +
+  #     ggplot2::theme(
+  #       text = ggplot2::element_text(size = to_num(input$stp_base_size, 12)),
+  #       plot.title = ggplot2::element_text(hjust = 0.5),
+  #       axis.text.x = ggplot2::element_text(angle = 30, hjust = 1, vjust = 1)
+  #     )
+  # }
+  # 
+  # stp_apply_palette <- function(g) {
+  #   pal <- input$stp_palette %||% "Paired (brewer)"
+  #   rev <- isTRUE(input$stp_palette_rev)
+  #   
+  #   if (pal == "Viridis") {
+  #     g +
+  #       ggplot2::scale_color_viridis_d(direction = ifelse(rev, -1, 1)) +
+  #       ggplot2::scale_fill_viridis_d(direction = ifelse(rev, -1, 1))
+  #   } else {
+  #     brewer_name <- sub(" \\(brewer\\)$", "", pal)
+  #     g +
+  #       ggplot2::scale_color_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1)) +
+  #       ggplot2::scale_fill_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1))
+  #   }
+  # }
+  # 
+  # # ============================================================
+  # # 3) Conditional style UI (COLOUR PICKERS)
+  # # ============================================================
+  # output$stp_style_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   pt <- input$stp_plot_type
+  #   
+  #   if (!requireNamespace("colourpicker", quietly = TRUE)) {
+  #     return(tags$div(
+  #       style = "color:#b22222; font-size:12px;",
+  #       "Package 'colourpicker' is required for color pickers. Install it: install.packages('colourpicker')"
+  #     ))
+  #   }
+  #   
+  #   is_liney <- pt %in% c("Line", "Line + Points", "Smoothed (LOESS)", "Moving average",
+  #                         "Cumulative sum", "Seasonal plot", "Seasonal subseries",
+  #                         "Polar seasonal", "Periodogram",
+  #                         "Classical decomposition (additive)", "Classical decomposition (multiplicative)",
+  #                         "STL decomposition")
+  #   
+  #   is_pointy <- pt %in% c("Points", "Line + Points", "Smoothed (LOESS)",
+  #                          "Lag-1 scatter", "Lag plot (1..m)", "QQ plot")
+  #   
+  #   is_filly  <- pt %in% c("Histogram", "Density", "Seasonal boxplot")
+  #   
+  #   tagList(
+  #     if (is_liney) tagList(
+  #       colourpicker::colourInput("stp_line_color", "Line color", value = "#2C7FB8", allowTransparent = FALSE),
+  #       sliderInput("stp_line_width", "Line width", min = 0.2, max = 4, value = 1, step = 0.1)
+  #     ),
+  #     if (is_pointy) tagList(
+  #       colourpicker::colourInput("stp_point_color", "Point color", value = "#2C7FB8", allowTransparent = FALSE),
+  #       sliderInput("stp_point_size", "Point size", min = 0.5, max = 8, value = 2, step = 0.5)
+  #     ),
+  #     if (is_filly) tagList(
+  #       colourpicker::colourInput("stp_fill_color", "Fill color", value = "#2C7FB8", allowTransparent = FALSE)
+  #     )
+  #   )
+  # })
+  # 
+  # # ============================================================
+  # # 4) Data reactive: choose scope + apply GLOBAL transform (none/log/boxcox)
+  # #    Also keeps Date axis correctly if df$x is Date/POSIXct.
+  # # ============================================================
+  # stp_data <- reactive({
+  #   req(prepared(), ts_train_test())
+  #   p <- prepared()
+  #   s <- ts_train_test()
+  #   
+  #   df_all <- p$df
+  #   req(df_all)
+  #   
+  #   validate(need("y_filled" %in% names(df_all), "prepared()$df must contain column y_filled."))
+  #   
+  #   # Ensure x exists
+  #   if (!("x" %in% names(df_all))) df_all$x <- seq_len(nrow(df_all))
+  #   
+  #   df_all <- df_all[is.finite(df_all$y_filled), , drop = FALSE]
+  #   validate(need(nrow(df_all) >= 5, "Not enough data to plot."))
+  #   
+  #   # train_n
+  #   train_n <- s$train_n %||% floor(nrow(df_all) * to_num(input$train_prop, 1))
+  #   train_n <- max(2, min(as.integer(train_n), nrow(df_all)))
+  #   
+  #   # scope (force full if no split)
+  #   has_test <- isTRUE(to_num(input$train_prop, 1) < 1)
+  #   scope_in <- input$stp_scope %||% "full"
+  #   scope <- if (!has_test) "full" else scope_in
+  #   
+  #   df_use <- if (identical(scope, "train")) df_all[seq_len(train_n), , drop = FALSE] else df_all
+  #   
+  #   # Apply GLOBAL transformation to plotted y
+  #   tr <- input$transform %||% "none"
+  #   y <- df_use$y_filled
+  #   y_plot <- y
+  #   lambda_used <- NA_real_
+  #   
+  #   if (tr == "log") {
+  #     validate(need(all(y > 0, na.rm = TRUE), "Log transform requires strictly positive values."))
+  #     y_plot <- log(y)
+  #   } else if (tr == "boxcox") {
+  #     validate(need(all(y > 0, na.rm = TRUE), "Box-Cox transform requires strictly positive values."))
+  #     lam <- input$lambda
+  #     if (is.null(lam) || (length(lam) == 1 && is.na(lam))) {
+  #       lam <- forecast::BoxCox.lambda(y, method = "guerrero")
+  #     } else {
+  #       lam <- as.numeric(lam)
+  #     }
+  #     lambda_used <- lam
+  #     y_plot <- forecast::BoxCox(y, lam)
+  #   }
+  #   
+  #   df_use$y_plot <- as.numeric(y_plot)
+  #   
+  #   freq_use <- p$freq %||% 1
+  #   ts_use <- stats::ts(df_use$y_plot, start = 1, frequency = freq_use)
+  #   
+  #   list(
+  #     df = df_use,
+  #     ts = ts_use,
+  #     freq = freq_use,
+  #     scope = scope,
+  #     train_n = train_n,
+  #     n_total = nrow(df_all),
+  #     transform = tr,
+  #     lambda_used = lambda_used,
+  #     x_is_date = inherits(df_use$x, "Date"),
+  #     x_is_dt   = inherits(df_use$x, "POSIXct") || inherits(df_use$x, "POSIXt")
+  #   )
+  # })
+  # 
+  # # ============================================================
+  # # 5) Labels helper + teaching subtitle (n, s, scope, transform)
+  # # ============================================================
+  # stp_labels <- function(d, default_title = "S(t)", default_y = "Value") {
+  #   title_in <- input$stp_title %||% ""
+  #   sub_in   <- input$stp_subtitle %||% ""
+  #   x_in     <- input$stp_xlab %||% ""
+  #   y_in     <- input$stp_ylab %||% ""
+  #   
+  #   scope_txt <- if (identical(d$scope, "train")) "training" else "full"
+  #   n_txt <- paste0("n=", nrow(d$df))
+  #   s_txt <- paste0("s=", d$freq)
+  #   
+  #   tr_txt <- switch(
+  #     d$transform,
+  #     "log" = "transform=log",
+  #     "boxcox" = paste0("transform=BoxCox(λ=", ifelse(is.finite(d$lambda_used), fmt_num(d$lambda_used, 3), "auto"), ")"),
+  #     "none" = "transform=none",
+  #     "transform=none"
+  #   )
+  #   
+  #   teaching_sub <- paste(scope_txt, n_txt, s_txt, tr_txt, sep = " • ")
+  #   
+  #   list(
+  #     title = if (nzchar(title_in)) title_in else default_title,
+  #     subtitle = if (nzchar(sub_in)) sub_in else teaching_sub,
+  #     x = if (nzchar(x_in)) x_in else "Time",
+  #     y = if (nzchar(y_in)) y_in else default_y
+  #   )
+  # }
+  # 
+  # # ============================================================
+  # # 6) Smart date axis formatting
+  # # ============================================================
+  # 
+  # stp_apply_x_scale <- function(g, d) {
+  #   # If not date/datetime, do nothing
+  #   if (!isTRUE(d$x_is_date) && !isTRUE(d$x_is_dt)) return(g)
+  #   
+  #   # user controls
+  #   smart <- isTRUE(input$stp_date_smart %||% TRUE)
+  #   n_ticks <- as.integer(to_num(input$stp_x_ticks, 8))
+  #   
+  #   # label format
+  #   fmt_choice <- input$stp_date_format %||% "auto"
+  #   fmt_custom <- input$stp_date_format_custom %||% "%Y-%m"
+  #   
+  #   fmt <- if (identical(fmt_choice, "custom")) fmt_custom else fmt_choice
+  #   
+  #   # if Auto: pick something reasonable
+  #   if (identical(fmt, "auto")) {
+  #     # heuristic based on how many rows are shown
+  #     n <- nrow(d$df)
+  #     if (n <= 24) fmt <- "%b %Y"
+  #     else if (n <= 120) fmt <- "%Y-%m"
+  #     else fmt <- "%Y"
+  #   }
+  #   
+  #   # rotation controls
+  #   rot <- isTRUE(input$stp_x_rotate %||% TRUE)
+  #   ang <- to_num(input$stp_x_angle, 30)
+  #   
+  #   g2 <- g
+  #   
+  #   # Use "smart" breaks = pretty breaks (gives ~n ticks)
+  #   if (smart) {
+  #     if (isTRUE(d$x_is_date)) {
+  #       g2 <- g2 + ggplot2::scale_x_date(
+  #         labels = scales::date_format(fmt),
+  #         breaks = scales::pretty_breaks(n = n_ticks)
+  #       )
+  #     } else {
+  #       g2 <- g2 + ggplot2::scale_x_datetime(
+  #         labels = scales::date_format(fmt),
+  #         breaks = scales::pretty_breaks(n = n_ticks)
+  #       )
+  #     }
+  #   } else {
+  #     # Non-smart: still limit to pretty breaks, but fewer ticks
+  #     if (isTRUE(d$x_is_date)) {
+  #       g2 <- g2 + ggplot2::scale_x_date(
+  #         labels = scales::date_format(fmt),
+  #         breaks = scales::pretty_breaks(n = n_ticks)
+  #       )
+  #     } else {
+  #       g2 <- g2 + ggplot2::scale_x_datetime(
+  #         labels = scales::date_format(fmt),
+  #         breaks = scales::pretty_breaks(n = n_ticks)
+  #       )
+  #     }
+  #   }
+  #   
+  #   # apply rotation consistently (override theme angle if desired)
+  #   if (rot) {
+  #     g2 <- g2 + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = ang, hjust = 1, vjust = 1))
+  #   } else {
+  #     g2 <- g2 + ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 0, hjust = 0.5, vjust = 0.5))
+  #   }
+  #   
+  #   g2
+  # }
+  # 
+  # 
+  # 
+  # 
+  # # stp_apply_x_scale <- function(g, d) {
+  # #   if (isTRUE(d$x_is_date)) {
+  # #     g + ggplot2::scale_x_date(date_labels = "%Y-%m", date_breaks = "3 months")
+  # #   } else if (isTRUE(d$x_is_dt)) {
+  # #     g + ggplot2::scale_x_datetime(date_labels = "%Y-%m-%d", date_breaks = "1 month")
+  # #   } else {
+  # #     g
+  # #   }
+  # # }
+  # 
+  # # ============================================================
+  # # 7) UI dispatcher for multi-panel plot types
+  # # ============================================================
+  # output$stp_plot_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   pt <- input$stp_plot_type
+  #   h <- to_num(input$stp_plot_height_px, 520)
+  #   
+  #   if (pt == "ACF+PACF") {
+  #     fluidRow(
+  #       column(6, plotOutput("stp_acf",  width = "100%", height = h)),
+  #       column(6, plotOutput("stp_pacf", width = "100%", height = h))
+  #     )
+  #   } else if (pt == "Time + ACF+PACF") {
+  #     tagList(
+  #       plotOutput("stp_main", width = "100%", height = round(h * 0.9)),
+  #       fluidRow(
+  #         column(6, plotOutput("stp_acf",  width = "100%", height = round(h * 0.8))),
+  #         column(6, plotOutput("stp_pacf", width = "100%", height = round(h * 0.8)))
+  #       )
+  #     )
+  #   } else if (pt == "Lag plot (1..m)") {
+  #     plotOutput("stp_lag_grid", width = "100%", height = round(h * 1.2))
+  #   } else if (pt == "ACF") {
+  #     plotOutput("stp_acf", width = "100%", height = h)
+  #   } else if (pt == "PACF") {
+  #     plotOutput("stp_pacf", width = "100%", height = h)
+  #   } else {
+  #     plotOutput("stp_main", width = "100%", height = h)
+  #   }
+  # })
+  # 
+  # # ============================================================
+  # # 8) Main plot
+  # # ============================================================
+  # output$stp_main <- renderPlot({
+  #   d <- stp_data()
+  #   df <- d$df
+  #   pt <- input$stp_plot_type %||% "Line"
+  #   
+  #   # Style (fallback-safe)
+  #   line_col <- input$stp_line_color %||% "#2C7FB8"
+  #   lw       <- to_num(input$stp_line_width, 1)
+  #   pt_col   <- input$stp_point_color %||% line_col
+  #   ps       <- to_num(input$stp_point_size, 2)
+  #   fill_col <- input$stp_fill_color %||% line_col
+  #   a        <- to_num(input$stp_alpha, 1)
+  #   
+  #   labs0 <- stp_labels(d,
+  #                       default_title = "S(t)",
+  #                       default_y = "Value")
+  #   
+  #   base <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y_plot)) +
+  #     ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = labs0$y)
+  #   
+  #   base <- stp_apply_x_scale(base, d)
+  #   
+  #   # ---- plot switch ----
+  #   if (pt == "Line") {
+  #     g <- base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Points") {
+  #     g <- base + ggplot2::geom_point(color = pt_col, size = ps, alpha = a)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Line + Points") {
+  #     g <- base +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::geom_point(color = pt_col, size = ps, alpha = a)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Smoothed (LOESS)") {
+  #     span <- to_num(input$stp_loess_span, 0.4)
+  #     g <- base +
+  #       ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #       ggplot2::geom_smooth(method = "loess", span = span, se = TRUE,
+  #                            color = line_col, linewidth = lw, alpha = 0.2)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Moving average") {
+  #     k <- as.integer(to_num(input$stp_ma_k, 5))
+  #     show_raw <- isTRUE(input$stp_ma_show_raw)
+  #     
+  #     df2 <- df
+  #     df2$ma <- zoo::rollmean(df2$y_plot, k = k, fill = NA, align = "center")
+  #     
+  #     g <- ggplot2::ggplot(df2, ggplot2::aes(x = x)) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = labs0$y)
+  #     
+  #     g <- stp_apply_x_scale(g, d)
+  #     
+  #     if (show_raw) g <- g + ggplot2::geom_line(ggplot2::aes(y = y_plot), color = "gray60", linewidth = 0.6, alpha = 0.7)
+  #     g <- g + ggplot2::geom_line(ggplot2::aes(y = ma), color = line_col, linewidth = lw, alpha = a)
+  #     
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Cumulative sum") {
+  #     df2 <- df
+  #     df2$cs <- cumsum(df2$y_plot)
+  #     g <- ggplot2::ggplot(df2, ggplot2::aes(x = x, y = cs)) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$x, y = "Cumsum")
+  #     g <- stp_apply_x_scale(g, d)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Histogram") {
+  #     bins <- as.integer(to_num(input$stp_hist_bins, 30))
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+  #       ggplot2::geom_histogram(bins = bins, fill = fill_col, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$y, y = "Count")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Density") {
+  #     bw_adj <- to_num(input$stp_bw_adj, 1)
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+  #       ggplot2::geom_density(adjust = bw_adj, fill = fill_col, alpha = 0.25) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = labs0$y, y = "Density")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "QQ plot") {
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(sample = y_plot)) +
+  #       ggplot2::stat_qq(color = pt_col, alpha = a) +
+  #       ggplot2::stat_qq_line(color = line_col, linewidth = lw) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "Theoretical", y = "Sample")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Lag-1 scatter") {
+  #     y <- df$y_plot
+  #     validate(need(length(y) >= 3, "Not enough observations for lag scatter."))
+  #     dfl <- data.frame(x = y[-length(y)], y = y[-1])
+  #     g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+  #       ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "S(t-1)", y = "S(t)")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt %in% c("Seasonal plot", "Seasonal subseries", "Polar seasonal", "Seasonal boxplot")) {
+  #     validate(need(d$freq >= 2, "Seasonal plots require frequency >= 2."))
+  #     
+  #     x_ts <- d$ts
+  #     
+  #     if (pt == "Seasonal plot") {
+  #       g <- forecast::ggseasonplot(x_ts, polar = FALSE) +
+  #         ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+  #       return(stp_apply_theme(stp_apply_palette(g)))
+  #     }
+  #     
+  #     if (pt == "Polar seasonal") {
+  #       g <- forecast::ggseasonplot(x_ts, polar = TRUE) +
+  #         ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+  #       return(stp_apply_theme(stp_apply_palette(g)))
+  #     }
+  #     
+  #     if (pt == "Seasonal subseries") {
+  #       g <- forecast::ggsubseriesplot(x_ts) +
+  #         ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+  #       return(stp_apply_theme(g))
+  #     }
+  #     
+  #     if (pt == "Seasonal boxplot") {
+  #       df2 <- df
+  #       df2$season <- as.factor(cycle(stats::ts(df2$y_plot, frequency = d$freq)))
+  #       g <- ggplot2::ggplot(df2, ggplot2::aes(x = season, y = y_plot, fill = season)) +
+  #         ggplot2::geom_boxplot(alpha = 0.6) +
+  #         ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "Season", y = labs0$y)
+  #       return(stp_apply_theme(stp_apply_palette(g)))
+  #     }
+  #   }
+  #   
+  #   if (pt == "Classical decomposition (additive)" || pt == "Classical decomposition (multiplicative)") {
+  #     validate(need(d$freq >= 2, "Decomposition requires frequency >= 2."))
+  #     x_ts <- d$ts
+  #     type <- if (pt == "Classical decomposition (multiplicative)") "multiplicative" else "additive"
+  #     dc <- stats::decompose(x_ts, type = type)
+  #     g <- forecast::autoplot(dc) + ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "STL decomposition") {
+  #     validate(need(d$freq >= 2, "STL requires frequency >= 2."))
+  #     x_ts <- d$ts
+  #     fit <- stats::stl(x_ts, s.window = "periodic", robust = TRUE)
+  #     g <- forecast::autoplot(fit) + ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Periodogram") {
+  #     x_ts <- d$ts
+  #     validate(need(length(x_ts) >= 8, "Not enough observations for periodogram."))
+  #     taper <- to_num(input$stp_spec_taper, 0.1)
+  #     sp <- stats::spec.pgram(x_ts, taper = taper, plot = FALSE)
+  #     dfp <- data.frame(freq = sp$freq, spec = sp$spec)
+  #     g <- ggplot2::ggplot(dfp, ggplot2::aes(x = freq, y = spec)) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle, x = "Frequency", y = "Spectral density")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   # fallback
+  #   stp_apply_theme(base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a))
+  #   
+  # }, width  = function() to_num(input$stp_plot_width_px, 980),
+  # height = function() to_num(input$stp_plot_height_px, 520))
+  # 
+  # # ============================================================
+  # # 9) ACF/PACF panels
+  # # ============================================================
+  # output$stp_acf <- renderPlot({
+  #   d <- stp_data()
+  #   x_ts <- d$ts
+  #   L <- min(60, length(x_ts) - 1)
+  #   g <- forecast::ggAcf(x_ts, lag.max = L) + ggplot2::labs(title = "ACF", subtitle = stp_labels(d)$subtitle)
+  #   stp_apply_theme(g)
+  # })
+  # 
+  # output$stp_pacf <- renderPlot({
+  #   d <- stp_data()
+  #   x_ts <- d$ts
+  #   L <- min(60, length(x_ts) - 1)
+  #   g <- forecast::ggPacf(x_ts, lag.max = L) + ggplot2::labs(title = "PACF", subtitle = stp_labels(d)$subtitle)
+  #   stp_apply_theme(g)
+  # })
+  # 
+  # # ============================================================
+  # # 10) Lag grid (1..m)
+  # # ============================================================
+  # output$stp_lag_grid <- renderPlot({
+  #   d <- stp_data()
+  #   df <- d$df
+  #   
+  #   m <- as.integer(to_num(input$stp_lag_m, 12))
+  #   validate(need(m >= 1, "m must be >= 1."))
+  #   
+  #   y <- df$y_plot
+  #   validate(need(length(y) >= (m + 2), "Not enough observations for requested lag grid."))
+  #   
+  #   out <- lapply(1:m, function(k) {
+  #     data.frame(
+  #       lag = paste0("Lag ", k),
+  #       x = y[seq_len(length(y) - k)],
+  #       y = y[(k + 1):length(y)]
+  #     )
+  #   })
+  #   dfl <- do.call(rbind, out)
+  #   
+  #   pt_col <- input$stp_point_color %||% "#2C7FB8"
+  #   ps <- to_num(input$stp_point_size, 2)
+  #   a  <- to_num(input$stp_alpha, 1)
+  #   
+  #   g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+  #     ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #     ggplot2::facet_wrap(~ lag, scales = "free", ncol = 3) +
+  #     ggplot2::labs(title = "Lag plots (1..m)", subtitle = stp_labels(d)$subtitle, x = "S(t-k)", y = "S(t)")
+  #   
+  #   stp_apply_theme(g)
+  #   
+  # }, width  = function() to_num(input$stp_plot_width_px, 980),
+  # height = function() round(to_num(input$stp_plot_height_px, 520) * 1.2))
+  # 
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # ============================================================
+  # S(t) plots tab (SERVER) — MUST BE INSIDE server()
+  # Uses GLOBAL input$transform and input$lambda
+  # ============================================================
+  
+  # `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
+  
+  # to_num <- function(x, d = NA_real_) {
+  #   y <- suppressWarnings(as.numeric(x))
+  #   ifelse(is.finite(y), y, d)
+  # }
+  # 
+  # fmt_num <- function(x, d = 4) {
+  #   if (!is.finite(x)) return("NA")
+  #   format(round(x, d), nsmall = d)
+  # }
+  # 
+  # # ---- show global transform info (read-only) ----
+  # output$stp_transform_info <- renderPrint({
+  #   tr <- input$transform %||% "none"
+  #   if (tr == "boxcox") {
+  #     lam <- input$lambda
+  #     cat("Transformation:", "Box-Cox", "\n")
+  #     cat("λ:", if (is.null(lam) || (length(lam) == 1 && is.na(lam))) "auto (estimated)" else as.character(lam), "\n")
+  #   } else if (tr == "log") {
+  #     cat("Transformation:", "Log (ln y)", "\n")
+  #   } else {
+  #     cat("Transformation:", "None", "\n")
+  #   }
+  # })
+  # 
+  # # ---- Theme/palette helpers ----
+  # stp_theme_picker <- function(key) {
+  #   switch(
+  #     key,
+  #     "Minimal" = ggplot2::theme_minimal(),
+  #     "Classic" = ggplot2::theme_classic(),
+  #     "Light"   = ggplot2::theme_light(),
+  #     "Dark"    = ggplot2::theme_dark(),
+  #     "BW"      = ggplot2::theme_bw(),
+  #     "Void"    = ggplot2::theme_void(),
+  #     ggplot2::theme_gray()
+  #   )
+  # }
+  # 
+  # stp_apply_theme <- function(g) {
+  #   g +
+  #     stp_theme_picker(input$stp_theme %||% "Minimal") +
+  #     ggplot2::theme(
+  #       text = ggplot2::element_text(size = as.numeric(input$stp_base_size %||% 12)),
+  #       plot.title = ggplot2::element_text(hjust = 0.5)
+  #     )
+  # }
+  # 
+  # stp_apply_palette <- function(g) {
+  #   pal <- input$stp_palette %||% "Set1 (brewer)"
+  #   rev <- isTRUE(input$stp_palette_rev)
+  #   
+  #   if (pal == "Viridis") {
+  #     g +
+  #       ggplot2::scale_color_viridis_d(direction = ifelse(rev, -1, 1)) +
+  #       ggplot2::scale_fill_viridis_d(direction = ifelse(rev, -1, 1))
+  #   } else {
+  #     brewer_name <- sub(" \\(brewer\\)$", "", pal)
+  #     g +
+  #       ggplot2::scale_color_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1)) +
+  #       ggplot2::scale_fill_brewer(palette = brewer_name, direction = ifelse(rev, -1, 1))
+  #   }
+  # }
+  # 
+  # # ---- conditional style UI ----
+  # output$stp_style_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   
+  #   pt <- input$stp_plot_type
+  #   
+  #   is_liney <- pt %in% c("Line", "Line + Points", "Smoothed (LOESS)", "Moving average",
+  #                         "Cumulative sum", "Seasonal plot", "Seasonal subseries",
+  #                         "Polar seasonal", "Periodogram",
+  #                         "Classical decomposition (additive)", "Classical decomposition (multiplicative)",
+  #                         "STL decomposition")
+  #   is_pointy <- pt %in% c("Points", "Line + Points", "Smoothed (LOESS)",
+  #                          "Lag-1 scatter", "Lag plot (1..m)", "QQ plot")
+  #   is_filly  <- pt %in% c("Histogram", "Density", "Seasonal boxplot")
+  #   
+  #   tagList(
+  #     # Line controls
+  #     if (is_liney) tagList(
+  #       colourpicker::colourInput("stp_line_color", "Line color", value = "#2C7FB8", allowTransparent = FALSE),
+  #       sliderInput("stp_line_width", "Line width", min = 0.2, max = 4, value = 1, step = 0.1)
+  #     ),
+  #     
+  #     # Point controls
+  #     if (is_pointy) tagList(
+  #       colourpicker::colourInput("stp_point_color", "Point color", value = "#2C7FB8", allowTransparent = FALSE),
+  #       sliderInput("stp_point_size", "Point size", min = 0.5, max = 8, value = 2, step = 0.5)
+  #     ),
+  #     
+  #     # Fill controls
+  #     if (is_filly) tagList(
+  #       colourpicker::colourInput("stp_fill_color", "Fill color", value = "#2C7FB8", allowTransparent = FALSE)
+  #     )
+  #   )
+  # })
+  # 
+  # # ---- choose series scope + apply GLOBAL transform ----
+  # stp_data <- reactive({
+  #   req(prepared(), ts_train_test())
+  #   p <- prepared()
+  #   s <- ts_train_test()
+  #   
+  #   df_all <- p$df
+  #   req(df_all)
+  #   
+  #   # Expect these columns: y_filled and x (if x missing, create index)
+  #   validate(need("y_filled" %in% names(df_all), "prepared()$df must contain y_filled."))
+  #   
+  #   if (!("x" %in% names(df_all))) df_all$x <- seq_len(nrow(df_all))
+  #   
+  #   df_all <- df_all[is.finite(df_all$y_filled), , drop = FALSE]
+  #   validate(need(nrow(df_all) >= 5, "Not enough data to plot."))
+  #   
+  #   train_n <- s$train_n %||% floor(nrow(df_all) * as.numeric(input$train_prop %||% 1))
+  #   train_n <- max(2, min(as.integer(train_n), nrow(df_all)))
+  #   
+  #   scope <- input$stp_scope %||% "full"
+  #   df_use <- if (identical(scope, "train")) df_all[seq_len(train_n), , drop = FALSE] else df_all
+  #   
+  #   # Apply GLOBAL transformation (None / Log / BoxCox) to the plotted y
+  #   tr <- input$transform %||% "none"
+  #   y <- df_use$y_filled
+  #   
+  #   y_plot <- y
+  #   if (tr == "log") {
+  #     # safeguard: log needs positive
+  #     validate(need(all(y > 0, na.rm = TRUE), "Log transform requires strictly positive values."))
+  #     y_plot <- log(y)
+  #   } else if (tr == "boxcox") {
+  #     # BoxCox requires positive
+  #     validate(need(all(y > 0, na.rm = TRUE), "Box-Cox transform requires strictly positive values."))
+  #     lam <- input$lambda
+  #     if (is.null(lam) || (length(lam) == 1 && is.na(lam))) {
+  #       lam <- forecast::BoxCox.lambda(y, method = "guerrero")
+  #     } else {
+  #       lam <- as.numeric(lam)
+  #     }
+  #     y_plot <- forecast::BoxCox(y, lam)
+  #     attr(y_plot, "lambda_used") <- lam
+  #   }
+  #   
+  #   df_use$y_plot <- as.numeric(y_plot)
+  #   
+  #   freq_use <- p$freq %||% 1
+  #   ts_use <- stats::ts(df_use$y_plot, start = 1, frequency = freq_use)
+  #   
+  #   list(
+  #     df = df_use,
+  #     ts = ts_use,
+  #     freq = freq_use,
+  #     scope = scope,
+  #     train_n = train_n,
+  #     n_total = nrow(df_all),
+  #     transform = tr,
+  #     lambda_used = attr(y_plot, "lambda_used") %||% NA_real_
+  #   )
+  # })
+  # 
+  # # ---- label helper ----
+  # stp_labels <- function(default_title = "S(t)", default_y = "Value") {
+  #   title_in <- input$stp_title %||% ""
+  #   sub_in   <- input$stp_subtitle %||% ""
+  #   x_in     <- input$stp_xlab %||% ""
+  #   y_in     <- input$stp_ylab %||% ""
+  #   
+  #   list(
+  #     title = if (nzchar(title_in)) title_in else default_title,
+  #     subtitle = if (nzchar(sub_in)) sub_in else NULL,
+  #     x = if (nzchar(x_in)) x_in else "Time",
+  #     y = if (nzchar(y_in)) y_in else default_y
+  #   )
+  # }
+  # 
+  # # ---- UI dispatcher for multi-panel plot types ----
+  # output$stp_plot_ui <- renderUI({
+  #   req(input$stp_plot_type)
+  #   pt <- input$stp_plot_type
+  #   h <- as.numeric(input$stp_plot_height_px %||% 520)
+  #   
+  #   if (pt == "ACF+PACF") {
+  #     fluidRow(
+  #       column(6, plotOutput("stp_acf",  width = "100%", height = h)),
+  #       column(6, plotOutput("stp_pacf", width = "100%", height = h))
+  #     )
+  #   } else if (pt == "Time + ACF+PACF") {
+  #     tagList(
+  #       plotOutput("stp_main", width = "100%", height = round(h * 0.9)),
+  #       fluidRow(
+  #         column(6, plotOutput("stp_acf",  width = "100%", height = round(h * 0.8))),
+  #         column(6, plotOutput("stp_pacf", width = "100%", height = round(h * 0.8)))
+  #       )
+  #     )
+  #   } else if (pt == "Lag plot (1..m)") {
+  #     plotOutput("stp_lag_grid", width = "100%", height = round(h * 1.2))
+  #   } else if (pt == "ACF") {
+  #     plotOutput("stp_acf", width = "100%", height = h)
+  #   } else if (pt == "PACF") {
+  #     plotOutput("stp_pacf", width = "100%", height = h)
+  #   } else {
+  #     plotOutput("stp_main", width = "100%", height = h)
+  #   }
+  # })
+  # 
+  # # ---- Main plot ----
+  # output$stp_main <- renderPlot({
+  #   d <- stp_data()
+  #   df <- d$df
+  #   scope_tag <- if (identical(d$scope, "train")) " (Training only)" else " (Full series)"
+  #   
+  #   pt <- input$stp_plot_type %||% "Line"
+  #   
+  #   # Style values (exist only if UI displayed them; use fallbacks)
+  #   line_col <- input$stp_line_color %||% "#2C7FB8"
+  #   lw <- as.numeric(input$stp_line_width %||% 1)
+  #   pt_col <- input$stp_point_color %||% line_col
+  #   ps <- as.numeric(input$stp_point_size %||% 2)
+  #   fill_col <- input$stp_fill_color %||% line_col
+  #   a  <- as.numeric(input$stp_alpha %||% 1)
+  #   
+  #   # teaching subtitle: transformation note (auto)
+  #   tr_note <- switch(
+  #     d$transform,
+  #     "log" = "Log-transformed",
+  #     "boxcox" = paste0("Box-Cox (λ=", ifelse(is.finite(d$lambda_used), fmt_num(d$lambda_used, 3), "auto"), ")"),
+  #     "none" = "No transformation",
+  #     "No transformation"
+  #   )
+  #   
+  #   # labels
+  #   labs0 <- stp_labels(
+  #     default_title = paste0("S(t)", scope_tag),
+  #     default_y = paste0("S(t) [", tr_note, "]")
+  #   )
+  #   
+  #   base <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y_plot)) +
+  #     ggplot2::labs(title = labs0$title, subtitle = labs0$subtitle %||% tr_note, x = labs0$x, y = labs0$y)
+  #   
+  #   # ---- plot switch ----
+  #   if (pt == "Line") {
+  #     return(stp_apply_theme(base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a)))
+  #   }
+  #   
+  #   if (pt == "Points") {
+  #     return(stp_apply_theme(base + ggplot2::geom_point(color = pt_col, size = ps, alpha = a)))
+  #   }
+  #   
+  #   if (pt == "Line + Points") {
+  #     return(stp_apply_theme(
+  #       base +
+  #         ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #         ggplot2::geom_point(color = pt_col, size = ps, alpha = a)
+  #     ))
+  #   }
+  #   
+  #   if (pt == "Smoothed (LOESS)") {
+  #     span <- as.numeric(input$stp_loess_span %||% 0.4)
+  #     return(stp_apply_theme(
+  #       base +
+  #         ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #         ggplot2::geom_smooth(method = "loess", span = span, se = TRUE,
+  #                              color = line_col, linewidth = lw, alpha = 0.2)
+  #     ))
+  #   }
+  #   
+  #   if (pt == "Moving average") {
+  #     k <- as.integer(input$stp_ma_k %||% 5)
+  #     show_raw <- isTRUE(input$stp_ma_show_raw)
+  #     
+  #     df2 <- df
+  #     df2$ma <- zoo::rollmean(df2$y_plot, k = k, fill = NA, align = "center")
+  #     
+  #     g <- ggplot2::ggplot(df2, ggplot2::aes(x = x)) +
+  #       ggplot2::labs(
+  #         title = if (nzchar(input$stp_title %||% "")) labs0$title else paste0("Moving average (k=", k, ")", scope_tag),
+  #         subtitle = labs0$subtitle %||% tr_note,
+  #         x = labs0$x, y = labs0$y
+  #       )
+  #     
+  #     if (show_raw) g <- g + ggplot2::geom_line(ggplot2::aes(y = y_plot), color = "gray60", linewidth = 0.6, alpha = 0.7)
+  #     g <- g + ggplot2::geom_line(ggplot2::aes(y = ma), color = line_col, linewidth = lw, alpha = a)
+  #     
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Cumulative sum") {
+  #     df2 <- df
+  #     df2$cs <- cumsum(df2$y_plot)
+  #     g <- ggplot2::ggplot(df2, ggplot2::aes(x = x, y = cs)) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = paste0("Cumulative sum", scope_tag), subtitle = tr_note, x = labs0$x, y = "Cumsum")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Histogram") {
+  #     bins <- as.integer(input$stp_hist_bins %||% 30)
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+  #       ggplot2::geom_histogram(bins = bins, fill = fill_col, alpha = a) +
+  #       ggplot2::labs(title = paste0("Histogram", scope_tag), subtitle = tr_note, x = labs0$y, y = "Count")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Density") {
+  #     bw_adj <- as.numeric(input$stp_bw_adj %||% 1)
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(x = y_plot)) +
+  #       ggplot2::geom_density(adjust = bw_adj, fill = fill_col, alpha = 0.25) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = paste0("Density", scope_tag), subtitle = tr_note, x = labs0$y, y = "Density")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "QQ plot") {
+  #     g <- ggplot2::ggplot(df, ggplot2::aes(sample = y_plot)) +
+  #       ggplot2::stat_qq(color = pt_col, alpha = a) +
+  #       ggplot2::stat_qq_line(color = line_col, linewidth = lw) +
+  #       ggplot2::labs(title = paste0("QQ plot", scope_tag), subtitle = tr_note, x = "Theoretical", y = "Sample")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Lag-1 scatter") {
+  #     y <- df$y_plot
+  #     validate(need(length(y) >= 3, "Not enough observations for lag scatter."))
+  #     dfl <- data.frame(x = y[-length(y)], y = y[-1])
+  #     g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+  #       ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #       ggplot2::labs(title = paste0("Lag-1 scatter", scope_tag), subtitle = tr_note, x = "S(t-1)", y = "S(t)")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt %in% c("Seasonal plot", "Seasonal subseries", "Polar seasonal", "Seasonal boxplot")) {
+  #     validate(need(d$freq >= 2, "Seasonal plots require frequency >= 2."))
+  #     
+  #     x_ts <- d$ts
+  #     
+  #     if (pt == "Seasonal plot") {
+  #       g <- forecast::ggseasonplot(x_ts, polar = FALSE) +
+  #         ggplot2::labs(title = paste0("Seasonal plot", scope_tag), subtitle = tr_note)
+  #       return(stp_apply_theme(stp_apply_palette(g)))
+  #     }
+  #     
+  #     if (pt == "Polar seasonal") {
+  #       g <- forecast::ggseasonplot(x_ts, polar = TRUE) +
+  #         ggplot2::labs(title = paste0("Polar seasonal plot", scope_tag), subtitle = tr_note)
+  #       return(stp_apply_theme(stp_apply_palette(g)))
+  #     }
+  #     
+  #     if (pt == "Seasonal subseries") {
+  #       g <- forecast::ggsubseriesplot(x_ts) +
+  #         ggplot2::labs(title = paste0("Seasonal subseries", scope_tag), subtitle = tr_note)
+  #       return(stp_apply_theme(g))
+  #     }
+  #     
+  #     if (pt == "Seasonal boxplot") {
+  #       df2 <- df
+  #       df2$season <- as.factor(cycle(stats::ts(df2$y_plot, frequency = d$freq)))
+  #       g <- ggplot2::ggplot(df2, ggplot2::aes(x = season, y = y_plot, fill = season)) +
+  #         ggplot2::geom_boxplot(alpha = 0.6) +
+  #         ggplot2::labs(title = paste0("Seasonal boxplot", scope_tag), subtitle = tr_note, x = "Season", y = labs0$y)
+  #       return(stp_apply_theme(stp_apply_palette(g)))
+  #     }
+  #   }
+  #   
+  #   if (pt == "Classical decomposition (additive)" || pt == "Classical decomposition (multiplicative)") {
+  #     validate(need(d$freq >= 2, "Decomposition requires frequency >= 2."))
+  #     
+  #     x_ts <- d$ts
+  #     type <- if (pt == "Classical decomposition (multiplicative)") "multiplicative" else "additive"
+  #     dc <- stats::decompose(x_ts, type = type)
+  #     g <- forecast::autoplot(dc) +
+  #       ggplot2::labs(title = paste0("Classical decomposition (", type, ")", scope_tag), subtitle = tr_note)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "STL decomposition") {
+  #     validate(need(d$freq >= 2, "STL requires frequency >= 2."))
+  #     x_ts <- d$ts
+  #     fit <- stats::stl(x_ts, s.window = "periodic", robust = TRUE)
+  #     g <- forecast::autoplot(fit) +
+  #       ggplot2::labs(title = paste0("STL decomposition", scope_tag), subtitle = tr_note)
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   if (pt == "Periodogram") {
+  #     x_ts <- d$ts
+  #     validate(need(length(x_ts) >= 8, "Not enough observations for periodogram."))
+  #     taper <- as.numeric(input$stp_spec_taper %||% 0.1)
+  #     
+  #     sp <- stats::spec.pgram(x_ts, taper = taper, plot = FALSE)
+  #     dfp <- data.frame(freq = sp$freq, spec = sp$spec)
+  #     
+  #     g <- ggplot2::ggplot(dfp, ggplot2::aes(x = freq, y = spec)) +
+  #       ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a) +
+  #       ggplot2::labs(title = paste0("Periodogram", scope_tag), subtitle = tr_note, x = "Frequency", y = "Spectral density")
+  #     return(stp_apply_theme(g))
+  #   }
+  #   
+  #   # fallback
+  #   stp_apply_theme(base + ggplot2::geom_line(color = line_col, linewidth = lw, alpha = a))
+  #   
+  # }, width = function() as.numeric(input$stp_plot_width_px %||% 980),
+  # height = function() as.numeric(input$stp_plot_height_px %||% 520))
+  # 
+  # # ---- ACF/PACF panels ----
+  # output$stp_acf <- renderPlot({
+  #   d <- stp_data()
+  #   x_ts <- d$ts
+  #   scope_tag <- if (identical(d$scope, "train")) " (Training only)" else " (Full series)"
+  #   L <- min(60, length(x_ts) - 1)
+  #   stp_apply_theme(forecast::ggAcf(x_ts, lag.max = L) +
+  #                     ggplot2::labs(title = paste0("ACF", scope_tag)))
+  # })
+  # 
+  # output$stp_pacf <- renderPlot({
+  #   d <- stp_data()
+  #   x_ts <- d$ts
+  #   scope_tag <- if (identical(d$scope, "train")) " (Training only)" else " (Full series)"
+  #   L <- min(60, length(x_ts) - 1)
+  #   stp_apply_theme(forecast::ggPacf(x_ts, lag.max = L) +
+  #                     ggplot2::labs(title = paste0("PACF", scope_tag)))
+  # })
+  # 
+  # # ---- Lag grid (1..m) ----
+  # output$stp_lag_grid <- renderPlot({
+  #   d <- stp_data()
+  #   df <- d$df
+  #   scope_tag <- if (identical(d$scope, "train")) " (Training only)" else " (Full series)"
+  #   
+  #   m <- as.integer(input$stp_lag_m %||% 12)
+  #   validate(need(m >= 1, "m must be >= 1."))
+  #   
+  #   y <- df$y_plot
+  #   validate(need(length(y) >= (m + 2), "Not enough observations for requested lag grid."))
+  #   
+  #   out <- lapply(1:m, function(k) {
+  #     data.frame(
+  #       lag = paste0("Lag ", k),
+  #       x = y[seq_len(length(y) - k)],
+  #       y = y[(k + 1):length(y)]
+  #     )
+  #   })
+  #   dfl <- do.call(rbind, out)
+  #   
+  #   pt_col <- input$stp_point_color %||% "#2C7FB8"
+  #   ps <- as.numeric(input$stp_point_size %||% 2)
+  #   a  <- as.numeric(input$stp_alpha %||% 1)
+  #   
+  #   g <- ggplot2::ggplot(dfl, ggplot2::aes(x = x, y = y)) +
+  #     ggplot2::geom_point(color = pt_col, size = ps, alpha = a) +
+  #     ggplot2::facet_wrap(~ lag, scales = "free", ncol = 3) +
+  #     ggplot2::labs(title = paste0("Lag plots (1..", m, ")", scope_tag), x = "S(t-k)", y = "S(t)")
+  #   
+  #   stp_apply_theme(g)
+  #   
+  # }, width = function() as.numeric(input$stp_plot_width_px %||% 980),
+  # height = function() round(as.numeric(input$stp_plot_height_px %||% 520) * 1.2))
+  # 
+  # 
+  # 
+  # 
+  # 
+ 
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  # ============================================================
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   # ---- Step 3 outputs ----
 
   output$decomp_add <- renderPlot({
@@ -759,20 +3698,7 @@ server <- function(input, output, session) {
     cat("- nsdiffs (D):", D_rec, "\n")
   })
   
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
+ 
   
   stationarity <- eventReactive(input$run_tests, {
     `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
@@ -780,32 +3706,64 @@ server <- function(input, output, session) {
     
     s <- ts_train_test()
     x <- as.numeric(stats::na.omit(s$ts_train))
+    x <- x[is.finite(x)]
     
     k <- max(0L, to_int(input$adf_lags, 10L))
     
     # single source of truth for the deterministic type
     type_used <- tolower(as.character(input$adf_type %||% input$adfTypeSt2 %||% "drift"))
-    type_used <- if (type_used %in% c("none","drift","trend")) type_used else "drift"
+    type_used <- if (type_used %in% c("none", "drift", "trend")) type_used else "drift"
     
     alpha_used <- suppressWarnings(as.numeric(input$alphaSt2 %||% 0.05))
     if (!is.finite(alpha_used)) alpha_used <- 0.05
     
-    out <- list(type_used = type_used, alpha_used = alpha_used)
+    out <- list(
+      type_used  = type_used,
+      alpha_used = alpha_used,
+      k_used     = k,
+      series     = x
+    )
     
     # run tests (keep errors if any)
-    out$adf <- tryCatch(tseries::adf.test(x, k = k, alternative = input$alternd2St %||% "stationary"),
-                        error = function(e) { out$adf_error <<- e$message; NULL })
+    out$adf <- tryCatch(
+      tseries::adf.test(x, k = k, alternative = input$alternd2St %||% "stationary"),
+      error = function(e) { out$adf_error <<- e$message; NULL }
+    )
+    
     out$kpss <- tryCatch({
       null_kpss <- if (identical(type_used, "trend")) "Trend" else "Level"
       tseries::kpss.test(x, null = null_kpss)
     }, error = function(e) { out$kpss_error <<- e$message; NULL })
-    out$pp <- tryCatch(tseries::pp.test(x),
-                       error = function(e) { out$pp_error <<- e$message; NULL })
-    out$ur <- tryCatch(urca::ur.df(x, type = type_used, lags = k),
-                       error = function(e) { out$ur_error <<- e$message; NULL })
+    
+    out$pp <- tryCatch(
+      tseries::pp.test(x),
+      error = function(e) { out$pp_error <<- e$message; NULL }
+    )
+    
+    out$ur <- tryCatch(
+      urca::ur.df(x, type = type_used, lags = k),
+      error = function(e) { out$ur_error <<- e$message; NULL }
+    )
+    
+    # NEW: Auto-lag ADF (AIC)
+    out$ur_auto <- tryCatch(
+      urca::ur.df(x, type = type_used, selectlags = "AIC"),
+      error = function(e) { out$ur_auto_error <<- e$message; NULL }
+    )
+    
+    # Infer chosen k from regression terms: number of z.diff* terms ~= k
+    out$k_auto <- tryCatch({
+      if (is.null(out$ur_auto)) return(NA_integer_)
+      sm <- summary(out$ur_auto)
+      rn <- rownames(sm@testreg$coefficients)
+      as.integer(sum(grepl("^z\\.diff", rn)))
+    }, error = function(e) NA_integer_)
     
     out
   })
+  
+  
+ 
   
   alpha_to_col <- function(a) {
     if (!is.finite(a)) return("5pct")
@@ -870,159 +3828,7 @@ server <- function(input, output, session) {
   
   
   
-  # stationarity <- eventReactive(input$run_tests, {
-  #   # --- helpers ---
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
-  #   to_int <- function(x, d = 0L) {
-  #     v <- suppressWarnings(as.integer(x)); if (!is.finite(v)) d else v
-  #   }
-  #   # Map many possible UI values to tseries KPSS 'null' values
-  #   norm_kpss_null <- function(val, adf_type = NULL) {
-  #     v <- tolower(as.character(val))
-  #     if (v %in% c("level", "mu", "l", "lev"))  return("Level")
-  #     if (v %in% c("trend", "tau", "t"))        return("Trend")
-  #     # fall back: if ADF type has trend, use Trend; else Level
-  #     if (!is.null(adf_type) && tolower(adf_type) == "trend") return("Trend")
-  #     "Level"
-  #   }
-  #   
-  #   # --- get training series ---
-  #   s <- ts_train_test()
-  #   x_raw <- s$ts_train
-  #   
-  #   # coerce to numeric, drop NA/Inf
-  #   x <- suppressWarnings(as.numeric(x_raw))
-  #   x <- x[is.finite(x)]
-  #   
-  #   # metadata & guards
-  #   N  <- length(x)
-  #   sdv <- if (N > 1) stats::sd(x) else NA_real_
-  #   k  <- max(0L, to_int(input$adf_lags, 10L))
-  #   
-  #   adf_type_in  <- tolower(as.character(input$adf_type %||% "drift"))
-  #   adf_type     <- if (adf_type_in %in% c("none","drift","trend")) adf_type_in else "drift"
-  #   kpss_null    <- norm_kpss_null(input$kpss_type, adf_type)
-  #   
-  #   out <- list(meta = list(N = N, sd = sdv, k = k, kpss_null = kpss_null, adf_type = adf_type))
-  #   
-  #   # if series unusable, bail early with reasons
-  #   if (N < 8 || !is.finite(sdv) || sdv == 0) {
-  #     msg <- sprintf("Invalid input for tests (N=%d, sd=%s).", N, as.character(sdv))
-  #     out$adf_error  <- msg
-  #     out$kpss_error <- msg
-  #     out$pp_error   <- msg
-  #     out$ur_error   <- msg
-  #     return(out)
-  #   }
-  #   
-  #   have_tseries <- requireNamespace("tseries", quietly = TRUE)
-  #   have_urca    <- requireNamespace("urca",    quietly = TRUE)
-  #   
-  #   # --- tseries tests ---
-  #   if (have_tseries) {
-  #     out$adf <- tryCatch(
-  #       tseries::adf.test(x, k = k, alternative = (input$alternd2St %||% "stationary")),
-  #       error = function(e) { out$adf_error <<- e$message; NULL }
-  #     )
-  #     out$kpss <- tryCatch(
-  #       tseries::kpss.test(x, null = kpss_null),                # "Level" or "Trend"
-  #       error = function(e) { out$kpss_error <<- e$message; NULL }
-  #     )
-  #     out$pp <- tryCatch(
-  #       tseries::pp.test(x),
-  #       error = function(e) { out$pp_error <<- e$message; NULL }
-  #     )
-  #   } else {
-  #     out$adf_error  <- "Package 'tseries' not installed."
-  #     out$kpss_error <- "Package 'tseries' not installed."
-  #     out$pp_error   <- "Package 'tseries' not installed."
-  #   }
-  #   
-  #   # --- urca (ADF with tau/critical) ---
-  #   if (have_urca) {
-  #     out$ur <- tryCatch(
-  #       urca::ur.df(x, type = adf_type, lags = k),
-  #       error = function(e) { out$ur_error <<- e$message; NULL }
-  #     )
-  #   } else {
-  #     out$ur_error <- "Package 'urca' not installed."
-  #   }
-  #   
-  #   out
-  # })
-  
-  
-  
-
-  # stationarity <- eventReactive(input$run_tests, {
-  #   s <- ts_train_test()
-  #   x <- s$ts_train
-  #   k <- as.numeric(input$adf_lags)
-  #   list(
-  #     adf = tryCatch(tseries::adf.test(x, k = k), error = function(e) NULL),
-  #     kpss = tryCatch(tseries::kpss.test(x, null = input$kpss_type), error = function(e) NULL),
-  #     pp = tryCatch(tseries::pp.test(x), error = function(e) NULL),
-  #     ur = tryCatch(urca::ur.df(x, type = input$adf_type, lags = k), error = function(e) NULL)
-  #   )
-  # })
-  
-  
-  # stationarity <- reactive({
-  #   x_raw <- tryCatch(myData_Choice(), error = function(e) NULL)
-  #   out <- list()
-  #   
-  #   # early exits if data missing
-  #   if (is.null(x_raw)) return(out)
-  #   
-  #   # clean & basic guards
-  #   x <- as.numeric(stats::na.omit(x_raw))
-  #   if (length(x) < 8 || !is.finite(stats::sd(x)) || stats::sd(x) == 0) {
-  #     out$kpss_error <- sprintf("Insufficient/invalid data for KPSS (N=%d, sd=%s).",
-  #                               length(x), as.character(stats::sd(x)))
-  #   }
-  #   
-  #   # map UI -> KPSS null (tseries uses 'Level' or 'Trend')
-  #   kpss_null <- if ((input$adfTypeSt2 %||% "drift") == "trend") "Trend" else "Level"
-  #   
-  #   # ADF (tseries)
-  #   if (requireNamespace("tseries", quietly = TRUE)) {
-  #     out$adf <- tryCatch(
-  #       tseries::adf.test(x, alternative = (input$alternd2St %||% "stationary"),
-  #                         k = as.integer(input$LagOrderADFd2St %||% 10)),
-  #       error = function(e) { out$adf_error <<- e$message; NULL }
-  #     )
-  #     # KPSS (only attempt if basic guards pass)
-  #     if (is.null(out$kpss_error)) {
-  #       out$kpss <- tryCatch(
-  #         tseries::kpss.test(x, null = kpss_null),
-  #         error = function(e) { out$kpss_error <<- e$message; NULL }
-  #       )
-  #     }
-  #     # PP
-  #     out$pp <- tryCatch(
-  #       tseries::pp.test(x),
-  #       error = function(e) { out$pp_error <<- e$message; NULL }
-  #     )
-  #   } else {
-  #     out$adf_error  <- "Package 'tseries' not installed."
-  #     out$kpss_error <- "Package 'tseries' not installed."
-  #     out$pp_error   <- "Package 'tseries' not installed."
-  #   }
-  #   
-  #   # ADF (urca)
-  #   if (requireNamespace("urca", quietly = TRUE)) {
-  #     out$ur <- tryCatch(
-  #       urca::ur.df(x, type = (input$adfTypeSt2 %||% "drift"),
-  #                   lags = as.integer(input$LagOrderADFd2St %||% 10)),
-  #       error = function(e) { out$ur_error <<- e$message; NULL }
-  #     )
-  #   } else {
-  #     out$ur_error <- "Package 'urca' not installed."
-  #   }
-  #   
-  #   out
-  # })
-  
+ 
   
   
   
@@ -1204,191 +4010,10 @@ server <- function(input, output, session) {
   
   
   
-  # output$stationarity_results <- renderPrint({
-  #   req(stationarity())
-  #   st <- stationarity()
-  #   
-  #   # ---- helpers ----
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
-  #   to_num  <- function(x, d = NA_real_) { y <- suppressWarnings(as.numeric(x)); ifelse(is.finite(y), y, d) }
-  #   fmt_p   <- if (exists("fmt_p", inherits = TRUE)) get("fmt_p") else function(p) {
-  #     if (!is.finite(p)) return("NA"); format.pval(p, digits = 4, eps = .Machine$double.eps)
-  #   }
-  #   fmt_num <- if (exists("fmt_num", inherits = TRUE)) get("fmt_num") else function(x, d = 4) {
-  #     if (!is.finite(x)) return("NA"); format(round(x, d), nsmall = d)
-  #   }
-  #   
-  #   # UI-driven settings (with safe defaults)
-  #   adf_type_ui  <- input$adfTypeSt2 %||% "trend"  # ur.df model type
-  #   k_lags       <- to_num(input$LagOrderADFd2St, 10)
-  #   alpha        <- to_num(input$alphaSt2, 0.05)
-  #   kpss_null_ui <- if (identical(adf_type_ui, "trend")) "tau" else "mu"
-  #   
-  #   # Map for ur.df critical values
-  #   tau_row <- switch(adf_type_ui, "none" = "tau1", "drift" = "tau2", "trend" = "tau3", "tau3")
-  #   alpha_col <- switch(as.character(alpha), "0.01"="1pct","0.05"="5pct","0.1"="10pct","0.10"="10pct","5pct")
-  #   
-  #   # Extract ur.df tau & critical
-  #   tau_obs  <- NA_real_; tau_crit <- NA_real_
-  #   if (!is.null(st$ur)) {
-  #     tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[tau_row]))
-  #     if (!is.finite(tau_obs)) tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[1]))
-  #     cv <- tryCatch(st$ur@cval, error = function(e) NULL)
-  #     if (!is.null(cv)) {
-  #       if (!is.null(dim(cv)) && tau_row %in% rownames(cv) && alpha_col %in% colnames(cv)) {
-  #         tau_crit <- suppressWarnings(as.numeric(cv[tau_row, alpha_col]))
-  #       } else if (is.null(dim(cv)) && !is.null(names(cv)) && alpha_col %in% names(cv)) {
-  #         tau_crit <- suppressWarnings(as.numeric(cv[[alpha_col]]))
-  #       }
-  #     }
-  #   }
-  #   
-  #   # Gather main numbers
-  #   adf_p    <- if (!is.null(st$adf))  to_num(st$adf$p.value)     else NA_real_
-  #   adf_stat <- if (!is.null(st$adf))  to_num(st$adf$statistic)   else NA_real_
-  #   kpss_p   <- if (!is.null(st$kpss)) to_num(st$kpss$p.value)    else NA_real_
-  #   kpss_stat<- if (!is.null(st$kpss)) to_num(st$kpss$statistic)  else NA_real_
-  #   pp_p     <- if (!is.null(st$pp))   to_num(st$pp$p.value)      else NA_real_
-  #   pp_stat  <- if (!is.null(st$pp))   to_num(st$pp$statistic)    else NA_real_
-  #   
-  #   # Decisions
-  #   adf_dec_ts  <- if (is.finite(adf_p))  (adf_p  < alpha) else NA                # reject unit root?
-  #   adf_dec_ur  <- if (is.finite(tau_obs) && is.finite(tau_crit)) (tau_obs < tau_crit) else NA
-  #   kpss_reject <- if (is.finite(kpss_p)) (kpss_p < alpha) else NA               # reject stationarity?
-  #   pp_reject   <- if (is.finite(pp_p))   (pp_p   < alpha) else NA               # reject unit root?
-  #   
-  #   # ---- HEADER ----
-  #   cat("==========================================================================\n")
-  #   cat("                ACADEMIC REPORT: STATIONARITY TEST RESULTS                \n")
-  #   cat("==========================================================================\n")
-  #   cat(" Significance Level (α): ", format(alpha, nsmall = 2), "\n", sep = "")
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 1) ADF (tseries::adf.test) ----
-  #   cat(" 1. AUGMENTED DICKEY–FULLER — tseries::adf.test\n")
-  #   if (is.null(st$adf)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat(" DECISION RULE:\n")
-  #     cat(" • Use case: parametric unit-root test (with lagged differences) to assess if differencing is needed.\n")
-  #     cat(" • H0: Unit root (non-stationary)\n")
-  #     cat(" • Ha: Stationary (mean-reverting)\n")
-  #     cat(" • α :", format(alpha, nsmall = 2), "\n")
-  #     cat(" • Reject H0 if P-value < α.\n\n")
-  #     
-  #     cat(" STATISTICS:\n")
-  #     cat("    - DF statistic       : ", fmt_num(adf_stat, 4), "\n", sep = "")
-  #     cat("    - P-Value            : ", fmt_p(adf_p), "\n\n", sep = "")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(adf_dec_ts)) {
-  #       cat("  P-value < α ⇒ REJECT H0: Evidence suggests STATIONARITY.\n")
-  #     } else if (identical(adf_dec_ts, FALSE)) {
-  #       cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Evidence suggests NON-STATIONARITY (unit root).\n")
-  #     } else {
-  #       cat("  ADF p-value is NA/Inf; decision is inconclusive.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 2) ADF (urca::ur.df) tau vs critical ----
-  #   cat(" 2. ADF — urca::ur.df (tau vs. critical)\n")
-  #   if (is.null(st$ur)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat(" DECISION RULE:\n")
-  #     cat(" • Use case: unit-root test with explicit deterministic component (type = none/drift/trend) and chosen k.\n")
-  #     cat(" • H0: Unit root (non-stationary)\n")
-  #     cat(" • Ha: Stationary\n")
-  #     cat(" • α :", format(alpha, nsmall = 2), " (", alpha_col, ")\n", sep = "")
-  #     cat(" • Reject H0 if Tau-Observed < Tau-Critical.\n\n")
-  #     
-  #     cat(" SPECIFICATION:\n")
-  #     cat("    - Model type         : ", adf_type_ui, "\n", sep = "")
-  #     cat("    - Lags (k)           : ", k_lags, "\n", sep = "")
-  #     cat(" STATISTICS:\n")
-  #     cat("    - Tau Observed       : ", fmt_num(tau_obs, 4), "\n", sep = "")
-  #     cat("    - Tau Critical       : ", fmt_num(tau_crit, 4), "\n\n", sep = "")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(adf_dec_ur)) {
-  #       cat("  Tau-Obs < Tau-Crit ⇒ REJECT H0: Stationarity supported.\n")
-  #     } else if (identical(adf_dec_ur, FALSE)) {
-  #       cat("  Tau-Obs ≥ Tau-Crit ⇒ FAIL TO REJECT H0: Possible unit root (non-stationary).\n")
-  #     } else {
-  #       cat("  Tau or critical value missing; cannot form a decision.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 3) KPSS ----
-  #   cat(" 3. KPSS — tseries::kpss.test\n")
-  #   if (is.null(st$kpss)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat(" DECISION RULE:\n")
-  #     cat(" • Use case: tests the *null* of stationarity (level/trend), complementing ADF/PP.\n")
-  #     cat(" • H0: Stationary around a ", ifelse(kpss_null_ui == "tau", "trend", "level"), "\n", sep = "")
-  #     cat(" • Ha: Non-stationary (unit root)\n")
-  #     cat(" • α :", format(alpha, nsmall = 2), "\n")
-  #     cat(" • Reject H0 if P-value < α.\n\n")
-  #     
-  #     cat(" STATISTICS:\n")
-  #     cat("    - KPSS statistic (η) : ", fmt_num(kpss_stat, 4), "\n", sep = "")
-  #     cat("    - P-Value            : ", fmt_p(kpss_p), "\n\n", sep = "")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(kpss_reject)) {
-  #       cat("  P-value < α ⇒ REJECT H0: Evidence of NON-STATIONARITY.\n")
-  #     } else if (identical(kpss_reject, FALSE)) {
-  #       cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Stationarity is plausible.\n")
-  #     } else {
-  #       cat("  KPSS p-value missing; decision is inconclusive.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 4) Phillips–Perron ----
-  #   cat(" 4. PHILLIPS–PERRON — tseries::pp.test\n")
-  #   if (is.null(st$pp)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat(" DECISION RULE:\n")
-  #     cat(" • Use case: unit-root test with nonparametric correction for serial correlation/heteroskedasticity.\n")
-  #     cat(" • H0: Unit root (non-stationary)\n")
-  #     cat(" • Ha: Stationary\n")
-  #     cat(" • α :", format(alpha, nsmall = 2), "\n")
-  #     cat(" • Reject H0 if P-value < α.\n\n")
-  #     
-  #     cat(" STATISTICS:\n")
-  #     cat("    - PP statistic       : ", fmt_num(pp_stat, 4), "\n", sep = "")
-  #     cat("    - P-Value            : ", fmt_p(pp_p), "\n\n", sep = "")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(pp_reject)) {
-  #       cat("  P-value < α ⇒ REJECT H0: Stationarity suggested.\n")
-  #     } else if (identical(pp_reject, FALSE)) {
-  #       cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Possible unit root (non-stationary).\n")
-  #     } else {
-  #       cat("  PP p-value missing; decision is inconclusive.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- Synthesis (optional short) ----
-  #   cat(" SYNTHESIS:\n")
-  #   cat(" • Combine test evidence with diagnostic plots to select differencing orders d and D.\n")
-  #   cat("==========================================================================\n\n")
-  # })
+ 
   
   
   
-
-  # output$stationarity_results <- renderPrint({
-  #   req(stationarity())
-  #   st <- stationarity()
-  #   cat("Stationarity tests (training series)\n\n")
-  #   cat("ADF (tseries::adf.test)\n"); if (is.null(st$adf)) cat("  Not available.\n") else print(st$adf)
-  #   cat("\nKPSS (tseries::kpss.test)\n"); if (is.null(st$kpss)) cat("  Not available.\n") else print(st$kpss)
-  #   cat("\nPhillips–Perron (tseries::pp.test)\n"); if (is.null(st$pp)) cat("  Not available.\n") else print(st$pp)
-  #   cat("\nADF (urca::ur.df) summary\n"); if (is.null(st$ur)) cat("  Not available.\n") else print(summary(st$ur))
-  # })
   
   
   
@@ -1399,388 +4024,435 @@ server <- function(input, output, session) {
     
     # ---- helpers ----
     `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
-    to_num  <- function(x, d = NA_real_) { y <- suppressWarnings(as.numeric(x)); ifelse(is.finite(y), y, d) }
-    # prefer your global helpers if they exist; otherwise fall back
-    fmt_p   <- if (exists("fmt_p", inherits = TRUE)) get("fmt_p") else function(p) {
-      if (!is.finite(p)) return("NA"); format.pval(p, digits = 4, eps = .Machine$double.eps)
+    to_num <- function(x, d = NA_real_) {
+      y <- suppressWarnings(as.numeric(x))
+      ifelse(is.finite(y), y, d)
     }
-    fmt_num <- if (exists("fmt_num", inherits = TRUE)) get("fmt_num") else function(x, d = 4) {
-      if (!is.finite(x)) return("NA"); format(round(x, d), nsmall = d)
+    to_int <- function(x, d = NA_integer_) {
+      y <- suppressWarnings(as.integer(x))
+      ifelse(is.finite(y), y, d)
     }
     
-    # UI-driven settings (with safe defaults)
-    adf_type_ui  <- input$adfTypeSt2 %||% "trend"  # ur.df model type
-    k_lags       <- to_num(input$LagOrderADFd2St, 10)
-    kpss_null_ui <- if (adf_type_ui == "trend") "tau" else "mu"  # typical pairing
-    alpha        <- to_num(input$alphaSt2, 0.05)
+    fmt_p <- if (exists("fmt_p", inherits = TRUE)) get("fmt_p") else function(p) {
+      if (!is.finite(p)) return("NA")
+      format.pval(p, digits = 4, eps = .Machine$double.eps)
+    }
+    fmt_num <- if (exists("fmt_num", inherits = TRUE)) get("fmt_num") else function(x, d = 4) {
+      if (!is.finite(x)) return("NA")
+      format(round(x, d), nsmall = d)
+    }
+    
+    # ---- series used ----
+    n_used <- if (!is.null(st$series)) length(st$series) else NA_integer_
+    
+    # Prefer stationarity() metadata when available
+    adf_type_ui <- st$type_used %||% (input$adfTypeSt2 %||% "drift")
+    alpha <- to_num(st$alpha_used, to_num(input$alphaSt2, 0.05))
+    
+    # fixed-lag (user-provided) metadata
+    k_lags <- as.integer(to_num(st$k_used, to_num(input$LagOrderADFd2St, 10)))
+    
+    # auto-lag metadata (AIC among 0..Kmax)
+    k_auto <- as.integer(to_num(st$k_auto, NA_real_))
+    max_lag_auto <- as.integer(to_num(st$max_lag_auto, NA_real_))
+    
+    # KPSS null pairing (informational)
+    kpss_null_ui <- if (adf_type_ui == "trend") "tau" else "mu"
     
     # Map for ur.df critical values
     tau_row <- switch(adf_type_ui, "none" = "tau1", "drift" = "tau2", "trend" = "tau3", "tau3")
-    alpha_col <- switch(as.character(alpha), "0.01"="1pct","0.05"="5pct","0.1"="10pct","0.10"="10pct","5pct")
+    alpha_col <- switch(
+      as.character(alpha),
+      "0.01" = "1pct",
+      "0.05" = "5pct",
+      "0.1"  = "10pct",
+      "0.10" = "10pct",
+      "5pct"
+    )
     
-    # Try to extract ur.df tau stat & crit
-    tau_obs  <- NA_real_; tau_crit <- NA_real_
-    if (!is.null(st$ur)) {
-      tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[tau_row]))
-      if (!is.finite(tau_obs)) tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[1]))
-      cv <- tryCatch(st$ur@cval, error = function(e) NULL)
-      if (!is.null(cv)) {
-        if (!is.null(dim(cv)) && tau_row %in% rownames(cv) && alpha_col %in% colnames(cv)) {
-          tau_crit <- suppressWarnings(as.numeric(cv[tau_row, alpha_col]))
-        } else if (is.null(dim(cv)) && !is.null(names(cv)) && alpha_col %in% names(cv)) {
-          tau_crit <- suppressWarnings(as.numeric(cv[[alpha_col]]))
-        }
+    # =========================
+    # NEW: Python-like ADF (no k specified) + report chosen lag
+    # tseries::adf.test default lag rule:
+    #   k_default = trunc((n - 1)^(1/3))
+    # =========================
+    k_default_adf <- NA_integer_
+    if (is.finite(n_used) && n_used >= 2) {
+      k_default_adf <- as.integer(trunc((n_used - 1)^(1/3)))
+      if (!is.finite(k_default_adf) || k_default_adf < 0L) k_default_adf <- NA_integer_
+    }
+    
+    adf_auto_obj  <- NULL
+    adf_auto_p    <- NA_real_
+    adf_auto_stat <- NA_real_
+    adf_auto_err  <- NULL
+    
+    # Run WITHOUT specifying k (Python-like)
+    if (!is.null(st$series) && length(st$series) >= 10) {
+      adf_auto_obj <- tryCatch(
+        tseries::adf.test(st$series, alternative = input$alternd2St %||% "stationary"),
+        error = function(e) { adf_auto_err <<- e$message; NULL }
+      )
+      if (!is.null(adf_auto_obj)) {
+        adf_auto_p    <- to_num(adf_auto_obj$p.value)
+        adf_auto_stat <- to_num(adf_auto_obj$statistic)
       }
     }
     
-    # Gather main numbers
-    adf_p    <- if (!is.null(st$adf))  to_num(st$adf$p.value)     else NA_real_
-    adf_stat <- if (!is.null(st$adf))  to_num(st$adf$statistic)   else NA_real_
-    kpss_p   <- if (!is.null(st$kpss)) to_num(st$kpss$p.value)    else NA_real_
-    kpss_stat<- if (!is.null(st$kpss)) to_num(st$kpss$statistic)  else NA_real_
-    pp_p     <- if (!is.null(st$pp))   to_num(st$pp$p.value)      else NA_real_
-    pp_stat  <- if (!is.null(st$pp))   to_num(st$pp$statistic)    else NA_real_
+    # ---- fixed-lag ur.df tau & crit ----
+    tau_obs <- NA_real_
+    tau_crit <- NA_real_
+    if (!is.null(st$ur)) {
+      tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[tau_row]))
+      if (!is.finite(tau_obs)) tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[1]))
+      
+      cv <- tryCatch(st$ur@cval, error = function(e) NULL)
+      if (!is.null(cv) && is.matrix(cv) &&
+          tau_row %in% rownames(cv) && alpha_col %in% colnames(cv)) {
+        tau_crit <- suppressWarnings(as.numeric(cv[tau_row, alpha_col]))
+      }
+    }
     
-    # Decisions
-    adf_dec_ts  <- if (is.finite(adf_p))  (adf_p  < alpha) else NA
-    adf_dec_ur  <- if (is.finite(tau_obs) && is.finite(tau_crit)) (tau_obs < tau_crit) else NA
-    kpss_reject <- if (is.finite(kpss_p)) (kpss_p < alpha) else NA      # reject stationarity
-    pp_reject   <- if (is.finite(pp_p))   (pp_p   < alpha) else NA      # reject unit root
+    # ---- auto-lag ur.df tau & crit ----
+    tau_obs_auto <- NA_real_
+    tau_crit_auto <- NA_real_
+    if (!is.null(st$ur_auto)) {
+      tau_obs_auto <- suppressWarnings(as.numeric(st$ur_auto@teststat[tau_row]))
+      if (!is.finite(tau_obs_auto)) tau_obs_auto <- suppressWarnings(as.numeric(st$ur_auto@teststat[1]))
+      
+      cv2 <- tryCatch(st$ur_auto@cval, error = function(e) NULL)
+      if (!is.null(cv2) && is.matrix(cv2) &&
+          tau_row %in% rownames(cv2) && alpha_col %in% colnames(cv2)) {
+        tau_crit_auto <- suppressWarnings(as.numeric(cv2[tau_row, alpha_col]))
+      }
+    }
+    
+    # ---- tseries numbers (your existing fixed-k ADF) ----
+    adf_p    <- if (!is.null(st$adf))  to_num(st$adf$p.value)    else NA_real_
+    adf_stat <- if (!is.null(st$adf))  to_num(st$adf$statistic)  else NA_real_
+    
+    kpss_p    <- if (!is.null(st$kpss)) to_num(st$kpss$p.value)   else NA_real_
+    kpss_stat <- if (!is.null(st$kpss)) to_num(st$kpss$statistic) else NA_real_
+    
+    pp_p    <- if (!is.null(st$pp)) to_num(st$pp$p.value) else NA_real_
+    pp_stat <- if (!is.null(st$pp)) to_num(st$pp$statistic) else NA_real_
+    
+    # ---- lags used by tests (best effort) ----
+    adf_lags_used <- k_lags
+    kpss_lags_used <- if (!is.null(st$kpss) && !is.null(st$kpss$parameter)) as.integer(to_num(st$kpss$parameter)) else NA_integer_
+    pp_lags_used   <- if (!is.null(st$pp)   && !is.null(st$pp$parameter))   as.integer(to_num(st$pp$parameter))   else NA_integer_
+    
+    # ---- decisions ----
+    adf_auto_dec_ts <- if (is.finite(adf_auto_p)) (adf_auto_p < alpha) else NA
+    
+    adf_dec_ts      <- if (is.finite(adf_p)) (adf_p < alpha) else NA
+    adf_dec_ur      <- if (is.finite(tau_obs) && is.finite(tau_crit)) (tau_obs < tau_crit) else NA
+    adf_dec_ur_auto <- if (is.finite(tau_obs_auto) && is.finite(tau_crit_auto)) (tau_obs_auto < tau_crit_auto) else NA
+    
+    kpss_reject <- if (is.finite(kpss_p)) (kpss_p < alpha) else NA
+    pp_reject   <- if (is.finite(pp_p)) (pp_p < alpha) else NA
     
     # ---- HEADER ----
     cat("==========================================================================\n")
     cat("                 ACADEMIC REPORT: STATIONARITY ANALYSIS                   \n")
     cat("==========================================================================\n")
+    cat(" Number of Observations Used: ", ifelse(is.finite(n_used), n_used, "NA"), "\n", sep = "")
     cat(" Significance Level (α): ", format(alpha, nsmall = 2), "\n", sep = "")
     cat("--------------------------------------------------------------------------\n")
     
-    # ---- 1) ADF (tseries::adf.test) ----
-    cat(" 1. AUGMENTED DICKEY–FULLER — tseries::adf.test\n")
-    if (is.null(st$adf)) {
+    # ---- TEACHING NOTES: overview ----
+    cat(" STATIONARITY ANALYSIS (overview):\n")
+    cat(" • Stationarity in SARIMA usually means: mean/variance roughly stable over time and autocorrelation decays.\n")
+    cat(" • ADF / PP: H0 = unit root (non-stationary). KPSS: H0 = stationary. They complement each other.\n")
+    cat(" • Differencing guidance:\n")
+    cat("    - Use d for non-seasonal trend; use D for seasonal unit roots.\n")
+    cat("    - Avoid over-differencing: it can induce negative autocorrelation and inflate forecast variance.\n")
+    cat(" • Deterministic terms (ur.df type):\n")
+    cat("    - none: no intercept/trend; drift: intercept; trend: intercept + deterministic trend.\n")
+    cat(" • Caution: structural breaks/outliers can make unit-root tests misleading. Always check plots.\n")
+    cat("--------------------------------------------------------------------------\n")
+    
+    # ---- 1A) Python-like ADF (tseries::adf.test with automatic k) ----
+    cat(" 1A. ADF — tseries::adf.test (AUTO Lag : k)\n")
+    cat("--------------------------------------------------------------------------\n")
+    
+    if (is.null(adf_auto_obj)) {
       cat("    Not available.\n")
+      if (!is.null(adf_auto_err)) cat("    Reason: ", adf_auto_err, "\n", sep = "")
     } else {
       cat(" DECISION RULE:\n")
-      cat(" • Use case: detects a unit root via a parametric regression with lagged differences;\n")
-      cat("   useful to confirm if differencing (d) is needed to achieve stationarity.\n")
       cat(" • H0: the series has a unit root (non-stationary)\n")
-      cat(" • Ha: the series is stationary (mean-reverting)\n")
-      cat(" • α :", format(alpha, nsmall = 2), "\n")
+      cat(" • Ha: the series is stationary\n")
       cat(" • Reject H0 if P-value < α.\n\n")
       
+      cat(" SPECIFICATION:\n")
+      cat("    - Lag selection       : automatic (no k provided)\n")
+      cat("    - Default lag formula : k = trunc((n - 1)^(1/3))\n")
+      cat("    - n used              : ", ifelse(is.finite(n_used), n_used, "NA"), "\n", sep = "")
+      cat("    - #Lags chosen (k)    : ", ifelse(is.finite(k_default_adf), k_default_adf, "NA"), "\n", sep = "")
+      cat("    - Critical Value      : not printed (p-value based)\n\n")
+      
       cat(" STATISTICS:\n")
-      cat("    - Test Statistic (DF) :", fmt_num(adf_stat, 4), "\n")
-      cat("    - P-Value             :", fmt_p(adf_p), "\n\n")
+      cat("    - Test Statistic (DF) : ", fmt_num(adf_auto_stat, 4), "\n", sep = "")
+      cat("    - P-Value             : ", fmt_p(adf_auto_p), "\n\n", sep = "")
       
       cat(" DECISION:\n")
-      if (isTRUE(adf_dec_ts)) {
-        cat("  P-value < α ⇒ REJECT H0: Evidence suggests STATIONARITY.\n")
-      } else if (identical(adf_dec_ts, FALSE)) {
-        cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Evidence suggests NON-STATIONARITY (unit root).\n")
+      if (isTRUE(adf_auto_dec_ts)) {
+        cat("  P-value < α ⇒ REJECT H0: Evidence suggests STATIONARITY.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  This result mirrors common Python workflows: the ADF lag length is chosen automatically based on sample size.\n")
+        cat("  Rejecting H0 suggests the series does not behave like a unit-root process under this default lag choice.\n")
+        cat("  In SARIMA practice, this reduces the need for non-seasonal differencing (d), but you should still check seasonal\n")
+        cat("  patterns (possibly D) and confirm with KPSS/PP plus ACF/PACF.\n")
+      } else if (identical(adf_auto_dec_ts, FALSE)) {
+        cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Evidence suggests NON-STATIONARITY.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  With automatic lag choice, failing to reject H0 indicates a unit root remains plausible, so differencing is typically\n")
+        cat("  justified (often d = 1). After differencing, re-run tests: if results flip to stationarity and residual diagnostics look\n")
+        cat("  white-noise-like, you have a good basis for ARIMA modeling.\n")
       } else {
-        cat("  ADF p-value is NA/Inf; decision is inconclusive.\n")
+        cat("  ADF p-value missing; decision is inconclusive.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  When p-values are unavailable/non-finite, rely more on the ur.df tau/critical approach, KPSS/PP, and especially the time\n")
+        cat("  plot + ACF/PACF. Also verify the series isn’t constant and has enough variation after cleaning.\n")
       }
     }
     cat("--------------------------------------------------------------------------\n")
     
-    # ---- 2) ADF (urca::ur.df) tau vs critical ----
-    cat(" 2. ADF — urca::ur.df (tau vs. critical)\n")
-    if (is.null(st$ur)) {
+    # ---- 1) ADF (tseries::adf.test) fixed k (your existing one) ----
+    cat(" 1B. ADF — tseries::adf.test (FIXED k)\n")
+    cat("--------------------------------------------------------------------------\n")
+    
+    if (is.null(st$adf)) {
       cat("    Not available.\n")
+      if (!is.null(st$adf_error)) cat("    Reason: ", st$adf_error, "\n", sep = "")
     } else {
       cat(" DECISION RULE:\n")
-      cat(" • Use case: complementary ADF formulation with explicit deterministic component\n")
-      cat("   (type = none/drift/trend) and chosen lag order k; compares τ to critical values.\n")
       cat(" • H0: the series has a unit root (non-stationary)\n")
       cat(" • Ha: the series is stationary\n")
-      cat(" • α :", format(alpha, nsmall = 2), " (", alpha_col, ")\n", sep = "")
+      cat(" • Reject H0 if P-value < α.\n\n")
+      
+      cat(" SPECIFICATION:\n")
+      cat("    - #Lags Used (k)      : ", ifelse(is.finite(adf_lags_used), adf_lags_used, "NA"), "\n", sep = "")
+      cat("    - Critical Value      : not printed (p-value based)\n\n")
+      
+      cat(" STATISTICS:\n")
+      cat("    - Test Statistic (DF) : ", fmt_num(adf_stat, 4), "\n", sep = "")
+      cat("    - P-Value             : ", fmt_p(adf_p), "\n\n", sep = "")
+      
+      cat(" DECISION:\n")
+      if (isTRUE(adf_dec_ts)) {
+        cat("  P-value < α ⇒ REJECT H0: Evidence suggests STATIONARITY.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  Under the chosen fixed lag k, the unit-root null is rejected. This supports treating the series as stationary after\n")
+        cat("  accounting for autocorrelation up to k lags. If this disagrees with KPSS, treat evidence as mixed and validate with\n")
+        cat("  residual diagnostics and forecast performance.\n")
+      } else if (identical(adf_dec_ts, FALSE)) {
+        cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Evidence suggests NON-STATIONARITY.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  With the selected fixed lag, a unit root cannot be ruled out. Consider differencing (d) and then re-check ACF/PACF.\n")
+        cat("  If the ACF still shows seasonal spikes at multiples of s, consider seasonal differencing (D).\n")
+      } else {
+        cat("  ADF p-value missing; decision is inconclusive.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  When ADF is inconclusive, rely on ur.df tau/critical, PP, and KPSS along with plots. In teaching settings, it helps to\n")
+        cat("  compare fixed-k vs auto-k to show sensitivity to lag choice.\n")
+      }
+    }
+    cat("--------------------------------------------------------------------------\n")
+    
+    # ---- 2) ADF (urca::ur.df) fixed lag ----
+    cat(" 2A. ADF — urca::ur.df (FIXED lags; tau vs. critical)\n")
+    cat("--------------------------------------------------------------------------\n")
+    
+    if (is.null(st$ur)) {
+      cat("    Not available.\n")
+      if (!is.null(st$ur_error)) cat("    Reason: ", st$ur_error, "\n", sep = "")
+    } else {
+      cat(" DECISION RULE:\n")
+      cat(" • H0: the series has a unit root (non-stationary)\n")
+      cat(" • Ha: the series is stationary\n")
       cat(" • Reject H0 if Tau-Observed < Tau-Critical.\n\n")
       
       cat(" SPECIFICATION:\n")
-      cat("    - Model type         : ", adf_type_ui, "\n", sep = "")
-      cat("    - Lags (k)           : ", k_lags, "\n", sep = "")
+      cat("    - Model type          : ", adf_type_ui, "  (none/drift/trend)\n", sep = "")
+      cat("    - #Lags Used (k)      : ", ifelse(is.finite(k_lags), k_lags, "NA"), "\n", sep = "")
+      
+      cat(" CRITICAL VALUE:\n")
+      cat("    - Tau Critical        : ", fmt_num(tau_crit, 4), " (", alpha_col, ")\n\n", sep = "")
+      
       cat(" STATISTICS:\n")
-      cat("    - Tau Observed       : ", fmt_num(tau_obs, 4), "\n", sep = "")
-      cat("    - Tau Critical       : ", fmt_num(tau_crit, 4), "\n\n", sep = "")
+      cat("    - Tau Observed        : ", fmt_num(tau_obs, 4), "\n\n", sep = "")
       
       cat(" DECISION:\n")
       if (isTRUE(adf_dec_ur)) {
-        cat("  Tau-Obs < Tau-Crit ⇒ REJECT H0: Stationarity supported.\n")
+        cat("  Tau-Obs < Tau-Crit ⇒ REJECT H0: Stationarity supported.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  The ur.df version is useful for teaching because it explicitly shows the deterministic component and uses a tau statistic\n")
+        cat("  compared to critical values. Rejection strengthens the case for d = 0, but always check if seasonality implies D > 0.\n")
       } else if (identical(adf_dec_ur, FALSE)) {
-        cat("  Tau-Obs ≥ Tau-Crit ⇒ FAIL TO REJECT H0: Possible unit root (non-stationary).\n")
+        cat("  Tau-Obs ≥ Tau-Crit ⇒ FAIL TO REJECT H0: Possible unit root.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  Failing to reject here suggests non-stationarity under the chosen deterministic component and lag order. In practice, try\n")
+        cat("  differencing and re-run tests; in teaching, compare type=drift vs type=trend to show how assumptions change conclusions.\n")
       } else {
-        cat("  Tau or critical value missing; cannot form a decision.\n")
+        cat("  Tau or critical value missing; cannot form a decision.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  If critical values are missing (package/version issues), use PP + KPSS and emphasize plot-based diagnostics.\n")
+      }
+    }
+    cat("--------------------------------------------------------------------------\n")
+    
+    # ---- 2A) ADF (urca::ur.df) automatic lag selection ----
+    cat(" 2B. ADF — urca::ur.df (AUTOMATIC lags via AIC; tau vs. critical)\n")
+    cat("--------------------------------------------------------------------------\n")
+    
+    if (is.null(st$ur_auto)) {
+      cat("    Not available.\n")
+      if (!is.null(st$ur_auto_error)) cat("    Reason: ", st$ur_auto_error, "\n", sep = "")
+    } else {
+      cat(" DECISION RULE:\n")
+      cat(" • H0: the series has a unit root (non-stationary)\n")
+      cat(" • Ha: the series is stationary\n")
+      cat(" • Lags are selected automatically using AIC within 0..Kmax.\n")
+      cat(" • Reject H0 if Tau-Observed < Tau-Critical.\n\n")
+      
+      cat(" SPECIFICATION:\n")
+      cat("    - Model type          : ", adf_type_ui, "\n", sep = "")
+      cat("    - Kmax searched       : ", ifelse(is.finite(max_lag_auto), max_lag_auto, "NA"), "\n", sep = "")
+      cat("    - #Lags chosen (auto) : ", ifelse(is.finite(k_auto), k_auto, "NA"), "\n", sep = "")
+      
+      cat(" CRITICAL VALUE:\n")
+      cat("    - Tau Critical        : ", fmt_num(tau_crit_auto, 4), " (", alpha_col, ")\n\n", sep = "")
+      
+      cat(" STATISTICS:\n")
+      cat("    - Tau Observed        : ", fmt_num(tau_obs_auto, 4), "\n\n", sep = "")
+      
+      cat(" DECISION:\n")
+      if (isTRUE(adf_dec_ur_auto)) {
+        cat("  Tau-Obs < Tau-Crit ⇒ REJECT H0: Stationarity supported.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  This is the most teachable/defensible ADF workflow: you set a maximum lag (Kmax) and let AIC pick the lag that best\n")
+        cat("  explains autocorrelation without overfitting. Agreement with PP (reject unit root) and KPSS (do not reject stationarity)\n")
+        cat("  is strong evidence for d = 0, subject to seasonal structure.\n")
+      } else if (identical(adf_dec_ur_auto, FALSE)) {
+        cat("  Tau-Obs ≥ Tau-Crit ⇒ FAIL TO REJECT H0: Possible unit root.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  Even with AIC-selected lag, the unit-root null remains plausible. This supports differencing. In teaching, highlight that\n")
+        cat("  lag choice matters because too few lags leave autocorrelation in errors; too many reduce power.\n")
+      } else {
+        cat("  Tau or critical value missing; cannot form a decision.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  If tau/critical values can’t be extracted, treat as supportive context and rely on the other tests + plots.\n")
       }
     }
     cat("--------------------------------------------------------------------------\n")
     
     # ---- 3) KPSS ----
     cat(" 3. KPSS — tseries::kpss.test\n")
+    cat("--------------------------------------------------------------------------\n")
+    
     if (is.null(st$kpss)) {
       cat("    Not available.\n")
+      if (!is.null(st$kpss_error)) cat("    Reason: ", st$kpss_error, "\n", sep = "")
     } else {
       cat(" DECISION RULE:\n")
-      cat(" • Use case: tests the *null* of stationarity (around a level or trend);\n")
-      cat("   complements ADF/PP by flagging residual non-stationarity when ADF/PP are inconclusive.\n")
       cat(" • H0: the series is stationary around a ", ifelse(kpss_null_ui == "tau", "trend", "level"), "\n", sep = "")
-      cat(" • Ha: the series is non-stationary (has a unit root)\n")
-      cat(" • α :", format(alpha, nsmall = 2), "\n")
+      cat(" • Ha: the series is non-stationary\n")
       cat(" • Reject H0 if P-value < α.\n\n")
       
+      cat(" SPECIFICATION:\n")
+      cat("    - #Lags Used          : ", ifelse(is.finite(kpss_lags_used), kpss_lags_used, "NA"), "\n", sep = "")
+      cat("    - Critical Value      : not printed (p-value based)\n\n")
+      
       cat(" STATISTICS:\n")
-      cat("    - Test Statistic (η) : ", fmt_num(kpss_stat, 4), "\n", sep = "")
-      cat("    - P-Value            : ", fmt_p(kpss_p), "\n\n", sep = "")
+      cat("    - Test Statistic (η)  : ", fmt_num(kpss_stat, 4), "\n", sep = "")
+      cat("    - P-Value             : ", fmt_p(kpss_p), "\n\n", sep = "")
       
       cat(" DECISION:\n")
       if (isTRUE(kpss_reject)) {
-        cat("  P-value < α ⇒ REJECT H0: Evidence of NON-STATIONARITY.\n")
+        cat("  P-value < α ⇒ REJECT H0: Evidence of NON-STATIONARITY.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  KPSS is the mirror-image of ADF/PP: it rejects stationarity. If ADF/PP fail to reject unit root AND KPSS rejects\n")
+        cat("  stationarity, that’s convergent evidence for differencing. If KPSS conflicts with ADF, emphasize mixed evidence and\n")
+        cat("  validate with residual diagnostics and forecast accuracy.\n")
       } else if (identical(kpss_reject, FALSE)) {
-        cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Stationarity is plausible.\n")
+        cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Stationarity is plausible.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  Non-rejection supports stationarity around level/trend. In teaching, KPSS is great to show why ‘fail to reject’ is not\n")
+        cat("  ‘prove stationarity’, but combined with ADF/PP it builds a coherent story.\n")
       } else {
-        cat("  KPSS p-value missing; decision is inconclusive.\n")
+        cat("  KPSS p-value missing; decision is inconclusive.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  If KPSS is unavailable/inconclusive, rely more on ADF/PP + plots and consider using multiple transformations.\n")
       }
     }
     cat("--------------------------------------------------------------------------\n")
     
     # ---- 4) Phillips–Perron ----
     cat(" 4. PHILLIPS–PERRON — tseries::pp.test\n")
+    cat("--------------------------------------------------------------------------\n")
+    
     if (is.null(st$pp)) {
       cat("    Not available.\n")
+      if (!is.null(st$pp_error)) cat("    Reason: ", st$pp_error, "\n", sep = "")
     } else {
       cat(" DECISION RULE:\n")
-      cat(" • Use case: unit-root test robust to serial correlation/heteroskedasticity\n")
-      cat("   (nonparametric corrections); complements ADF.\n")
       cat(" • H0: the series has a unit root (non-stationary)\n")
       cat(" • Ha: the series is stationary\n")
-      cat(" • α :", format(alpha, nsmall = 2), "\n")
       cat(" • Reject H0 if P-value < α.\n\n")
       
+      cat(" SPECIFICATION:\n")
+      cat("    - #Lags Used          : ", ifelse(is.finite(pp_lags_used), pp_lags_used, "NA"), "\n", sep = "")
+      cat("    - Critical Value      : not printed (p-value based)\n\n")
+      
       cat(" STATISTICS:\n")
-      cat("    - Test Statistic     : ", fmt_num(pp_stat, 4), "\n", sep = "")
-      cat("    - P-Value            : ", fmt_p(pp_p), "\n\n", sep = "")
+      cat("    - Test Statistic      : ", fmt_num(pp_stat, 4), "\n", sep = "")
+      cat("    - P-Value             : ", fmt_p(pp_p), "\n\n", sep = "")
       
       cat(" DECISION:\n")
       if (isTRUE(pp_reject)) {
-        cat("  P-value < α ⇒ REJECT H0: Stationarity suggested.\n")
+        cat("  P-value < α ⇒ REJECT H0: Stationarity suggested.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  PP is a robust alternative to ADF that corrects for serial correlation/heteroskedasticity nonparametrically.\n")
+        cat("  In teaching, it’s useful to show that agreement between PP and ADF strengthens inference, while disagreement suggests\n")
+        cat("  sensitivity to assumptions and motivates a conservative workflow.\n")
       } else if (identical(pp_reject, FALSE)) {
-        cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Possible unit root (non-stationary).\n")
+        cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Possible unit root.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  PP does not reject a unit root, supporting differencing. Re-test after differencing and check residual whiteness.\n")
       } else {
-        cat("  PP p-value missing; decision is inconclusive.\n")
+        cat("  PP p-value missing; decision is inconclusive.\n\n")
+        cat(" CONCLUSION (teaching paragraph):\n")
+        cat("  If PP is inconclusive, rely on the other tests + plots, and consider transformations (log/Box-Cox) before differencing.\n")
       }
     }
     cat("--------------------------------------------------------------------------\n")
     
     # ---- Final synthesis ----
-    cat(" RECOMMENDATION:\n")
-    cat(" • Combine test evidence with plots (Time, ACF/PACF) to choose differencing orders d and D.\n")
-    if ( (isTRUE(adf_dec_ts) || isTRUE(adf_dec_ur) || isTRUE(pp_reject)) && !isTRUE(kpss_reject) ) {
-      cat(" • Convergent evidence for STATIONARITY (ADF/PP agree; KPSS does not reject): consider d = 0 (check seasonality).\n")
-    } else if ( (identical(adf_dec_ts, FALSE) || identical(adf_dec_ur, FALSE) || identical(pp_reject, FALSE)) && isTRUE(kpss_reject) ) {
-      cat(" • Convergent evidence for NON-STATIONARITY: apply differencing (d and/or D), then re-test.\n")
+    cat(" RECOMMENDATION (practical SARIMA workflow):\n")
+    cat("--------------------------------------------------------------------------\n")
+    
+    cat(" • Step 1: Inspect time plot + ACF/PACF (look for slow decay and seasonal spikes).\n")
+    cat(" • Step 2: Use evidence from ADF/PP (unit root) + KPSS (stationarity null) to decide d and D.\n")
+    cat(" • Step 3: Apply minimal differencing; re-check tests and plots.\n")
+    cat(" • Step 4: Fit SARIMA; verify residuals ~ white noise (Ljung-Box, residual ACF).\n")
+    cat(" • Step 5: Prefer the model that passes diagnostics and forecasts well (not just lowest AIC).\n\n")
+    
+    # teaching: show how to interpret convergence
+    if ((isTRUE(adf_auto_dec_ts) || isTRUE(adf_dec_ts) || isTRUE(adf_dec_ur) || isTRUE(adf_dec_ur_auto) || isTRUE(pp_reject)) && !isTRUE(kpss_reject)) {
+      cat(" • Convergent evidence: STATIONARITY likely (consider d = 0; then evaluate seasonal differencing D).\n")
+    } else if ((identical(adf_auto_dec_ts, FALSE) || identical(adf_dec_ts, FALSE) || identical(adf_dec_ur, FALSE) || identical(adf_dec_ur_auto, FALSE) || identical(pp_reject, FALSE)) && isTRUE(kpss_reject)) {
+      cat(" • Convergent evidence: NON-STATIONARITY likely (difference: d and/or D; then re-test).\n")
     } else {
-      cat(" • Mixed signals: be conservative — prefer differencing and validate via residual diagnostics/forecast performance.\n")
+      cat(" • Mixed evidence: be conservative — try minimal differencing and validate using residual diagnostics + forecast accuracy.\n")
     }
+    
     cat("\n==========================================================================\n\n")
   })
   
   
   
-  # output$stationarity_interpretation <- renderPrint({
-  #   req(stationarity())
-  #   st <- stationarity()
-  #   
-  #   # ---- small helpers (local) ----
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
-  #   to_num  <- function(x, d = NA_real_) { y <- suppressWarnings(as.numeric(x)); ifelse(is.finite(y), y, d) }
-  #   fmt_p   <- get("fmt_p",   envir = parent.env(environment()))  # use your global helpers
-  #   fmt_num <- get("fmt_num", envir = parent.env(environment()))
-  #   
-  #   # Inputs (with safe defaults)
-  #   adf_type_ui  <- input$adf_type  %||% "trend"  # for ur.df
-  #   kpss_null_ui <- input$kpss_type %||% "mu"
-  #   k_lags       <- to_num(input$adf_lags, 10)
-  #   alpha        <- to_num(input$alphaSt2, 0.05)  # will fall back to 0.05 if not present in this tab
-  #   
-  #   # Map for ur.df rows/cols (critical values)
-  #   tau_row <- switch(adf_type_ui, "none" = "tau1", "drift" = "tau2", "trend" = "tau3", "tau3")
-  #   alpha_col <- switch(as.character(alpha),
-  #                       "0.01"="1pct","0.05"="5pct","0.1"="10pct","0.10"="10pct","5pct")
-  #   
-  #   # Try to extract ur.df tau stat and critical value
-  #   tau_obs  <- NA_real_; tau_crit <- NA_real_
-  #   if (!is.null(st$ur)) {
-  #     # observed
-  #     tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[tau_row]))
-  #     if (!is.finite(tau_obs)) {
-  #       tau_obs <- suppressWarnings(as.numeric(st$ur@teststat[1]))
-  #     }
-  #     # critical
-  #     cv <- tryCatch(st$ur@cval, error = function(e) NULL)
-  #     if (!is.null(cv) && !is.null(dim(cv)) && tau_row %in% rownames(cv) && alpha_col %in% colnames(cv)) {
-  #       tau_crit <- suppressWarnings(as.numeric(cv[tau_row, alpha_col]))
-  #     } else if (!is.null(cv) && is.null(dim(cv)) && !is.null(names(cv)) && alpha_col %in% names(cv)) {
-  #       tau_crit <- suppressWarnings(as.numeric(cv[[alpha_col]]))
-  #     }
-  #   }
-  #   
-  #   # Extract main test numbers
-  #   adf_p   <- if (!is.null(st$adf)) to_num(st$adf$p.value) else NA_real_
-  #   adf_stat<- if (!is.null(st$adf)) to_num(st$adf$statistic) else NA_real_
-  #   
-  #   kpss_p   <- if (!is.null(st$kpss)) to_num(st$kpss$p.value) else NA_real_
-  #   kpss_stat<- if (!is.null(st$kpss)) to_num(st$kpss$statistic) else NA_real_
-  #   
-  #   pp_p     <- if (!is.null(st$pp)) to_num(st$pp$p.value) else NA_real_
-  #   pp_stat  <- if (!is.null(st$pp)) to_num(st$pp$statistic) else NA_real_
-  #   
-  #   # Decisions
-  #   # ADF (ur.df rule): reject H0 (unit root) if tau_obs < tau_crit
-  #   adf_dec_ur <- if (is.finite(tau_obs) && is.finite(tau_crit)) (tau_obs < tau_crit) else NA
-  #   adf_dec_ts <- if (is.finite(adf_p)) (adf_p < alpha) else NA  # tseries reference
-  #   
-  #   # KPSS: reject H0 (stationary) if p < alpha
-  #   kpss_reject <- if (is.finite(kpss_p)) (kpss_p < alpha) else NA
-  #   
-  #   # PP: reject H0 (unit root) if p < alpha
-  #   pp_reject <- if (is.finite(pp_p)) (pp_p < alpha) else NA
-  #   
-  #   # ---- HEADER ----
-  #   cat("==========================================================================\n")
-  #   cat("                 ACADEMIC REPORT: STATIONARITY ANALYSIS                   \n")
-  #   cat("==========================================================================\n")
-  #   cat(" DECISION RULES:\n")
-  #   cat(" • ADF (tseries::adf.test): H0 = Unit Root (non-stationary).\n")
-  #   cat("     Reject H0 if P-value < α.\n")
-  #   cat(" • ADF (urca::ur.df): H0 = Unit Root; type =", adf_type_ui, ", lags k =", k_lags, "\n")
-  #   cat("     Reject H0 if Tau-Observed < Tau-Critical (", alpha_col, ").\n", sep = "")
-  #   cat(" • KPSS (tseries::kpss.test): H0 = Stationary (null =", kpss_null_ui, ").\n")
-  #   cat("     Reject H0 if P-value < α.\n")
-  #   cat(" • PP (tseries::pp.test): H0 = Unit Root (non-stationary).\n")
-  #   cat("     Reject H0 if P-value < α.\n")
-  #   cat(" • Significance Level (α): ", format(alpha, nsmall = 2), "\n", sep = "")
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 1) ADF (tseries) ----
-  #   cat(" 1. AUGMENTED DICKEY–FULLER (tseries)\n")
-  #   if (is.null(st$adf)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat("    - Test Statistic (DF) :", fmt_num(adf_stat, 4), "\n")
-  #     cat("    - P-Value             :", fmt_p(adf_p), "\n\n")
-  #     cat(" RESULT:\n")
-  #     cat("  The ADF test from tseries evaluates the unit-root hypothesis in a regression\n")
-  #     cat("  with lagged differences (k =", k_lags, ").\n\n")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(adf_dec_ts)) {
-  #       cat("  At α =", format(alpha, nsmall = 2), " the p-value indicates REJECTION of H0.\n")
-  #       cat("  Evidence suggests the series is STATIONARY.\n")
-  #     } else if (identical(adf_dec_ts, FALSE)) {
-  #       cat("  At α =", format(alpha, nsmall = 2), " the p-value is not small enough.\n")
-  #       cat("  FAIL TO REJECT H0: Evidence suggests NON-STATIONARITY (unit root).\n")
-  #     } else {
-  #       cat("  ADF p-value is NA/Inf; decision is inconclusive.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 2) ADF (urca::ur.df) with critical value ----
-  #   cat(" 2. ADF (urca::ur.df) — Tau vs Critical\n")
-  #   if (is.null(st$ur)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat("    - Tau Observed        :", fmt_num(tau_obs, 4), "\n")
-  #     cat("    - Tau Critical (", alpha_col, "): ", fmt_num(tau_crit, 4), "\n", sep = "")
-  #     cat("    - Model type          : ", adf_type_ui, " | Lags k: ", k_lags, "\n", sep = "")
-  #     cat("\n RESULT:\n")
-  #     cat("  The ur.df framework compares the observed tau statistic to its critical value\n")
-  #     cat("  under the specified deterministic component (none/drift/trend).\n\n")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(adf_dec_ur)) {
-  #       cat("  Tau-Obs < Tau-Crit ⇒ REJECT H0: Stationarity supported.\n")
-  #     } else if (identical(adf_dec_ur, FALSE)) {
-  #       cat("  Tau-Obs ≥ Tau-Crit ⇒ FAIL TO REJECT H0: Possible unit root (non-stationary).\n")
-  #     } else {
-  #       cat("  Tau or critical value missing; cannot form a decision.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 3) KPSS ----
-  #   cat(" 3. KPSS (tseries::kpss.test)\n")
-  #   if (is.null(st$kpss)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat("    - Test Statistic (η)  :", fmt_num(kpss_stat, 4), "\n")
-  #     cat("    - P-Value             :", fmt_p(kpss_p), "\n")
-  #     cat("    - Null hypothesis     : Stationary around ", ifelse(kpss_null_ui == "tau", "a trend", "a level"), "\n", sep = "")
-  #     cat("\n RESULT:\n")
-  #     cat("  Small p-values indicate deviations from stationarity with respect to the chosen null.\n\n")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(kpss_reject)) {
-  #       cat("  P-value < α ⇒ REJECT H0: Evidence of NON-STATIONARITY.\n")
-  #     } else if (identical(kpss_reject, FALSE)) {
-  #       cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Stationarity is plausible.\n")
-  #     } else {
-  #       cat("  KPSS p-value missing; decision is inconclusive.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- 4) Phillips–Perron ----
-  #   cat(" 4. PHILLIPS–PERRON (tseries::pp.test)\n")
-  #   if (is.null(st$pp)) {
-  #     cat("    Not available.\n")
-  #   } else {
-  #     cat("    - Test Statistic      :", fmt_num(pp_stat, 4), "\n")
-  #     cat("    - P-Value             :", fmt_p(pp_p), "\n\n")
-  #     cat(" RESULT:\n")
-  #     cat("  The PP test addresses serial correlation/heteroskedasticity nonparametrically.\n\n")
-  #     cat(" DECISION:\n")
-  #     if (isTRUE(pp_reject)) {
-  #       cat("  P-value < α ⇒ REJECT H0: Stationarity suggested.\n")
-  #     } else if (identical(pp_reject, FALSE)) {
-  #       cat("  P-value ≥ α ⇒ FAIL TO REJECT H0: Possible unit root (non-stationary).\n")
-  #     } else {
-  #       cat("  PP p-value missing; decision is inconclusive.\n")
-  #     }
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---- Final Advice ----
-  #   cat(" ADVICE:\n")
-  #   if (isTRUE(adf_dec_ts) || isTRUE(adf_dec_ur)) {
-  #     if (!isTRUE(kpss_reject) && isTRUE(pp_reject)) {
-  #       cat(" • Convergent evidence (ADF/PP) with KPSS non-rejection ⇒ stationarity is well supported.\n")
-  #     } else if (isTRUE(kpss_reject)) {
-  #       cat(" • ADF/PP vs KPSS conflict: consider differencing (d or D), check model type (none/drift/trend),\n")
-  #       cat("   and inspect for structural breaks/seasonality.\n")
-  #     } else {
-  #       cat(" • ADF indicates stationarity; verify visually and with residual diagnostics.\n")
-  #     }
-  #   } else if (identical(adf_dec_ts, FALSE) || identical(adf_dec_ur, FALSE) || identical(pp_reject, FALSE)) {
-  #     cat(" • Evidence of a unit root: apply differencing (d and/or D), then re-test.\n")
-  #   } else {
-  #     cat(" • Mixed/inconclusive: rely on plots (time, ACF/PACF) and adopt a conservative differencing choice.\n")
-  #   }
-  #   cat("\n==========================================================================\n\n")
-  # })
-  
-  
-  
-  
-
-  # output$stationarity_interpretation <- renderPrint({
-  #   req(stationarity())
-  #   st <- stationarity()
-  #   cat("Interpretation (heuristic):\n\n")
-  #   cat("- ADF: H0 = unit root (non-stationary). Small p suggests stationarity.\n")
-  #   cat("- KPSS: H0 = stationary. Small p suggests non-stationary.\n")
-  #   cat("- PP: H0 = unit root (non-stationary). Small p suggests stationarity.\n\n")
-  #   if (!is.null(st$adf)) cat("ADF:", fmt_p(st$adf$p.value), "\n")
-  #   if (!is.null(st$kpss)) cat("KPSS:", fmt_p(st$kpss$p.value), "\n")
-  #   if (!is.null(st$pp)) cat("PP:", fmt_p(st$pp$p.value), "\n\n")
-  #   cat("Recommendation: use combined evidence (tests + plots) to decide d and D.\n")
-  # })
-
+ 
   diff_preview <- eventReactive(input$preview_diff, {
     s <- ts_train_test()
     x <- ts(c(as.numeric(s$ts_train), as.numeric(s$ts_test)), start = 1, frequency = frequency(s$ts_train))
@@ -1792,8 +4464,262 @@ server <- function(input, output, session) {
     x2
   })
 
-  output$diff_plot <- renderPlot({ req(diff_preview()); plot(diff_preview(), main = "Differenced series preview", ylab = "Value", xlab = "Time") })
-
+  
+  
+  
+  output$diff_plot <- renderPlot(
+    {
+      # =======================
+      # Layout knobs (EDIT ME)
+      # =======================
+      LAG_MAX <- 40
+      
+      # When SPLIT (top + middle + (acf|pacf))
+      # ↓↓↓ Reduce TOP, increase BOTTOM so ACF/PACF are readable
+      H_TOP <- 0.7   # top: original series with split line
+      H_MID <- 1.0   # middle: train-differenced series
+      H_BOT <- 1.6   # bottom: ACF/PACF row
+      
+      # Width split between ACF and PACF
+      W_LEFT  <- 1.0
+      W_RIGHT <- 1.0
+      
+      # Panel styling knobs (teaching-friendly)
+      TOP_TITLE_SIZE <- 11
+      MID_TITLE_SIZE <- 12
+      BOT_TITLE_SIZE <- 12
+      
+      TOP_MARGIN <- ggplot2::margin(t = 2, r = 6, b = 2, l = 6)
+      MID_MARGIN <- ggplot2::margin(t = 6, r = 6, b = 6, l = 6)
+      BOT_MARGIN <- ggplot2::margin(t = 6, r = 6, b = 6, l = 6)
+      
+      s <- ts_train_test()
+      req(s$ts_train)
+      
+      d <- as.numeric(input$d_preview)
+      D <- as.numeric(input$D_preview)
+      
+      has_test <- isTRUE(input$train_prop < 1) && length(s$ts_test) > 0
+      
+      # Full ORIGINAL series (no differencing)
+      x_full_orig <- ts(
+        c(as.numeric(s$ts_train), as.numeric(s$ts_test)),
+        start = 1,
+        frequency = frequency(s$ts_train)
+      )
+      
+      # Differencing helper
+      do_diff <- function(x) {
+        x2 <- x
+        if (d > 0) x2 <- diff(x2, differences = d)
+        if (D > 0) x2 <- diff(x2, lag = frequency(x), differences = D)
+        x2
+      }
+      
+      # =========================
+      # NO SPLIT: top reflects d,D
+      # =========================
+      if (!has_test) {
+        x_full_diff <- do_diff(x_full_orig)
+        
+        p_top <- autoplot(x_full_diff) +
+          ggtitle(paste0("Series preview (full), differenced (d=", d, ", D=", D, ")")) +
+          xlab("Time") + ylab("Value") +
+          theme(
+            plot.title = element_text(size = MID_TITLE_SIZE),
+            plot.margin = MID_MARGIN
+          )
+        
+        p_acf  <- ggAcf(x_full_diff, lag.max = LAG_MAX) +
+          ggtitle("ACF (full series, after differencing)") +
+          theme(
+            plot.title = element_text(size = BOT_TITLE_SIZE),
+            plot.margin = BOT_MARGIN
+          )
+        
+        p_pacf <- ggPacf(x_full_diff, lag.max = LAG_MAX) +
+          ggtitle("PACF (full series, after differencing)") +
+          theme(
+            plot.title = element_text(size = BOT_TITLE_SIZE),
+            plot.margin = BOT_MARGIN
+          )
+        
+        (p_top / (p_acf | p_pacf)) +
+          patchwork::plot_layout(heights = c(1.1, 1.0), widths = c(W_LEFT, W_RIGHT))
+      } else {
+        
+        # =========================
+        # SPLIT: top original + split line
+        # =========================
+        p_top <- autoplot(x_full_orig) +
+          ggtitle("Original time series (no transformation) with Train/Test split") +
+          xlab("Time") + ylab("Value") +
+          theme(
+            plot.title = element_text(size = TOP_TITLE_SIZE),
+            plot.margin = TOP_MARGIN
+          )
+        
+        split_time <- time(x_full_orig)[length(s$ts_train)]
+        p_top <- p_top +
+          geom_vline(xintercept = split_time, linetype = "dashed", color = "red") +
+          annotate(
+            "text",
+            x = split_time,
+            y = max(as.numeric(x_full_orig), na.rm = TRUE),
+            label = "Train/Test split",
+            vjust = -0.5, hjust = 0,
+            color = "red",
+            size = 3
+          )
+        
+        # Middle: TRAIN-only differenced
+        x_train_diff <- do_diff(s$ts_train)
+        
+        p_mid <- autoplot(x_train_diff) +
+          ggtitle(paste0("Training portion only, differenced (d=", d, ", D=", D, ")")) +
+          xlab("Time") + ylab("Differenced value") +
+          theme(
+            plot.title = element_text(size = MID_TITLE_SIZE),
+            plot.margin = MID_MARGIN
+          )
+        
+        # Bottom: ACF/PACF on TRAIN-diff
+        p_acf <- ggAcf(x_train_diff, lag.max = LAG_MAX) +
+          ggtitle("ACF (train only, after differencing)") +
+          theme(
+            plot.title = element_text(size = BOT_TITLE_SIZE),
+            plot.margin = BOT_MARGIN
+          )
+        
+        p_pacf <- ggPacf(x_train_diff, lag.max = LAG_MAX) +
+          ggtitle("PACF (train only, after differencing)") +
+          theme(
+            plot.title = element_text(size = BOT_TITLE_SIZE),
+            plot.margin = BOT_MARGIN
+          )
+        
+        bottom_row <- (p_acf | p_pacf) +
+          patchwork::plot_layout(widths = c(W_LEFT, W_RIGHT))
+        
+        # IMPORTANT: Force row heights so top is NOT huge
+        (p_top / p_mid / bottom_row) +
+          patchwork::plot_layout(heights = c(H_TOP, H_MID, H_BOT))
+      }
+    },
+    
+    # =======================
+    # Output device sizing
+    # =======================
+    width = local({
+      W_PX <- 990   # overall width (EDIT ME)
+      W_PX
+    }),
+    
+    height = local({
+      H_NO_SPLIT_PX <- 750   # overall height without split (EDIT ME)
+      H_SPLIT_PX    <- 950   # overall height with split (EDIT ME)
+      function() {
+        s <- ts_train_test()
+        has_test <- isTRUE(input$train_prop < 1) &&
+          !is.null(s$ts_test) &&
+          length(s$ts_test) > 0
+        if (has_test) H_SPLIT_PX else H_NO_SPLIT_PX
+      }
+    })
+  )
+  
+  
+  
+ 
+  
+  output$diff_plot <- renderPlot(
+    {
+      s <- ts_train_test()
+      req(s$ts_train)
+      
+      d <- as.numeric(input$d_preview)
+      D <- as.numeric(input$D_preview)
+      
+      has_test <- isTRUE(input$train_prop < 1) && length(s$ts_test) > 0
+      
+      # Build full ORIGINAL series (no differencing)
+      x_full_orig <- ts(
+        c(as.numeric(s$ts_train), as.numeric(s$ts_test)),
+        start = 1,
+        frequency = frequency(s$ts_train)
+      )
+      
+      # Differencing helper (applies to any ts)
+      do_diff <- function(x) {
+        x2 <- x
+        if (d > 0) x2 <- diff(x2, differences = d)
+        if (D > 0) x2 <- diff(x2, lag = frequency(x), differences = D)
+        x2
+      }
+      
+      # ===== If NO SPLIT: upper plot should reflect parameters (d, D) =====
+      if (!has_test) {
+        x_full_diff <- do_diff(x_full_orig)
+        
+        p_top <- autoplot(x_full_diff) +
+          ggtitle(paste0("Series preview (full), differenced (d=", d, ", D=", D, ")")) +
+          xlab("Time") + ylab("Value")
+        
+        p_acf  <- ggAcf(x_full_diff, lag.max = 40) +
+          ggtitle("ACF (full series, after differencing)")
+        
+        p_pacf <- ggPacf(x_full_diff, lag.max = 40) +
+          ggtitle("PACF (full series, after differencing)")
+        
+        return(p_top / (p_acf | p_pacf))
+      }
+      
+      # ===== If SPLIT: keep top ORIGINAL + split, then show TRAIN-diff + ACF/PACF =====
+      p_top <- autoplot(x_full_orig) +
+        ggtitle("Original time series (no transformation) with Train/Test split") +
+        xlab("Time") + ylab("Value")
+      
+      split_time <- time(x_full_orig)[length(s$ts_train)]
+      p_top <- p_top +
+        geom_vline(xintercept = split_time, linetype = "dashed", color = "red") +
+        annotate(
+          "text",
+          x = split_time,
+          y = max(as.numeric(x_full_orig), na.rm = TRUE),
+          label = "Train/Test split",
+          vjust = -0.5, hjust = 0,
+          color = "red",
+          size = 3
+        )
+      
+      # TRAIN-only after differencing
+      x_train_diff <- do_diff(s$ts_train)
+      
+      p_train <- autoplot(x_train_diff) +
+        ggtitle(paste0("Training portion only, differenced (d=", d, ", D=", D, ")")) +
+        xlab("Time") + ylab("Differenced value")
+      
+      p_acf <- ggAcf(x_train_diff, lag.max = 40) +
+        ggtitle("ACF (train only, after differencing)")
+      
+      p_pacf <- ggPacf(x_train_diff, lag.max = 40) +
+        ggtitle("PACF (train only, after differencing)")
+      
+      p_top / (p_train / (p_acf | p_pacf))
+    },
+    width  = 990,
+    height = function() {
+      s <- ts_train_test()
+      has_test <- isTRUE(input$train_prop < 1) && !is.null(s$ts_test) && length(s$ts_test) > 0
+      if (has_test) 1050 else 750
+    }
+  )
+  
+ 
+  
+  
+  
+  
   output$apa_stationarity_paragraph <- renderPrint({
     req(stationarity(), prepared())
     st <- stationarity()
@@ -1865,6 +4791,50 @@ server <- function(input, output, session) {
   output$auto_resid_hist <- renderPlot({ req(auto_fit()); hist(residuals(auto_fit()), breaks = 30, main = "Residual histogram", xlab = "Residual") })
   output$auto_resid_qq <- renderPlot({ req(auto_fit()); qqnorm(residuals(auto_fit())); qqline(residuals(auto_fit())) })
   
+  # Ljung–Box p-values across lags (Auto-ARIMA)
+  output$auto_resid_lb_pvals <- renderPlot({
+    req(auto_fit())
+    
+    res <- residuals(auto_fit())
+    res <- as.numeric(res)[is.finite(res)]
+    
+    # Use the same controls you already expose for diagnostics
+    L_input <- suppressWarnings(as.integer(input$diag_lag))
+    L       <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+    fitdf   <- length(coef(auto_fit()))
+    alpha   <- suppressWarnings(as.numeric(input$alphaSt2)); if (!is.finite(alpha)) alpha <- 0.05
+    
+    N <- length(res)
+    validate(need(N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+    L <- max(1L, min(L, N - 1L))
+    
+    # Compute p-values at cumulative lags 1..L (omit k <= fitdf where df<=0)
+    pvals <- rep(NA_real_, L)
+    for (k in seq_len(L)) {
+      if (k > fitdf) {
+        bt <- tryCatch(stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+                       error = function(e) NULL)
+        pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+      }
+    }
+    
+    # Base R plotting to match your existing diagnostics
+    plot(seq_len(L), pvals,
+         type = "h", lwd = 2,
+         xlab = "Lag (k)",
+         ylab = "p-value  (Ljung–Box up to lag k)",
+         main = "Ljung–Box p-values by lag (Auto-ARIMA)",
+         ylim = c(0, 1))
+    points(seq_len(L), pvals, pch = 16)
+    abline(h = alpha, lty = 2)
+    mtext(sprintf("alpha = %.3f,   fitdf = %d", alpha, fitdf), side = 3, line = 0.2, cex = 0.8)
+    
+    if (fitdf >= 1 && fitdf < L) {
+      rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+           border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+      text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+    }
+  })
   
   
   
@@ -2114,126 +5084,7 @@ server <- function(input, output, session) {
   
   
   
-  # # ---- Helpers for equation formatting (put once in server.R) ----
-  # latex_poly <- function(k, greek, seasonal = FALSE, s = 1, type = c("AR","MA")) {
-  #   # Returns "1 - phi_1 B - ... - phi_k B^k" (AR) or "1 + theta_1 B + ... + theta_k B^k" (MA)
-  #   type <- match.arg(type)
-  #   if (k <= 0) return("1")
-  #   opsign <- if (type == "AR") "-" else "+"
-  #   terms <- vapply(seq_len(k), function(i) {
-  #     exp_txt <- if (seasonal) paste0(i, "\\,", s) else i
-  #     paste0(" ", opsign, " \\\\", greek, "_", i, " B^{", exp_txt, "}")
-  #   }, character(1))
-  #   paste0("1", paste0(terms, collapse = ""))
-  # }
-  # 
-  # latex_diff <- function(d, D, s) {
-  #   # (1 - B)^d (1 - B^s)^D   with smart omission if exponent is 0
-  #   parts <- c()
-  #   if (d > 0) parts <- c(parts, paste0("(1 - B)^{", d, "}"))
-  #   if (D > 0) parts <- c(parts, paste0("(1 - B^{", s, "})^{", D, "}"))
-  #   if (length(parts) == 0) "1" else paste(parts, collapse = " ")
-  # }
-  # 
-  # latex_coeff_list <- function(coefs, greek, label_prefix = "", wrap_dollars = TRUE) {
-  #   # coefs is a numeric vector; greek like "phi"/"theta"/"Phi"/"Theta"
-  #   if (length(coefs) == 0) return(NULL)
-  #   items <- vapply(seq_along(coefs), function(i) {
-  #     val <- sprintf("%.4f", coefs[i])
-  #     sym <- paste0("\\\\", greek, "_", i)
-  #     if (wrap_dollars) {
-  #       paste0("<li>\\(", label_prefix, sym, " = ", val, "\\)</li>")
-  #     } else {
-  #       paste0("<li>", label_prefix, sym, " = ", val, "</li>")
-  #     }
-  #   }, character(1))
-  #   paste0("<ul style='margin:4px 0 10px 20px;'>", paste(items, collapse = ""), "</ul>")
-  # }
-  # 
-  # # ---- NEW: Auto-ARIMA model equation output ----
-  # output$auto_model_equation <- renderUI({
-  #   req(auto_fit())
-  #   fit <- auto_fit()
-  #   
-  #   # Extract ARIMA structure from forecast::Arima
-  #   # arma = c(p, q, P, Q, m, d, D)
-  #   arma <- fit$arma
-  #   p <- arma[1]; q <- arma[2]; P <- arma[3]; Q <- arma[4]
-  #   s <- arma[5]; d <- arma[6]; D <- arma[7]
-  #   
-  #   # Coefficient lookup by names (forecast uses "ar", "ma", "sar", "sma", "intercept", "drift")
-  #   cf   <- stats::coef(fit)
-  #   nm   <- names(cf)
-  #   phi  <- unname(cf[grep("^ar\\d+$", nm)])          # non-seasonal AR
-  #   theta<- unname(cf[grep("^ma\\d+$", nm)])          # non-seasonal MA
-  #   PhiS <- unname(cf[grep("^sar\\d+$", nm)])         # seasonal AR
-  #   TheS <- unname(cf[grep("^sma\\d+$", nm)])         # seasonal MA
-  #   mu   <- if (any(nm == "intercept")) unname(cf["intercept"]) else NA_real_
-  #   drift<- if (any(nm == "drift"))     unname(cf["drift"])     else NA_real_
-  #   sig2 <- if (!is.null(fit$sigma2)) fit$sigma2 else NA_real_
-  #   
-  #   # Build symbolic polynomials
-  #   AR_ns   <- latex_poly(p,  "phi", seasonal = FALSE, s = s, type = "AR")
-  #   MA_ns   <- latex_poly(q,  "theta", seasonal = FALSE, s = s, type = "MA")
-  #   AR_seas <- latex_poly(P,  "Phi", seasonal = TRUE,  s = s, type = "AR")
-  #   MA_seas <- latex_poly(Q,  "Theta", seasonal = TRUE, s = s, type = "MA")
-  #   DIFF    <- latex_diff(d, D, s)
-  #   
-  #   # Constant / drift term string
-  #   rhs_const <- NULL
-  #   if (is.finite(mu) && d == 0 && D == 0) {
-  #     rhs_const <- "\\; + \\; \\mu"
-  #   } else if (is.finite(drift) && (d > 0 || D > 0)) {
-  #     rhs_const <- "\\; + \\; \\delta \\, t"
-  #   } else {
-  #     rhs_const <- ""
-  #   }
-  #   
-  #   # Main symbolic equation
-  #   eq <- paste0(
-  #     "\\[",
-  #     "\\underbrace{(", AR_ns, ")}_{\\text{AR(", p, ")}}\\,",
-  #     "\\underbrace{(", AR_seas, ")}_{\\text{Seasonal AR(", P, ")}}\\,",
-  #     "\\underbrace{", DIFF, "}_{\\text{Differencing}}\\, y_t",
-  #     " \\;=\\; ",
-  #     "\\underbrace{(", MA_ns, ")}_{\\text{MA(", q, ")}}\\,",
-  #     "\\underbrace{(", MA_seas, ")}_{\\text{Seasonal MA(", Q, ")}}\\, \\varepsilon_t",
-  #     rhs_const,
-  #     "\\]"
-  #   )
-  #   
-  #   # Coefficient legend (only those that exist)
-  #   legend_html <- c(
-  #     if (length(phi))  latex_coeff_list(phi,  "phi"),
-  #     if (length(theta))latex_coeff_list(theta,"theta"),
-  #     if (length(PhiS)) latex_coeff_list(PhiS,"Phi"),
-  #     if (length(TheS)) latex_coeff_list(TheS,"Theta"),
-  #     if (is.finite(mu) && d == 0 && D == 0)
-  #       sprintf("<div>\\(\\mu\\) (intercept) = <b>%.4f</b></div>", mu),
-  #     if (is.finite(drift) && (d > 0 || D > 0))
-  #       sprintf("<div>\\(\\delta\\) (drift) = <b>%.4f</b></div>", drift),
-  #     if (is.finite(sig2))
-  #       sprintf("<div>\\(\\sigma^2_{\\varepsilon}\\) (innovation variance) = <b>%.4f</b></div>", sig2)
-  #   )
-  #   legend_html <- paste(Filter(Negate(is.null), legend_html), collapse = "\n")
-  #   
-  #   # Header with compact summary of orders
-  #   head_html <- sprintf(
-  #     "<div style='margin-bottom:8px;'>
-  #      <b>Selected model:</b> ARIMA(%d,%d,%d)%s
-  #      <br/><b>Seasonal period (s)</b> = %d
-  #    </div>",
-  #     p, d, q,
-  #     if (s > 1) sprintf(" × (%d,%d,%d)[%d]", P, D, Q, s) else "",
-  #     s
-  #   )
-  #   
-  #   HTML(paste0(head_html, "<div>", eq, "</div>",
-  #               "<div style='margin-top:6px;'><b>Estimated coefficients</b>:</div>",
-  #               legend_html))
-  # })
-  # 
-  # 
+  
   
   #===============================================================
   #===============================================================
@@ -2253,16 +5104,7 @@ server <- function(input, output, session) {
   })
   
   
-  # output$auto_diag_tests <- renderText({
-  #   req(auto_fit())
-  #   residual_diagnostics_report(
-  #     res   = residuals(auto_fit()),
-  #     L     = as.numeric(input$diag_lag),
-  #     fitdf = length(coef(auto_fit())),
-  #     alpha = to_num_safe(input$alphaSt2 %||% 0.05, 0.05)
-  #   )
-  # })
-  
+
   
   
   residual_diagnostics_report <- function(res, L = 12L, fitdf = 0L, alpha = 0.05) {
@@ -2593,196 +5435,7 @@ server <- function(input, output, session) {
   }
   
   
-  # residual_diagnostics_report <- function(res, L = 12L, fitdf = 0L, alpha = 0.05) {
-  #   # sanitize inputs
-  #   res <- as.numeric(res)
-  #   res <- res[is.finite(res)]
-  #   N   <- length(res)
-  #   L   <- max(1L, as.integer(L))
-  #   fitdf <- max(0L, as.integer(fitdf))
-  #   alpha <- to_num_safe(alpha, 0.05)
-  #   if (N < 8) {
-  #     return("Residual Diagnostic Battery\n----------------------------------------\nToo few residuals (N < 8) to run the requested tests.")
-  #   }
-  #   
-  #   # convenience
-  #   df_lb <- max(L - fitdf, 1L)  # Ljung–Box / Box–Pierce df after parameter adjustment
-  #   cv_lb <- stats::qchisq(1 - alpha, df = df_lb)
-  #   
-  #   # 1) Ljung–Box (portmanteau for autocorrelation)
-  #   lb <- tryCatch(stats::Box.test(res, lag = L, type = "Ljung-Box", fitdf = fitdf), error = function(e) NULL)
-  #   lb_stat <- if (!is.null(lb)) as.numeric(lb$statistic) else NA_real_
-  #   lb_p    <- if (!is.null(lb)) as.numeric(lb$p.value)   else NA_real_
-  #   
-  #   # 2) Box–Pierce (classic portmanteau)
-  #   bp <- tryCatch(stats::Box.test(res, lag = L, type = "Box-Pierce", fitdf = fitdf), error = function(e) NULL)
-  #   bp_stat <- if (!is.null(bp)) as.numeric(bp$statistic) else NA_real_
-  #   bp_p    <- if (!is.null(bp)) as.numeric(bp$p.value)   else NA_real_
-  #   
-  #   # 3) Jarque–Bera (normality of residuals; large-sample χ^2_2)
-  #   jb <- if (requireNamespace("tseries", quietly = TRUE))
-  #     tryCatch(tseries::jarque.bera.test(res), error = function(e) NULL) else NULL
-  #   jb_stat <- if (!is.null(jb)) as.numeric(jb$statistic) else NA_real_
-  #   jb_p    <- if (!is.null(jb)) as.numeric(jb$p.value)   else NA_real_
-  #   cv_jb   <- stats::qchisq(1 - alpha, df = 2)  # JB ~ χ^2(2) asymptotically
-  #   
-  #   # 4) Shapiro–Wilk (normality; exact W, but no simple CV to print)
-  #   sw <- if (N >= 3 && N <= 5000)
-  #     tryCatch(stats::shapiro.test(res), error = function(e) NULL) else NULL
-  #   sw_W <- if (!is.null(sw)) as.numeric(sw$statistic) else NA_real_
-  #   sw_p <- if (!is.null(sw)) as.numeric(sw$p.value)   else NA_real_
-  #   
-  #   # 5) Engle’s ARCH LM (conditional heteroskedasticity)
-  #   # Uses FinTS::ArchTest if available; df = lags
-  #   arch_lags <- min(L, max(1L, floor(N/10)))
-  #   arch <- if (requireNamespace("FinTS", quietly = TRUE))
-  #     tryCatch(FinTS::ArchTest(res, lags = arch_lags), error = function(e) NULL) else NULL
-  #   arch_stat <- if (!is.null(arch)) as.numeric(arch$statistic) else NA_real_
-  #   arch_p    <- if (!is.null(arch)) as.numeric(arch$p.value)   else NA_real_
-  #   cv_arch   <- stats::qchisq(1 - alpha, df = arch_lags)
-  #   
-  #   # 6) Runs test (randomness / independence)
-  #   run <- if (requireNamespace("tseries", quietly = TRUE))
-  #     tryCatch(tseries::runs.test(res), error = function(e) NULL) else NULL
-  #   run_Z <- if (!is.null(run)) as.numeric(run$statistic) else NA_real_
-  #   run_p <- if (!is.null(run)) as.numeric(run$p.value)   else NA_real_
-  #   zcrit <- stats::qnorm(1 - alpha/2)  # two-sided
-  #   
-  #   # 7) (Optional) Anderson–Darling for normality (if nortest installed)
-  #   ad <- if (requireNamespace("nortest", quietly = TRUE))
-  #     tryCatch(nortest::ad.test(res), error = function(e) NULL) else NULL
-  #   ad_A2 <- if (!is.null(ad)) as.numeric(ad$statistic) else NA_real_
-  #   ad_p  <- if (!is.null(ad)) as.numeric(ad$p.value)   else NA_real_
-  #   
-  #   # ---- Compose the academic-friendly text ----
-  #   out <- c(
-  #     "==========================================================================",
-  #     "                     RESIDUAL DIAGNOSTIC BATTERY                          ",
-  #     "==========================================================================",
-  #     sprintf(" SAMPLE SIZE (residuals used): %d   |   α: %s   |   Lag (L): %d   |   fitdf: %d",
-  #             N, fmt_num(alpha, 4), L, fitdf),
-  #     "--------------------------------------------------------------------------",
-  #     
-  #     # Ljung–Box
-  #     "TEST 1: Ljung–Box Portmanteau (autocorrelation)",
-  #     " Purpose : Detect remaining serial correlation up to lag L in residuals.",
-  #     sprintf(" Statistic : Q(LB) = %s  |  df = max(L - fitdf, 1) = %d  |  p-value = %s",
-  #             fmt_num(lb_stat, 4), df_lb, fmt_p(lb_p)),
-  #     sprintf(" Critical  : χ^2_(%d, 1-α) = %s", df_lb, fmt_num(cv_lb, 4)),
-  #     sprintf(" Decision  : Reject H0 (white noise) if Q(LB) > χ^2_(%d,1-α) (equivalently p < α).", df_lb),
-  #     sprintf(" Result    : %s",
-  #             if (!is.finite(lb_p)) {
-  #               "Inconclusive (statistic/p-value unavailable)."
-  #             } else if (lb_p < alpha) {
-  #               "Reject H0 → residuals show autocorrelation; model may be underspecified."
-  #             } else {
-  #               "Fail to reject H0 → residuals are consistent with white noise."
-  #             }),
-  #     "--------------------------------------------------------------------------",
-  #     
-  #     # Box–Pierce
-  #     "TEST 2: Box–Pierce Portmanteau (autocorrelation, classic)",
-  #     " Purpose : Historical portmanteau alternative to Ljung–Box.",
-  #     sprintf(" Statistic : Q(BP) = %s  |  df = %d  |  p-value = %s",
-  #             fmt_num(bp_stat, 4), df_lb, fmt_p(bp_p)),
-  #     sprintf(" Critical  : χ^2_(%d, 1-α) = %s", df_lb, fmt_num(cv_lb, 4)),
-  #     sprintf(" Decision  : Reject H0 if Q(BP) > χ^2_(%d,1-α) (equivalently p < α).", df_lb),
-  #     sprintf(" Result    : %s",
-  #             if (!is.finite(bp_p)) {
-  #               "Inconclusive (statistic/p-value unavailable)."
-  #             } else if (bp_p < alpha) {
-  #               "Reject H0 → residuals show autocorrelation; consider increasing AR/MA orders or seasonal terms."
-  #             } else {
-  #               "Fail to reject H0 → no strong evidence of residual autocorrelation."
-  #             }),
-  #     "--------------------------------------------------------------------------",
-  #     
-  #     # Jarque–Bera
-  #     "TEST 3: Jarque–Bera (normality, large-sample χ^2)",
-  #     " Purpose : Assess normality via skewness and kurtosis of residuals.",
-  #     sprintf(" Statistic : JB = %s  |  df = 2  |  p-value = %s", fmt_num(jb_stat, 4), fmt_p(jb_p)),
-  #     sprintf(" Critical  : χ^2_(2, 1-α) = %s", fmt_num(cv_jb, 4)),
-  #     " Decision  : Reject H0 (normality) if JB > χ^2_(2,1-α) (equivalently p < α).",
-  #     sprintf(" Result    : %s",
-  #             if (!is.finite(jb_p)) {
-  #               "Inconclusive (statistic/p-value unavailable)."
-  #             } else if (jb_p < alpha) {
-  #               "Reject H0 → residuals deviate from normality; prediction intervals may be miscalibrated."
-  #             } else {
-  #               "Fail to reject H0 → residual normality is plausible."
-  #             }),
-  #     "--------------------------------------------------------------------------",
-  #     
-  #     # Shapiro–Wilk
-  #     "TEST 4: Shapiro–Wilk (normality, small/medium samples)",
-  #     " Purpose : Sensitive test for normality (recommended for N ≤ 5000).",
-  #     sprintf(" Statistic : W = %s  |  p-value = %s  |  Note: critical values are not printed by R.",
-  #             fmt_num(sw_W, 4), if (N > 5000) "n/a (N>5000)" else fmt_p(sw_p)),
-  #     " Critical  : n/a (decision based on p-value).",
-  #     " Decision  : Reject H0 (normality) if p < α.",
-  #     sprintf(" Result    : %s",
-  #             if (N > 5000) {
-  #               "Omitted (Shapiro–Wilk only defined for N ≤ 5000)."
-  #             } else if (!is.finite(sw_p)) {
-  #               "Inconclusive (statistic/p-value unavailable)."
-  #             } else if (sw_p < alpha) {
-  #               "Reject H0 → residuals deviate from normality."
-  #             } else {
-  #               "Fail to reject H0 → residual normality is plausible."
-  #             }),
-  #     "--------------------------------------------------------------------------",
-  #     
-  #     # ARCH LM
-  #     "TEST 5: Engle’s ARCH LM (conditional heteroskedasticity)",
-  #     sprintf(" Purpose : Detect ARCH effects (time-varying variance) up to %d lags.", arch_lags),
-  #     sprintf(" Statistic : LM = %s  |  df = %d  |  p-value = %s",
-  #             fmt_num(arch_stat, 4), arch_lags, fmt_p(arch_p)),
-  #     sprintf(" Critical  : χ^2_(%d, 1-α) = %s", arch_lags, fmt_num(cv_arch, 4)),
-  #     " Decision  : Reject H0 (no ARCH) if LM > χ^2_(lags,1-α) (equivalently p < α).",
-  #     sprintf(" Result    : %s",
-  #             if (is.null(arch)) {
-  #               "Skipped (package 'FinTS' not installed)."
-  #             } else if (!is.finite(arch_p)) {
-  #               "Inconclusive (statistic/p-value unavailable)."
-  #             } else if (arch_p < alpha) {
-  #               "Reject H0 → ARCH present; consider SARIMA + GARCH if volatility clustering matters."
-  #             } else {
-  #               "Fail to reject H0 → no strong evidence of ARCH."
-  #             }),
-  #     "--------------------------------------------------------------------------",
-  #     
-  #     # Runs test
-  #     "TEST 6: Runs Test (randomness of signs)",
-  #     " Purpose : Check independence/randomness of residual signs.",
-  #     sprintf(" Statistic : Z = %s  |  p-value = %s  |  Two-sided z-crit = ±%s",
-  #             fmt_num(run_Z, 4), fmt_p(run_p), fmt_num(zcrit, 3)),
-  #     " Critical  : Reject H0 if |Z| > z_crit (equivalently p < α).",
-  #     sprintf(" Result    : %s",
-  #             if (is.null(run)) {
-  #               "Skipped (package 'tseries' not installed)."
-  #             } else if (!is.finite(run_p)) {
-  #               "Inconclusive (statistic/p-value unavailable)."
-  #             } else if (run_p < alpha) {
-  #               "Reject H0 → residual signs are not random (possible structure left)."
-  #             } else {
-  #               "Fail to reject H0 → residual signs appear random."
-  #             }),
-  #     "==========================================================================",
-  #     "INTERPRETATION GUIDE",
-  #     " - Good SARIMA residuals typically: pass Ljung–Box (no autocorrelation),",
-  #     "   show no strong ARCH (unless volatility modeling is intended), and are",
-  #     "   roughly normal (for well-calibrated prediction intervals)."
-  #   )
-  #   
-  #   paste(out, collapse = "\n")
-  # }
-  
-  
-  
-  
-  
-  
-  
+ 
   
   
   
@@ -2839,6 +5492,220 @@ server <- function(input, output, session) {
       sep = ""
     )
   })
+  
+  
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  
+  
+
+  # ---- Auto-ARIMA: academic conclusion (cached on Fit click) ----
+  auto_conclusion_full_obj <- eventReactive(input$fit_auto, {
+    req(auto_fit(), auto_fc(), auto_equations(), ts_train_test(), prepared())
+    
+    fit <- auto_fit()
+    fc0 <- auto_fc()
+    fc  <- fc0$fc
+    eq  <- auto_equations()
+    s   <- ts_train_test()
+    p0  <- prepared()
+    
+    # ---- safe values
+    n_train <- suppressWarnings(as.integer(s$train_n)); if (!is.finite(n_train)) n_train <- length(residuals(fit))
+    n_test  <- suppressWarnings(as.integer(s$test_n));  if (!is.finite(n_test))  n_test  <- 0L
+    N <- n_train + n_test
+    
+    L_in <- suppressWarnings(as.integer(input$diag_lag))
+    L <- if (is.finite(L_in) && L_in > 0) L_in else 12L
+    fitdf <- length(coef(fit))
+    
+    # ---- key stats
+    AICc_val <- suppressWarnings(as.numeric(fit$aicc))
+    BIC_val  <- suppressWarnings(as.numeric(fit$bic))
+    AIC_val  <- suppressWarnings(as.numeric(fit$aic))
+    
+    # ---- residual tests (minimal, fast)
+    res <- as.numeric(residuals(fit))
+    res <- res[is.finite(res)]
+    lb <- tryCatch(Box.test(res, lag = min(L, max(1L, floor(length(res) / 3))), type = "Ljung-Box", fitdf = fitdf),
+                   error = function(e) NULL)
+    
+    # ---- accuracy (only if test exists)
+    acc_line <- NULL
+    if (n_test > 0) {
+      acc <- tryCatch(accuracy_df(s$ts_test, fc$mean), error = function(e) NULL)
+      if (!is.null(acc) && all(c("Metric", "Value") %in% names(acc))) {
+        rmse <- acc$Value[acc$Metric == "RMSE"][1]
+        mae  <- acc$Value[acc$Metric == "MAE"][1]
+        mape <- acc$Value[acc$Metric == "MAPE"][1]
+        acc_line <- tags$p(
+          tags$b("Forecast accuracy (test set). "),
+          HTML(paste0(
+            "Over the holdout period (n = ", n_test, "), performance was RMSE = ",
+            fmt_num(rmse, 3), ", MAE = ", fmt_num(mae, 3),
+            if (is.finite(mape)) paste0(", MAPE = ", fmt_num(100 * mape, 2), "%") else "",
+            "."
+          ))
+        )
+      }
+    }
+    if (is.null(acc_line)) {
+      acc_line <- tags$p(tags$b("Forecast accuracy. "),
+                         "No holdout test set was detected; therefore, out-of-sample accuracy was not computed.")
+    }
+    
+    # ---- horizon narrative (align with your Step 5 logic)
+    horizon_txt <- if (n_test > 0) {
+      paste0("Validation mode was used: the forecast horizon was forced to match the test length (h = ", n_test, ").")
+    } else {
+      paste0("Future mode was used: forecasts were produced beyond the training sample (h = ", fc0$h, ").")
+    }
+    
+    # ---- “model string” consistent with your equation panel
+    s_term <- if (is.finite(eq$s) && eq$s > 1) sprintf(" × (%d,%d,%d)[%d]", eq$P, eq$D, eq$Q, eq$s) else ""
+    model_str <- sprintf("ARIMA(%d,%d,%d)%s", eq$p, eq$d, eq$q, s_term)
+    
+    # ---- build tag UI (fast + correct MathJax)
+    tagList(
+      tags$h3("Auto-ARIMA: Full academic conclusion"),
+      
+      tags$h4("1. Objective and modelling context"),
+      tags$p(
+        "An automated ARIMA procedure was used to establish a reproducible baseline for linear time-series dynamics. ",
+        "Auto-ARIMA searches across candidate ARIMA/SARIMA structures and selects a parsimonious specification based on information criteria, ",
+        "subject to the user-defined search settings (e.g., stepwise/approximation and seasonal allowance)."
+      ),
+      
+      tags$h4("2. Sample design"),
+      tags$p(
+        HTML(paste0(
+          "The analysis used <b>N = ", N, "</b> observations (training <b>n = ", n_train,
+          "</b>", if (n_test > 0) paste0(", test <b>n = ", n_test, "</b>") else "",
+          "). The seasonal period used in the workflow was <b>s = ", p0$freq, "</b>."
+        ))
+      ),
+      tags$p(tags$b("Forecast design. "), horizon_txt),
+      
+      tags$h4("3. Selected specification and fit"),
+      tags$p(HTML(paste0("The selected model was <b>", as.character(fit), "</b> (reported as <b>", model_str, "</b> in order notation)."))),
+      tags$ul(
+        tags$li(HTML(paste0("AIC = <b>", fmt_num(AIC_val, 2), "</b>"))),
+        tags$li(HTML(paste0("AICc = <b>", fmt_num(AICc_val, 2), "</b>"))),
+        tags$li(HTML(paste0("BIC = <b>", fmt_num(BIC_val, 2), "</b>")))
+      ),
+      tags$p(
+        "In academic reporting, these criteria support relative comparison among candidate models; lower values indicate improved parsimony-adjusted fit."
+      ),
+      
+      tags$h4("4. Model equations (reporting-ready)"),
+      tags$p(
+        "For documentation and replication, the fitted model is expressed in standard SARIMA operator notation, followed by an expanded form ",
+        "and a numerical representation using the estimated coefficients."
+      ),
+      tags$div(
+        style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;text-align:left;",
+        tags$h5("General SARIMA formulation"),
+        HTML(eq$eq_general),
+        tags$hr(),
+        tags$h5("Expanded operator form"),
+        HTML(eq$eq_expanded),
+        tags$hr(),
+        tags$h5("Numerical model"),
+        HTML(eq$eq_line3),
+        tags$hr(),
+        HTML(eq$eq_line4)
+      ),
+      
+      tags$h4("5. Residual diagnostics (adequacy of linear dynamics)"),
+      tags$p(
+        "Adequacy was evaluated using graphical diagnostics (residual series, ACF, histogram, Q–Q plot) and formal residual tests. ",
+        "A key criterion for ARIMA adequacy is that residuals approximate white noise (no remaining autocorrelation)."
+      ),
+      if (!is.null(lb)) {
+        tags$p(HTML(paste0(
+          "<b>Ljung–Box test:</b> Q(", lb$parameter, ") = ", fmt_num(lb$statistic, 3),
+          ", p ", fmt_p(lb$p.value), "."
+        )))
+      } else {
+        tags$p(tags$b("Ljung–Box test:"), " unavailable (insufficient residuals or test error).")
+      },
+      
+      tags$h4("6. Forecasting and predictive performance"),
+      acc_line,
+      
+      tags$h4("7. Overall conclusion and recommended next steps"),
+      tags$p(
+        "Overall, the Auto-ARIMA baseline provides a defensible benchmark for forecasting and for comparison against theory-guided manual SARIMA candidates. ",
+        "If diagnostics suggest residual autocorrelation, a refined manual specification (guided by ACF/PACF after differencing) is recommended. ",
+        "If volatility clustering is present (e.g., significant ARCH effects), ARIMA may be complemented by conditional variance modelling (e.g., GARCH)."
+      )
+    )
+  })
+  
+  output$auto_conclusion_full <- renderUI({
+    # Show a helpful message if user hasn't clicked Fit yet
+    validate(need(input$fit_auto > 0, "Click “Fit Auto-ARIMA” to generate the full academic conclusion."))
+    req(auto_conclusion_full_obj())
+    
+    # Force MathJax typesetting in the conclusion container
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "auto_conclusion_box")
+    }, once = TRUE)
+    
+    auto_conclusion_full_obj()
+  })
+  
+  
+  
+  
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  
 
   # ---- Step 6 Manual SARIMA ----
 
@@ -2932,6 +5799,7 @@ server <- function(input, output, session) {
   })
 
   output$manual_coef_table <- renderTable({ req(manual_fit()); coef_table(manual_fit()) }, rownames = FALSE)
+  
   output$manual_resid_ts <- renderPlot({ req(manual_fit()); plot(residuals(manual_fit()), main = "Residuals (Manual SARIMA)", ylab = "Residual", xlab = "Time") })
   output$manual_resid_acf <- renderPlot({ req(manual_fit()); plot(acf(residuals(manual_fit()), plot = FALSE), main = "Residual ACF (Manual SARIMA)") })
   output$manual_resid_hist <- renderPlot({ req(manual_fit()); hist(residuals(manual_fit()), breaks = 30, main = "Residual histogram", xlab = "Residual") })
@@ -2939,7 +5807,4752 @@ server <- function(input, output, session) {
   
   
   
+  
+  
+  
   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # --------------------------------------------- 
+  
+  
+  
+  # # =========================
+  # # For Manual Diag
+  # # =========================
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # =========================
+  # # Manual SARIMA diagnostics tab (NEW independent outputs)
+  # # =========================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- residuals(manual_fit())
+  #   plot(res, type = "l",
+  #        main = "Residuals over time (Diagnostics tab)",
+  #        xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- residuals(manual_fit())
+  #   plot(acf(res, plot = FALSE),
+  #        main = "Residual ACF (Diagnostics tab)")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- residuals(manual_fit())
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram (Diagnostics tab)",
+  #        xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- residuals(manual_fit())
+  #   qqnorm(res, main = "Normal Q–Q (Diagnostics tab)")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # # NEW: Residuals vs fitted (mean equation adequacy / nonlinearity)
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   fit <- manual_fit()
+  #   res <- residuals(fit)
+  #   fitted_vals <- fitted(fit)
+  #   
+  #   plot(fitted_vals, res,
+  #        pch = 16, cex = 0.7, col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   # light smooth trend for visual cue (safe)
+  #   ok <- is.finite(fitted_vals) & is.finite(res)
+  #   if (sum(ok) > 20) {
+  #     lines(stats::lowess(fitted_vals[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # # NEW: Scale-location proxy (variance stability)
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   fit <- manual_fit()
+  #   res <- residuals(fit)
+  #   fitted_vals <- fitted(fit)
+  #   
+  #   y <- sqrt(abs(res))
+  #   plot(fitted_vals, y,
+  #        pch = 16, cex = 0.7, col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   ok <- is.finite(fitted_vals) & is.finite(y)
+  #   if (sum(ok) > 20) {
+  #     lines(stats::lowess(fitted_vals[ok], y[ok], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # # NEW: Ljung–Box p-values by lag (Diagnostics tab version)
+  # output$manual_resid_lb_pvals_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   
+  #   res <- residuals(manual_fit())
+  #   res <- as.numeric(res)[is.finite(res)]
+  #   
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L       <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   fitdf   <- length(coef(manual_fit()))
+  #   alpha   <- suppressWarnings(as.numeric(input$alphaSt2)); if (!is.finite(alpha)) alpha <- 0.05
+  #   
+  #   N <- length(res)
+  #   validate(need(N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #                      error = function(e) NULL)
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = "Ljung–Box p-values by lag (Diagnostics tab)",
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf), side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # })
+  # 
+  # # NEW: Commentary + conclusions (Diagnostics tab)
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   req(manual_fit())
+  #   fit   <- manual_fit()
+  #   res   <- as.numeric(residuals(fit))
+  #   res   <- res[is.finite(res)]
+  #   N     <- length(res)
+  #   
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L       <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   fitdf   <- length(coef(fit))
+  #   alpha   <- suppressWarnings(as.numeric(input$alphaSt2)); if (!is.finite(alpha)) alpha <- 0.05
+  #   
+  #   if (N < 8) {
+  #     cat("Diagnostics summary\n",
+  #         "- Too few residuals to run a stable diagnostic battery.\n",
+  #         "- Fit the model on more observations or reduce differencing/orders.\n", sep = "")
+  #     return(invisible())
+  #   }
+  #   
+  #   # Ljung–Box at chosen lag
+  #   L2 <- max(1L, min(L, N - 1L))
+  #   lb <- tryCatch(stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #                  error = function(e) NULL)
+  #   
+  #   # Simple normality flag (optional tests already exist elsewhere in your app)
+  #   sw <- if (N >= 3 && N <= 5000) tryCatch(stats::shapiro.test(res), error = function(e) NULL) else NULL
+  #   
+  #   # Heuristic variance stability from scale-location trend:
+  #   fitted_vals <- as.numeric(fitted(fit))
+  #   ok <- is.finite(fitted_vals) & is.finite(res)
+  #   slope_flag <- NA
+  #   if (sum(ok) > 30) {
+  #     # correlate fitted with abs(res) as a crude variance trend signal
+  #     slope_flag <- suppressWarnings(stats::cor(fitted_vals[ok], abs(res[ok]), use = "complete.obs"))
+  #   }
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   cat("* White-noise / autocorrelation:\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat("  - Ljung–Box Q(", lb$parameter, ") = ", round(as.numeric(lb$statistic), 3),
+  #         ", p = ", signif(as.numeric(lb$p.value), 3),
+  #         if (lb$p.value > alpha) "  -> No strong evidence of residual autocorrelation.\n"
+  #         else "  -> Evidence of remaining autocorrelation (model may be under-specified).\n",
+  #         sep = "")
+  #   } else {
+  #     cat("  - Ljung–Box unavailable (test error or insufficient df).\n")
+  #   }
+  #   
+  #   cat("* Distribution / normality:\n")
+  #   if (!is.null(sw) && is.finite(sw$p.value)) {
+  #     cat("  - Shapiro–Wilk p = ", signif(sw$p.value, 3),
+  #         if (sw$p.value > alpha) "  -> residuals not strongly inconsistent with normality.\n"
+  #         else "  -> residuals deviate from normality (heavy tails/skew possible).\n",
+  #         sep = "")
+  #   } else {
+  #     cat("  - Shapiro–Wilk not computed (N out of range or error).\n")
+  #   }
+  #   
+  #   cat("* Variance stability:\n")
+  #   if (is.finite(slope_flag)) {
+  #     cat("  - Corr(fitted, |res|) = ", round(slope_flag, 3),
+  #         if (abs(slope_flag) < 0.15) "  -> variance looks roughly stable.\n"
+  #         else "  -> possible heteroskedasticity (consider variance modeling / transformation).\n",
+  #         sep = "")
+  #   } else {
+  #     cat("  - Not enough usable points to assess variance trend.\n")
+  #   }
+  #   
+  #   cat("\nConclusion / next steps:\n")
+  #   cat("------------------------------------------------------------\n")
+  #   cat("- If ACF shows significant spikes and Ljung–Box rejects: revisit (d, D) and AR/MA orders; use ACF/PACF guidance.\n")
+  #   cat("- If residuals are heavy-tailed or variance changes with level: consider transformation and/or adding a volatility model (e.g., GARCH) for conditional variance.\n")
+  #   cat("- If residual-vs-fitted shows curvature: the mean equation may need additional structure (regressors, intervention dummies, or nonlinear terms).\n")
+  # })
+  # 
+  # 
+  # 
+  # 
+  # 
+  # # Ljung–Box p-values across lags (Manual SARIMA)
+  # output$manual_resid_lb_pvals <- renderPlot({
+  #   req(manual_fit())
+  #   res <- residuals(manual_fit())
+  #   res <- as.numeric(res)[is.finite(res)]
+  #   
+  #   # Use the same controls you already expose elsewhere
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L       <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   fitdf   <- length(coef(manual_fit()))
+  #   alpha   <- suppressWarnings(as.numeric(input$alphaSt2)); if (!is.finite(alpha)) alpha <- 0.05
+  #   
+  #   N <- length(res)
+  #   validate(need(N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   L <- max(1L, min(L, N - 1L))  # sane cap
+  #   
+  #   # Compute p-values for lags 1..L. For k <= fitdf, df would be nonpositive;
+  #   # we mark those as NA (not meaningful after parameter adjustment).
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #                      error = function(e) NULL)
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   
+  #   # Base R plot (consistent with your other diagnostics)
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = "Ljung–Box p-values by lag (Manual SARIMA)",
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2)           # significance threshold
+  #   mtext(sprintf("alpha = %.3f,   fitdf = %d", alpha, fitdf), side = 3, line = 0.2, cex = 0.8)
+  #   # optional: annotate NA region when k <= fitdf
+  #   if (fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # })
+  # 
+  
+  
+  
+  
+  # --------------------------------------------- 
+  # --------------------------------------------- 
+  
+  # # =========================
+  # # For Manual Diag (FULL REPLACEMENT)
+  # # =========================
+  # 
+  # # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf), side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   # Shade region where k <= fitdf (df <= 0 after adjustment -> omitted)
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # =========================
+  # # Manual SARIMA diagnostics tab (NEW independent outputs)
+  # # =========================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- as.numeric(residuals(manual_fit()))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  #   
+  #   plot(res, type = "l",
+  #        main = "Residuals over time",
+  #        xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- as.numeric(residuals(manual_fit()))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  #   
+  #   plot(acf(res, plot = FALSE),
+  #        main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- as.numeric(residuals(manual_fit()))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  #   
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram",
+  #        xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   res <- as.numeric(residuals(manual_fit()))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q-Q plot."))
+  #   
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # # Residuals vs fitted (mean equation adequacy / nonlinearity)
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  #   
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   
+  #   if (sum(ok) > 20) {
+  #     lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # # Scale-location proxy (variance stability)
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   
+  #   y <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  #   
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) {
+  #     lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # # Ljung–Box p-values by lag (Diagnostics tab version)
+  # output$manual_resid_lb_pvals_diag <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   
+  #   fit <- manual_fit()
+  #   res <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # # Commentary + conclusions (Diagnostics tab)
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   req(manual_fit())
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  #   
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   if (N < 8) {
+  #     cat(
+  #       "Diagnostics summary (Manual SARIMA)\n",
+  #       "------------------------------------------------------------\n",
+  #       "- Too few residuals to run a stable diagnostic battery.\n",
+  #       "- Fit the model on more observations or reduce differencing/orders.\n",
+  #       sep = ""
+  #     )
+  #     return(invisible())
+  #   }
+  #   
+  #   # Ljung–Box at chosen lag
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(
+  #     stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #     error = function(e) NULL
+  #   )
+  #   
+  #   # Shapiro–Wilk (guarded)
+  #   sw <- if (N >= 3 && N <= 5000) tryCatch(stats::shapiro.test(res), error = function(e) NULL) else NULL
+  #   
+  #   # Heteroskedasticity proxy: Corr(fitted, |res|)
+  #   fv <- as.numeric(fitted(fit))
+  #   ok <- is.finite(fv) & is.finite(res)
+  #   rho <- if (sum(ok) > 30) suppressWarnings(stats::cor(fv[ok], abs(res[ok]), use = "complete.obs")) else NA_real_
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   
+  #   cat("* White-noise / autocorrelation:\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat(
+  #       "  - Ljung–Box Q(", lb$parameter, ") = ", round(as.numeric(lb$statistic), 3),
+  #       ", p = ", signif(as.numeric(lb$p.value), 3),
+  #       if (lb$p.value > ctrl$alpha) "  -> No strong evidence of residual autocorrelation.\n"
+  #       else "  -> Evidence of remaining autocorrelation (consider revising AR/MA orders or differencing).\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Ljung–Box unavailable (test error or insufficient df).\n")
+  #   }
+  #   
+  #   cat("* Distribution / normality:\n")
+  #   if (!is.null(sw) && is.finite(sw$p.value)) {
+  #     cat(
+  #       "  - Shapiro–Wilk p = ", signif(sw$p.value, 3),
+  #       if (sw$p.value > ctrl$alpha) "  -> residuals not strongly inconsistent with normality.\n"
+  #       else "  -> residuals deviate from normality (heavy tails/skew possible).\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Shapiro–Wilk not computed (N out of range or error).\n")
+  #   }
+  #   
+  #   cat("* Variance stability:\n")
+  #   if (is.finite(rho)) {
+  #     cat(
+  #       "  - Corr(fitted, |res|) = ", round(rho, 3),
+  #       if (abs(rho) < 0.15) "  -> variance looks roughly stable.\n"
+  #       else "  -> possible heteroskedasticity (consider transformation or volatility modeling).\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Not enough usable points to assess variance trend.\n")
+  #   }
+  #   
+  #   cat("\nConclusion / next steps:\n")
+  #   cat("------------------------------------------------------------\n")
+  #   cat("- If ACF has spikes and Ljung–Box rejects: revisit (p,q)(P,Q), and ensure (d,D,s) are appropriate.\n")
+  #   cat("- If Q–Q shows heavy tails: prediction intervals may be optimistic; consider robust alternatives or bootstrapping.\n")
+  #   cat("- If residual-vs-fitted shows structure: consider exogenous regressors, interventions, or model refinement.\n")
+  # })
+  # 
+  # # =========================
+  # # Ljung–Box p-values across lags (Manual SARIMA)  [REPORT VERSION]
+  # # Keep this output name because the Academic conclusion (full) may reference it.
+  # # =========================
+  # output$manual_resid_lb_pvals <- renderPlot({
+  #   req(manual_fit())
+  #   nice_par()
+  #   
+  #   fit <- manual_fit()
+  #   res <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Manual SARIMA)")
+  # })
+  # 
+  # # --------------------------------------------- 
+  # # --------------------------------------------- 
+  # 
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # # =========================
+  # # For Manual Diag (FULL REPLACEMENT + UI BUILDER)
+  # # =========================
+  # 
+  # # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # =========================
+  # # Manual SARIMA diagnostics tab (NEW independent outputs)
+  # # =========================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  #   
+  #   plot(res, type = "l",
+  #        main = "Residuals over time",
+  #        xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  #   
+  #   plot(acf(res, plot = FALSE),
+  #        main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  #   
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram",
+  #        xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q-Q plot."))
+  #   
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  #   
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   
+  #   if (sum(ok) > 20) {
+  #     lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   
+  #   y <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  #   
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) {
+  #     lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # output$manual_resid_lb_pvals_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  #   
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   if (N < 8) {
+  #     cat(
+  #       "Diagnostics summary (Manual SARIMA)\n",
+  #       "------------------------------------------------------------\n",
+  #       "- Too few residuals to run a stable diagnostic battery.\n",
+  #       "- Fit the model on more observations or reduce differencing/orders.\n",
+  #       sep = ""
+  #     )
+  #     return(invisible())
+  #   }
+  #   
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(
+  #     stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #     error = function(e) NULL
+  #   )
+  #   
+  #   sw <- if (N >= 3 && N <= 5000) tryCatch(stats::shapiro.test(res), error = function(e) NULL) else NULL
+  #   
+  #   fv <- as.numeric(fitted(fit))
+  #   ok <- is.finite(fv) & is.finite(res)
+  #   rho <- if (sum(ok) > 30) suppressWarnings(stats::cor(fv[ok], abs(res[ok]), use = "complete.obs")) else NA_real_
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   
+  #   cat("* White-noise / autocorrelation:\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat(
+  #       "  - Ljung–Box Q(", lb$parameter, ") = ", round(as.numeric(lb$statistic), 3),
+  #       ", p = ", signif(as.numeric(lb$p.value), 3),
+  #       if (lb$p.value > ctrl$alpha) "  -> No strong evidence of residual autocorrelation.\n"
+  #       else "  -> Evidence of remaining autocorrelation (revise p/q/P/Q or differencing).\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Ljung–Box unavailable (test error or insufficient df).\n")
+  #   }
+  #   
+  #   cat("* Distribution / normality:\n")
+  #   if (!is.null(sw) && is.finite(sw$p.value)) {
+  #     cat(
+  #       "  - Shapiro–Wilk p = ", signif(sw$p.value, 3),
+  #       if (sw$p.value > ctrl$alpha) "  -> residuals not strongly inconsistent with normality.\n"
+  #       else "  -> residuals deviate from normality (heavy tails/skew possible).\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Shapiro–Wilk not computed (N out of range or error).\n")
+  #   }
+  #   
+  #   cat("* Variance stability:\n")
+  #   if (is.finite(rho)) {
+  #     cat(
+  #       "  - Corr(fitted, |res|) = ", round(rho, 3),
+  #       if (abs(rho) < 0.15) "  -> variance looks roughly stable.\n"
+  #       else "  -> possible heteroskedasticity.\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Not enough usable points to assess variance trend.\n")
+  #   }
+  #   
+  #   cat("\nConclusion / next steps:\n")
+  #   cat("------------------------------------------------------------\n")
+  #   cat("- If ACF spikes and Ljung–Box rejects: revisit (p,q)(P,Q) and/or (d,D,s).\n")
+  #   cat("- If Q–Q shows heavy tails: intervals may be optimistic; consider robust alternatives.\n")
+  #   cat("- If residual-vs-fitted shows structure: consider regressors/interventions.\n")
+  # })
+  # 
+  # # =========================
+  # # Ljung–Box p-values across lags (Manual SARIMA)  [REPORT VERSION]
+  # # (keep this output name because the Academic conclusion (full) may reference it)
+  # # =========================
+  # output$manual_resid_lb_pvals <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Manual SARIMA)")
+  # })
+  # 
+  # # =========================
+  # # Diagnostics tab: dynamic plot layout builder (THIS WAS MISSING)
+  # # =========================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",       title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",      title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",     title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",       title = "Normal Q-Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",   title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",    title = "Scale-location"),
+  #   lb     = list(id = "manual_resid_lb_pvals_diag", title = "Ljung–Box p-values by lag")
+  # )
+  # 
+  # make_diag_plot_output <- function(plot_key, height_px, width_px = 0) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  #   
+  #   w <- if (!is.finite(width_px) || width_px <= 0) "100%" else paste0(width_px, "px")
+  #   
+  #   tagList(
+  #     tags$div(
+  #       style = "margin-bottom:10px;",
+  #       tags$h5(info$title),
+  #       plotOutput(info$id, height = height_px, width = w)
+  #     )
+  #   )
+  # }
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  #   
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  #   
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the sidebar to select one or more plots.")
+  #     ))
+  #   }
+  #   
+  #   height_px <- input$diag_plot_height %||% 260
+  #   width_px  <- input$diag_plot_width  %||% 0
+  #   preset    <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   # Preset: current layout (2x2 + stacked extras)
+  #   if (preset == "preset_current") {
+  #     row1 <- intersect(c("ts", "acf"), keys)
+  #     row2 <- intersect(c("hist", "qq"), keys)
+  #     rest <- setdiff(keys, c("ts", "acf", "hist", "qq"))
+  #     
+  #     ui <- tagList()
+  #     
+  #     if (length(row1) > 0) {
+  #       ui <- tagList(ui,
+  #                     fluidRow(lapply(row1, function(k) column(6, make_diag_plot_output(k, height_px, width_px))))
+  #       )
+  #     }
+  #     if (length(row2) > 0) {
+  #       ui <- tagList(ui,
+  #                     fluidRow(lapply(row2, function(k) column(6, make_diag_plot_output(k, height_px, width_px))))
+  #       )
+  #     }
+  #     if (length(rest) > 0) {
+  #       ui <- tagList(ui, lapply(rest, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #     }
+  #     return(ui)
+  #   }
+  #   
+  #   # Preset: two columns stacked
+  #   if (preset == "preset_two_col") {
+  #     left  <- keys[seq(1, length(keys), by = 2)]
+  #     right <- keys[seq(2, length(keys), by = 2)]
+  #     return(
+  #       fluidRow(
+  #         column(6, lapply(left,  function(k) make_diag_plot_output(k, height_px, width_px))),
+  #         column(6, lapply(right, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #       )
+  #     )
+  #   }
+  #   
+  #   # Preset: one column stacked (and custom order)
+  #   tagList(lapply(keys, function(k) make_diag_plot_output(k, height_px, width_px)))
+  # })
+  
+  
+  
+  
+  
+  
+  # # =========================
+  # # For Manual Diag (FULL REPLACEMENT + UI BUILDER + WIDTH SLIDER)
+  # # =========================
+  # 
+  # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # =========================
+  # # Manual SARIMA diagnostics tab (NEW independent outputs)
+  # # =========================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  #   
+  #   plot(res, type = "l",
+  #        main = "Residuals over time",
+  #        xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  #   
+  #   plot(acf(res, plot = FALSE), main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  #   
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram", xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q-Q plot."))
+  #   
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  #   
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   
+  #   if (sum(ok) > 20) {
+  #     lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   
+  #   y <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  #   
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) {
+  #     lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # output$manual_resid_lb_pvals_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  #   
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   if (N < 8) {
+  #     cat(
+  #       "Diagnostics summary (Manual SARIMA)\n",
+  #       "------------------------------------------------------------\n",
+  #       "- Too few residuals to run a stable diagnostic battery.\n",
+  #       "- Fit the model on more observations or reduce differencing/orders.\n",
+  #       sep = ""
+  #     )
+  #     return(invisible())
+  #   }
+  #   
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(
+  #     stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #     error = function(e) NULL
+  #   )
+  #   
+  #   sw <- if (N >= 3 && N <= 5000) tryCatch(stats::shapiro.test(res), error = function(e) NULL) else NULL
+  #   
+  #   fv <- as.numeric(fitted(fit))
+  #   ok <- is.finite(fv) & is.finite(res)
+  #   rho <- if (sum(ok) > 30) suppressWarnings(stats::cor(fv[ok], abs(res[ok]), use = "complete.obs")) else NA_real_
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   
+  #   cat("* White-noise / autocorrelation:\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat(
+  #       "  - Ljung–Box Q(", lb$parameter, ") = ", round(as.numeric(lb$statistic), 3),
+  #       ", p = ", signif(as.numeric(lb$p.value), 3),
+  #       if (lb$p.value > ctrl$alpha) "  -> No strong evidence of residual autocorrelation.\n"
+  #       else "  -> Evidence of remaining autocorrelation (revise p/q/P/Q or differencing).\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Ljung–Box unavailable (test error or insufficient df).\n")
+  #   }
+  #   
+  #   cat("* Distribution / normality:\n")
+  #   if (!is.null(sw) && is.finite(sw$p.value)) {
+  #     cat(
+  #       "  - Shapiro–Wilk p = ", signif(sw$p.value, 3),
+  #       if (sw$p.value > ctrl$alpha) "  -> residuals not strongly inconsistent with normality.\n"
+  #       else "  -> residuals deviate from normality (heavy tails/skew possible).\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Shapiro–Wilk not computed (N out of range or error).\n")
+  #   }
+  #   
+  #   cat("* Variance stability:\n")
+  #   if (is.finite(rho)) {
+  #     cat(
+  #       "  - Corr(fitted, |res|) = ", round(rho, 3),
+  #       if (abs(rho) < 0.15) "  -> variance looks roughly stable.\n"
+  #       else "  -> possible heteroskedasticity.\n",
+  #       sep = ""
+  #     )
+  #   } else {
+  #     cat("  - Not enough usable points to assess variance trend.\n")
+  #   }
+  #   
+  #   cat("\nConclusion / next steps:\n")
+  #   cat("------------------------------------------------------------\n")
+  #   cat("- If ACF spikes and Ljung–Box rejects: revisit (p,q)(P,Q) and/or (d,D,s).\n")
+  #   cat("- If Q–Q shows heavy tails: intervals may be optimistic; consider robust alternatives.\n")
+  #   cat("- If residual-vs-fitted shows structure: consider regressors/interventions.\n")
+  # })
+  # 
+  # # =========================
+  # # Dynamic main panel (controls width of the plots panel)
+  # # =========================
+  # 
+  # output$manual_diag_mainpanel_ui <- renderUI({
+  #   w <- input$diag_main_width %||% 9
+  #   w <- as.integer(w)
+  #   if (!is.finite(w) || w < 6) w <- 6
+  #   if (w > 11) w <- 11
+  #   
+  #   mainPanel(
+  #     width = w,
+  #     
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#fcfcfc;margin-bottom:12px;",
+  #       tags$h4("Residual diagnostics (Manual SARIMA)"),
+  #       tags$p("Use the controls on the left to choose plots, layout, sizing, and whether to show the academic conclusion.")
+  #     ),
+  #     
+  #     uiOutput("manual_diag_plots_ui"),
+  #     
+  #     conditionalPanel(
+  #       condition = "input.diag_show_conclusion == true",
+  #       tags$h4("Academic conclusion (Diagnostics)"),
+  #       tags$div(
+  #         style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#ffffff;",
+  #         verbatimTextOutput("manual_diag_commentary_diag")
+  #       )
+  #     )
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Diagnostics tab: dynamic plot layout builder
+  # # =========================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",       title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",      title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",     title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",       title = "Normal Q-Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",   title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",    title = "Scale-location"),
+  #   lb     = list(id = "manual_resid_lb_pvals_diag", title = "Ljung–Box p-values by lag")
+  # )
+  # 
+  # # Create a plot "card" that never overlaps other columns
+  # make_diag_plot_output <- function(plot_key, height_px, width_px = 0) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  #   
+  #   # Prefer 100% width (responsive). If px requested, still constrain to container.
+  #   w <- if (!is.finite(width_px) || width_px <= 0) "100%" else paste0(width_px, "px")
+  #   
+  #   tags$div(
+  #     style = "margin-bottom:12px;",
+  #     tags$h5(info$title),
+  #     tags$div(
+  #       style = "width:100%;max-width:100%;overflow:hidden;",  # prevents overlap
+  #       plotOutput(info$id, height = height_px, width = w)
+  #     )
+  #   )
+  # }
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  #   
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  #   
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the sidebar to select one or more plots.")
+  #     ))
+  #   }
+  #   
+  #   height_px <- input$diag_plot_height %||% 260
+  #   width_px  <- input$diag_plot_width  %||% 0
+  #   preset    <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   # --- Preset: current layout (2x2 + stacked extras)
+  #   if (preset == "preset_current") {
+  #     row1 <- intersect(c("ts", "acf"), keys)
+  #     row2 <- intersect(c("hist", "qq"), keys)
+  #     rest <- setdiff(keys, c("ts", "acf", "hist", "qq"))
+  #     
+  #     ui <- tagList()
+  #     
+  #     if (length(row1) > 0) {
+  #       ui <- tagList(ui,
+  #                     fluidRow(lapply(row1, function(k) column(6, make_diag_plot_output(k, height_px, width_px))))
+  #       )
+  #     }
+  #     if (length(row2) > 0) {
+  #       ui <- tagList(ui,
+  #                     fluidRow(lapply(row2, function(k) column(6, make_diag_plot_output(k, height_px, width_px))))
+  #       )
+  #     }
+  #     if (length(rest) > 0) {
+  #       ui <- tagList(ui, lapply(rest, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #     }
+  #     return(ui)
+  #   }
+  #   
+  #   # --- Preset: two columns stacked
+  #   if (preset == "preset_two_col") {
+  #     left  <- keys[seq(1, length(keys), by = 2)]
+  #     right <- keys[seq(2, length(keys), by = 2)]
+  #     return(
+  #       fluidRow(
+  #         column(6, lapply(left,  function(k) make_diag_plot_output(k, height_px, width_px))),
+  #         column(6, lapply(right, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #       )
+  #     )
+  #   }
+  #   
+  #   # --- Preset: one column stacked (and custom order)
+  #   tagList(lapply(keys, function(k) make_diag_plot_output(k, height_px, width_px)))
+  # })
+  # 
+  
+  
+  
+  # # =========================
+  # # For Manual Diag (FULL REPLACEMENT + STAY-RIGHT WIDTHS)
+  # # =========================
+  # 
+  # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # =========================
+  # # Dynamic widths (KEEP ON SAME ROW)
+  # # =========================
+  # diag_main_w <- reactive({
+  #   # main width slider in Bootstrap columns (1..11)
+  #   w <- input$diag_main_width %||% 9
+  #   w <- as.integer(w)
+  #   if (!is.finite(w)) w <- 9
+  #   w <- max(6L, min(11L, w))  # keep main panel usable
+  #   w
+  # })
+  # 
+  # diag_sidebar_w <- reactive({
+  #   # Always keep sum = 12 so it never wraps
+  #   12L - diag_main_w()
+  # })
+  # 
+  # # =========================
+  # # Sidebar UI (built in server so width can react)
+  # # =========================
+  # output$manual_diag_sidebar_ui <- renderUI({
+  #   column(
+  #     width = diag_sidebar_w(),
+  #     
+  #     tags$h4("Diagnostics layout builder"),
+  #     
+  #     selectInput(
+  #       "diag_layout_preset",
+  #       "Layout preset",
+  #       choices = c(
+  #         "Current layout (2x2 + Ljung-Box + Conclusion)" = "preset_current",
+  #         "Two columns (all plots, stacked)"             = "preset_two_col",
+  #         "Single column (all plots, stacked)"           = "preset_one_col",
+  #         "Custom order (choose positions below)"        = "preset_custom"
+  #       ),
+  #       selected = "preset_current"
+  #     ),
+  #     
+  #     tags$hr(),
+  #     
+  #     checkboxGroupInput(
+  #       "diag_plots_selected",
+  #       "Plots to display",
+  #       choices = c(
+  #         "Residuals over time"                          = "ts",
+  #         "Residual ACF"                                 = "acf",
+  #         "Residual histogram"                           = "hist",
+  #         "Normal Q-Q"                                   = "qq",
+  #         "Residuals vs fitted"                          = "fitted",
+  #         "Scale-location (sqrt(|res|) vs fitted)"       = "scale",
+  #         "Ljung–Box p-values by lag"                    = "lb"
+  #       ),
+  #       selected = c("ts", "acf", "hist", "qq", "lb", "fitted", "scale")
+  #     ),
+  #     
+  #     tags$hr(),
+  #     
+  #     # Slider that controls MAIN PANEL width (sidebar adjusts automatically)
+  #     sliderInput(
+  #       "diag_main_width",
+  #       "Plots panel width (Bootstrap columns)",
+  #       min = 6, max = 11, value = 9, step = 1
+  #     ),
+  #     helpText("Main + sidebar always sum to 12, so the plots panel stays on the right."),
+  #     
+  #     tags$hr(),
+  #     
+  #     sliderInput(
+  #       "diag_plot_height",
+  #       "Plot height (px)",
+  #       min = 180, max = 700, value = 260, step = 10
+  #     ),
+  #     
+  #     sliderInput(
+  #       "diag_plot_width",
+  #       "Plot width (px, optional; constrained)",
+  #       min = 0, max = 2000, value = 0, step = 25
+  #     ),
+  #     helpText("width = 0 uses full available width. Large widths are clipped to avoid overlap."),
+  #     
+  #     tags$hr(),
+  #     
+  #     checkboxInput("diag_show_conclusion", "Show academic conclusion panel", value = TRUE),
+  #     
+  #     conditionalPanel(
+  #       condition = "input.diag_layout_preset == 'preset_custom'",
+  #       tags$h5("Custom positions (1 = first)"),
+  #       helpText("Give each enabled plot a position. Ties are broken by name."),
+  #       
+  #       numericInput("pos_ts",     "Residuals over time position", value = 1, min = 1, step = 1),
+  #       numericInput("pos_acf",    "Residual ACF position",        value = 2, min = 1, step = 1),
+  #       numericInput("pos_hist",   "Histogram position",           value = 3, min = 1, step = 1),
+  #       numericInput("pos_qq",     "Q-Q position",                 value = 4, min = 1, step = 1),
+  #       numericInput("pos_fitted", "Residuals vs fitted position", value = 5, min = 1, step = 1),
+  #       numericInput("pos_scale",  "Scale-location position",      value = 6, min = 1, step = 1),
+  #       numericInput("pos_lb",     "Ljung–Box p-values position",  value = 7, min = 1, step = 1)
+  #     )
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Main panel UI (built in server so width can react)
+  # # =========================
+  # output$manual_diag_mainpanel_ui <- renderUI({
+  #   column(
+  #     width = diag_main_w(),
+  #     
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#fcfcfc;margin-bottom:12px;",
+  #       tags$h4("Residual diagnostics (Manual SARIMA)"),
+  #       tags$p("Choose plots, layout, and sizing from the left panel.")
+  #     ),
+  #     
+  #     uiOutput("manual_diag_plots_ui"),
+  #     
+  #     conditionalPanel(
+  #       condition = "input.diag_show_conclusion == true",
+  #       tags$h4("Academic conclusion (Diagnostics)"),
+  #       tags$div(
+  #         style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#ffffff;",
+  #         verbatimTextOutput("manual_diag_commentary_diag")
+  #       )
+  #     )
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Plot outputs (diag)
+  # # =========================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  #   
+  #   plot(res, type = "l", main = "Residuals over time", xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  #   
+  #   plot(acf(res, plot = FALSE), main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  #   
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram", xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q-Q plot."))
+  #   
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  #   
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   if (sum(ok) > 20) lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   
+  #   y <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  #   
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_lb_pvals_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf, "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  #   
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   if (N < 8) {
+  #     cat(
+  #       "Diagnostics summary (Manual SARIMA)\n",
+  #       "------------------------------------------------------------\n",
+  #       "- Too few residuals to run a stable diagnostic battery.\n",
+  #       "- Fit the model on more observations or reduce differencing/orders.\n",
+  #       sep = ""
+  #     )
+  #     return(invisible())
+  #   }
+  #   
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #                  error = function(e) NULL)
+  #   
+  #   sw <- if (N >= 3 && N <= 5000) tryCatch(stats::shapiro.test(res), error = function(e) NULL) else NULL
+  #   
+  #   fv <- as.numeric(fitted(fit))
+  #   ok <- is.finite(fv) & is.finite(res)
+  #   rho <- if (sum(ok) > 30) suppressWarnings(stats::cor(fv[ok], abs(res[ok]), use = "complete.obs")) else NA_real_
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   
+  #   cat("* White-noise / autocorrelation:\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat("  - Ljung–Box p = ", signif(lb$p.value, 3),
+  #         if (lb$p.value > ctrl$alpha) " -> no strong evidence of autocorrelation.\n"
+  #         else " -> remaining autocorrelation; consider revising orders/differencing.\n", sep = "")
+  #   } else {
+  #     cat("  - Ljung–Box unavailable.\n")
+  #   }
+  #   
+  #   cat("* Distribution / normality:\n")
+  #   if (!is.null(sw) && is.finite(sw$p.value)) {
+  #     cat("  - Shapiro–Wilk p = ", signif(sw$p.value, 3),
+  #         if (sw$p.value > ctrl$alpha) " -> not strongly inconsistent with normality.\n"
+  #         else " -> non-normal residuals likely.\n", sep = "")
+  #   } else {
+  #     cat("  - Shapiro–Wilk not computed.\n")
+  #   }
+  #   
+  #   cat("* Variance stability:\n")
+  #   if (is.finite(rho)) {
+  #     cat("  - Corr(fitted, |res|) = ", round(rho, 3),
+  #         if (abs(rho) < 0.15) " -> roughly stable.\n"
+  #         else " -> possible heteroskedasticity.\n", sep = "")
+  #   } else {
+  #     cat("  - Not enough points to assess.\n")
+  #   }
+  # })
+  # 
+  # # =========================
+  # # Diagnostics tab: dynamic plot layout builder
+  # # =========================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",       title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",      title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",     title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",       title = "Normal Q-Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",   title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",    title = "Scale-location"),
+  #   lb     = list(id = "manual_resid_lb_pvals_diag", title = "Ljung–Box p-values by lag")
+  # )
+  # 
+  # make_diag_plot_output <- function(plot_key, height_px, width_px = 0) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  #   
+  #   # responsive by default
+  #   w <- if (!is.finite(width_px) || width_px <= 0) "100%" else paste0(width_px, "px")
+  #   
+  #   tags$div(
+  #     style = "margin-bottom:12px;",
+  #     tags$h5(info$title),
+  #     tags$div(
+  #       style = "width:100%;max-width:100%;overflow:hidden;", # prevents overlap
+  #       plotOutput(info$id, height = height_px, width = w)
+  #     )
+  #   )
+  # }
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  #   
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  #   
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the left panel to select plots.")
+  #     ))
+  #   }
+  #   
+  #   height_px <- input$diag_plot_height %||% 260
+  #   width_px  <- input$diag_plot_width  %||% 0
+  #   preset    <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   if (preset == "preset_current") {
+  #     row1 <- intersect(c("ts", "acf"), keys)
+  #     row2 <- intersect(c("hist", "qq"), keys)
+  #     rest <- setdiff(keys, c("ts", "acf", "hist", "qq"))
+  #     
+  #     ui <- tagList()
+  #     if (length(row1) > 0) ui <- tagList(ui, fluidRow(lapply(row1, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     if (length(row2) > 0) ui <- tagList(ui, fluidRow(lapply(row2, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     if (length(rest) > 0) ui <- tagList(ui, lapply(rest, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #     return(ui)
+  #   }
+  #   
+  #   if (preset == "preset_two_col") {
+  #     left  <- keys[seq(1, length(keys), by = 2)]
+  #     right <- keys[seq(2, length(keys), by = 2)]
+  #     return(
+  #       fluidRow(
+  #         column(6, lapply(left,  function(k) make_diag_plot_output(k, height_px, width_px))),
+  #         column(6, lapply(right, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #       )
+  #     )
+  #   }
+  #   
+  #   tagList(lapply(keys, function(k) make_diag_plot_output(k, height_px, width_px)))
+  # })
+  
+  
+ 
+  
+  
+  
+   
+  # # =========================
+  # # Manual SARIMA Diagnostics (FULL) - responsive panel + builder
+  # # =========================
+  # 
+  # # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # 
+  # # main width from slider
+  # diag_main_w <- reactive({
+  #   w <- input$diag_main_width %||% 9
+  #   w <- as.integer(w)
+  #   if (!is.finite(w)) w <- 9
+  #   w <- max(6L, min(11L, w))
+  #   w
+  # })
+  # 
+  # # sidebar width auto-adjust so main stays right (sum = 12)
+  # diag_sidebar_w <- reactive({
+  #   12L - diag_main_w()
+  # })
+  # 
+  # output$manual_diag_sidebar_ui <- renderUI({
+  #   column(
+  #     width = diag_sidebar_w(),
+  # 
+  #     tags$h4("Diagnostics layout builder"),
+  # 
+  #     selectInput(
+  #       "diag_layout_preset",
+  #       "Layout preset",
+  #       choices = c(
+  #         "Current layout (2x2 + Ljung-Box + Conclusion)" = "preset_current",
+  #         "Two columns (all plots, stacked)"             = "preset_two_col",
+  #         "Single column (all plots, stacked)"           = "preset_one_col",
+  #         "Custom order (choose positions below)"        = "preset_custom"
+  #       ),
+  #       selected = "preset_current"
+  #     ),
+  # 
+  #     tags$hr(),
+  # 
+  #     checkboxGroupInput(
+  #       "diag_plots_selected",
+  #       "Plots to display",
+  #       choices = c(
+  #         "Residuals over time"                          = "ts",
+  #         "Residual ACF"                                 = "acf",
+  #         "Residual histogram"                           = "hist",
+  #         "Normal Q-Q"                                   = "qq",
+  #         "Residuals vs fitted"                          = "fitted",
+  #         "Scale-location (sqrt(|res|) vs fitted)"       = "scale",
+  #         "Ljung–Box p-values by lag"                    = "lb"
+  #       ),
+  #       selected = c("ts", "acf", "hist", "qq", "lb", "fitted", "scale")
+  #     ),
+  # 
+  #     tags$hr(),
+  # 
+  #     sliderInput(
+  #       "diag_main_width",
+  #       "Plots panel width (Bootstrap columns)",
+  #       min = 6, max = 11, value = 9, step = 1
+  #     ),
+  #     helpText("Main + sidebar always sum to 12, so the plots panel stays on the right."),
+  # 
+  #     tags$hr(),
+  # 
+  #     sliderInput("diag_plot_height", "Plot height (px)", min = 180, max = 700, value = 260, step = 10),
+  #     sliderInput("diag_plot_width",  "Plot width (px, optional)", min = 0, max = 2000, value = 0, step = 25),
+  #     helpText("width=0 uses full available width; large widths are constrained in the plot cards."),
+  # 
+  #     tags$hr(),
+  # 
+  #     checkboxInput("diag_show_conclusion", "Show academic conclusion panel", value = TRUE),
+  # 
+  #     conditionalPanel(
+  #       condition = "input.diag_layout_preset == 'preset_custom'",
+  #       tags$h5("Custom positions (1 = first)"),
+  #       numericInput("pos_ts",     "Residuals over time position", value = 1, min = 1),
+  #       numericInput("pos_acf",    "Residual ACF position",        value = 2, min = 1),
+  #       numericInput("pos_hist",   "Histogram position",           value = 3, min = 1),
+  #       numericInput("pos_qq",     "Q-Q position",                 value = 4, min = 1),
+  #       numericInput("pos_fitted", "Residuals vs fitted position", value = 5, min = 1),
+  #       numericInput("pos_scale",  "Scale-location position",      value = 6, min = 1),
+  #       numericInput("pos_lb",     "Ljung–Box p-values position",  value = 7, min = 1)
+  #     )
+  #   )
+  # })
+  # 
+  # output$manual_diag_mainpanel_ui <- renderUI({
+  #   column(
+  #     width = diag_main_w(),
+  # 
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#fcfcfc;margin-bottom:12px;",
+  #       tags$h4("Residual diagnostics (Manual SARIMA)"),
+  #       tags$p("Use the controls on the left to choose plots, layout, size, and whether to show the academic conclusion.")
+  #     ),
+  # 
+  #     uiOutput("manual_diag_plots_ui"),
+  # 
+  #     conditionalPanel(
+  #       condition = "input.diag_show_conclusion == true",
+  #       tags$h4("Academic conclusion (Diagnostics)"),
+  #       tags$div(
+  #         style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#ffffff;",
+  #         verbatimTextOutput("manual_diag_commentary_diag")
+  #       )
+  #     )
+  #   )
+  # })
+  # 
+  # 
+  # 
+  # 
+  # 
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  # 
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  # 
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  # 
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  # 
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  # 
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  # 
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # =========================
+  # # Dynamic widths (KEEP MAIN ON RIGHT, NEVER WRAP)
+  # # main + sidebar always sum to 12
+  # # =========================
+  # diag_main_w <- reactive({
+  #   w <- input$diag_main_width %||% 9
+  #   w <- as.integer(w)
+  #   if (!is.finite(w)) w <- 9
+  #   w <- max(6L, min(11L, w))
+  #   w
+  # })
+  # 
+  # diag_sidebar_w <- reactive({
+  #   12L - diag_main_w()
+  # })
+  # 
+  # # =========================
+  # # Sidebar UI (dynamic width)
+  # # =========================
+  # output$manual_diag_sidebar_ui <- renderUI({
+  #   column(
+  #     width = diag_sidebar_w(),
+  # 
+  #     tags$h4("Diagnostics layout builder"),
+  # 
+  #     selectInput(
+  #       "diag_layout_preset",
+  #       "Layout preset",
+  #       choices = c(
+  #         "Current layout (2x2 + Ljung-Box + Conclusion)" = "preset_current",
+  #         "Two columns (all plots, stacked)"             = "preset_two_col",
+  #         "Single column (all plots, stacked)"           = "preset_one_col",
+  #         "Custom order (choose positions below)"        = "preset_custom"
+  #       ),
+  #       selected = "preset_current"
+  #     ),
+  # 
+  #     tags$hr(),
+  # 
+  #     checkboxGroupInput(
+  #       "diag_plots_selected",
+  #       "Plots to display",
+  #       choices = c(
+  #         "Residuals over time"                          = "ts",
+  #         "Residual ACF"                                 = "acf",
+  #         "Residual histogram"                           = "hist",
+  #         "Normal Q-Q"                                   = "qq",
+  #         "Residuals vs fitted"                          = "fitted",
+  #         "Scale-location (sqrt(|res|) vs fitted)"       = "scale",
+  #         "Ljung–Box p-values by lag"                    = "lb"
+  #       ),
+  #       selected = c("ts", "acf", "hist", "qq", "lb", "fitted", "scale")
+  #     ),
+  # 
+  #     tags$hr(),
+  # 
+  #     # Controls MAIN panel width; sidebar auto-adjusts so it stays on the right
+  #     sliderInput(
+  #       "diag_main_width",
+  #       "Plots panel width (Bootstrap columns)",
+  #       min = 6, max = 11, value = 9, step = 1
+  #     ),
+  #     helpText("Main + sidebar always sum to 12, so plots panel stays on the right."),
+  # 
+  #     tags$hr(),
+  # 
+  #     sliderInput("diag_plot_height", "Plot height (px)", min = 180, max = 700, value = 260, step = 10),
+  # 
+  #     # Plot width request. Used to decide 1-col vs 2-col to avoid overlap.
+  #     sliderInput(
+  #       "diag_plot_width",
+  #       "Preferred plot width (px, optional)",
+  #       min = 0, max = 2000, value = 0, step = 25
+  #     ),
+  #     helpText("If a wide width is requested, 2-column layouts automatically switch to 1-column to prevent overlap."),
+  # 
+  #     tags$hr(),
+  # 
+  #     checkboxInput("diag_show_conclusion", "Show academic conclusion panel", value = TRUE),
+  # 
+  #     conditionalPanel(
+  #       condition = "input.diag_layout_preset == 'preset_custom'",
+  #       tags$h5("Custom positions (1 = first)"),
+  #       helpText("Give each enabled plot a position. Ties are broken by name."),
+  # 
+  #       numericInput("pos_ts",     "Residuals over time position", value = 1, min = 1, step = 1),
+  #       numericInput("pos_acf",    "Residual ACF position",        value = 2, min = 1, step = 1),
+  #       numericInput("pos_hist",   "Histogram position",           value = 3, min = 1, step = 1),
+  #       numericInput("pos_qq",     "Q-Q position",                 value = 4, min = 1, step = 1),
+  #       numericInput("pos_fitted", "Residuals vs fitted position", value = 5, min = 1, step = 1),
+  #       numericInput("pos_scale",  "Scale-location position",      value = 6, min = 1, step = 1),
+  #       numericInput("pos_lb",     "Ljung–Box p-values position",  value = 7, min = 1, step = 1)
+  #     )
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Main panel UI (dynamic width)
+  # # =========================
+  # output$manual_diag_mainpanel_ui <- renderUI({
+  #   column(
+  #     width = diag_main_w(),
+  # 
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#fcfcfc;margin-bottom:12px;",
+  #       tags$h4("Residual diagnostics (Manual SARIMA)"),
+  #       tags$p("Choose plots, layout, and sizing from the left panel.")
+  #     ),
+  # 
+  #     uiOutput("manual_diag_plots_ui"),
+  # 
+  #     conditionalPanel(
+  #       condition = "input.diag_show_conclusion == true",
+  #       tags$h4("Academic conclusion (Diagnostics)"),
+  #       tags$div(
+  #         style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#ffffff;",
+  #         verbatimTextOutput("manual_diag_commentary_diag")
+  #       )
+  #     )
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Plot outputs (diag)
+  # # =========================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  # 
+  #   plot(res, type = "l", main = "Residuals over time", xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  # 
+  #   plot(acf(res, plot = FALSE), main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  # 
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram", xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q-Q plot."))
+  # 
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  # 
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   if (sum(ok) > 20) lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  # 
+  #   y <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  # 
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_lb_pvals_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  # 
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  # 
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  # 
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf, "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  # 
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  # 
+  #   if (N < 8) {
+  #     cat(
+  #       "Diagnostics summary (Manual SARIMA)\n",
+  #       "------------------------------------------------------------\n",
+  #       "- Too few residuals to run a stable diagnostic battery.\n",
+  #       "- Fit the model on more observations or reduce differencing/orders.\n",
+  #       sep = ""
+  #     )
+  #     return(invisible())
+  #   }
+  # 
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #                  error = function(e) NULL)
+  # 
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat("Ljung–Box p =", signif(lb$p.value, 3),
+  #         if (lb$p.value > ctrl$alpha) " -> no strong evidence of autocorrelation.\n"
+  #         else " -> remaining autocorrelation; revise orders/differencing.\n", sep = "")
+  #   } else {
+  #     cat("Ljung–Box unavailable.\n")
+  #   }
+  # })
+  # 
+  # # =========================
+  # # Diagnostics plot layout builder (AUTO: 2-col -> 1-col if plots too wide)
+  # # =========================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",       title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",      title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",     title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",       title = "Normal Q-Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",   title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",    title = "Scale-location"),
+  #   lb     = list(id = "manual_resid_lb_pvals_diag", title = "Ljung–Box p-values by lag")
+  # )
+  # 
+  # make_diag_plot_output <- function(plot_key, height_px, width_px = 0) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  # 
+  #   # Default responsive; if px requested, apply but constrain to container.
+  #   w <- if (!is.finite(width_px) || width_px <= 0) "100%" else paste0(width_px, "px")
+  # 
+  #   tags$div(
+  #     style = "margin-bottom:12px;",
+  #     tags$h5(info$title),
+  #     tags$div(
+  #       style = "width:100%;max-width:100%;overflow:hidden;",
+  #       plotOutput(info$id, height = height_px, width = w)
+  #     )
+  #   )
+  # }
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  # 
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  # 
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # # Heuristic: when user requests a big plot width, switch to 1-column in 2-col presets.
+  # # This avoids overlap and behaves like "column grows when plot grows".
+  # use_one_col_due_to_width <- reactive({
+  #   wpx <- input$diag_plot_width %||% 0
+  #   wpx <- suppressWarnings(as.numeric(wpx))
+  #   if (!is.finite(wpx) || wpx <= 0) return(FALSE)
+  #   # threshold: if requested width is large, prefer 1 column
+  #   wpx >= 700
+  # })
+  # 
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  # 
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the left panel to select plots.")
+  #     ))
+  #   }
+  # 
+  #   height_px <- input$diag_plot_height %||% 260
+  #   width_px  <- input$diag_plot_width  %||% 0
+  #   preset    <- input$diag_layout_preset %||% "preset_current"
+  # 
+  #   # Auto-switch: if plots are wide, force 1 column even in 2-col presets
+  #   force_one_col <- isTRUE(use_one_col_due_to_width())
+  # 
+  #   if (preset == "preset_current" && !force_one_col) {
+  #     row1 <- intersect(c("ts", "acf"), keys)
+  #     row2 <- intersect(c("hist", "qq"), keys)
+  #     rest <- setdiff(keys, c("ts", "acf", "hist", "qq"))
+  # 
+  #     ui <- tagList()
+  #     if (length(row1) > 0) ui <- tagList(ui, fluidRow(lapply(row1, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     if (length(row2) > 0) ui <- tagList(ui, fluidRow(lapply(row2, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     if (length(rest) > 0) ui <- tagList(ui, lapply(rest, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #     return(ui)
+  #   }
+  # 
+  #   if (preset == "preset_two_col" && !force_one_col) {
+  #     left  <- keys[seq(1, length(keys), by = 2)]
+  #     right <- keys[seq(2, length(keys), by = 2)]
+  #     return(
+  #       fluidRow(
+  #         column(6, lapply(left,  function(k) make_diag_plot_output(k, height_px, width_px))),
+  #         column(6, lapply(right, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #       )
+  #     )
+  #   }
+  # 
+  #   # preset_one_col, preset_custom, OR forced one-col due to wide plots:
+  #   tagList(lapply(keys, function(k) make_diag_plot_output(k, height_px, width_px)))
+  # })
+  
+  
+  
+  
+  # # =========================
+  # # Manual SARIMA Diagnostics (FULL) - responsive panel + builder
+  # #   MOD: allow real enlargement via scrollable plots panel (px width)
+  # # =========================
+  # 
+  # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value  (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # =========================
+  # # IMPORTANT MOD:
+  # # instead of "Bootstrap columns" resizing (which cannot exceed the screen),
+  # # we allow a PX-width plots panel with horizontal scrolling.
+  # # We'll still keep main+sidebar stable (sum=12) so it stays on the right.
+  # # =========================
+  # 
+  # # main width from slider (keeps main on right; do NOT try to exceed screen with this)
+  # diag_main_w <- reactive({
+  #   w <- input$diag_main_width %||% 9
+  #   w <- as.integer(w)
+  #   if (!is.finite(w)) w <- 9
+  #   w <- max(6L, min(11L, w))
+  #   w
+  # })
+  # 
+  # # sidebar width auto-adjust so main stays right (sum = 12)
+  # diag_sidebar_w <- reactive({
+  #   12L - diag_main_w()
+  # })
+  # 
+  # # =========================
+  # # Sidebar UI (dynamic width)
+  # # NOTE: you must add diag_panel_px slider in your UI to control the plot panel width (px).
+  # # =========================
+  # output$manual_diag_sidebar_ui <- renderUI({
+  #   column(
+  #     width = diag_sidebar_w(),
+  #     
+  #     tags$h4("Diagnostics layout builder"),
+  #     
+  #     selectInput(
+  #       "diag_layout_preset",
+  #       "Layout preset",
+  #       choices = c(
+  #         "Current layout (2x2 + Ljung-Box + Conclusion)" = "preset_current",
+  #         "Two columns (all plots, stacked)"             = "preset_two_col",
+  #         "Single column (all plots, stacked)"           = "preset_one_col",
+  #         "Custom order (choose positions below)"        = "preset_custom"
+  #       ),
+  #       selected = "preset_current"
+  #     ),
+  #     
+  #     tags$hr(),
+  #     
+  #     checkboxGroupInput(
+  #       "diag_plots_selected",
+  #       "Plots to display",
+  #       choices = c(
+  #         "Residuals over time"                          = "ts",
+  #         "Residual ACF"                                 = "acf",
+  #         "Residual histogram"                           = "hist",
+  #         "Normal Q-Q"                                   = "qq",
+  #         "Residuals vs fitted"                          = "fitted",
+  #         "Scale-location (sqrt(|res|) vs fitted)"       = "scale",
+  #         "Ljung–Box p-values by lag"                    = "lb"
+  #       ),
+  #       selected = c("ts", "acf", "hist", "qq", "lb", "fitted", "scale")
+  #     ),
+  #     
+  #     tags$hr(),
+  #     
+  #     sliderInput(
+  #       "diag_main_width",
+  #       "Main panel share (Bootstrap columns)",
+  #       min = 6, max = 11, value = 9, step = 1
+  #     ),
+  #     helpText("This controls how much of the page the Diagnostics area uses. Real enlargement uses the px panel width below."),
+  #     
+  #     tags$hr(),
+  #     
+  #     # NEW (must exist in UI): plots panel width in pixels (can exceed viewport; scrolls)
+  #     sliderInput(
+  #       "diag_panel_px",
+  #       "Plots panel width (px) — enables enlargement via scroll",
+  #       min = 600, max = 4000, value = 1200, step = 50
+  #     ),
+  #     helpText("Increase this to make 2-column plots larger than your screen; a horizontal scrollbar will appear."),
+  #     
+  #     tags$hr(),
+  #     
+  #     sliderInput("diag_plot_height", "Plot height (px)", min = 180, max = 900, value = 260, step = 10),
+  #     sliderInput("diag_plot_width",  "Plot width (px, optional)", min = 0, max = 3000, value = 0, step = 25),
+  #     helpText("width=0 uses full column width inside the plots panel. Non-zero width uses a fixed px width."),
+  #     
+  #     tags$hr(),
+  #     
+  #     checkboxInput("diag_show_conclusion", "Show academic conclusion panel", value = TRUE),
+  #     
+  #     conditionalPanel(
+  #       condition = "input.diag_layout_preset == 'preset_custom'",
+  #       tags$h5("Custom positions (1 = first)"),
+  #       numericInput("pos_ts",     "Residuals over time position", value = 1, min = 1),
+  #       numericInput("pos_acf",    "Residual ACF position",        value = 2, min = 1),
+  #       numericInput("pos_hist",   "Histogram position",           value = 3, min = 1),
+  #       numericInput("pos_qq",     "Q-Q position",                 value = 4, min = 1),
+  #       numericInput("pos_fitted", "Residuals vs fitted position", value = 5, min = 1),
+  #       numericInput("pos_scale",  "Scale-location position",      value = 6, min = 1),
+  #       numericInput("pos_lb",     "Ljung–Box p-values position",  value = 7, min = 1)
+  #     )
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Main panel UI (dynamic width)
+  # # MOD: wrap plots UI in a scroll container whose inner div has min-width = diag_panel_px
+  # # =========================
+  # output$manual_diag_mainpanel_ui <- renderUI({
+  #   column(
+  #     width = diag_main_w(),
+  #     
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#fcfcfc;margin-bottom:12px;",
+  #       tags$h4("Residual diagnostics (Manual SARIMA)"),
+  #       tags$p("Increase 'Plots panel width (px)' to enlarge plots beyond the screen; scroll horizontally to view.")
+  #     ),
+  #     
+  #     # Scroll wrapper + fixed/min px width panel
+  #     tags$div(
+  #       style = "width:100%; overflow-x:auto; padding-bottom:6px;",
+  #       tags$div(
+  #         style = paste0(
+  #           "min-width:", (input$diag_panel_px %||% 1200), "px;",
+  #           "max-width:none;",
+  #           "background:#fff;",
+  #           "border:1px solid #eee;",
+  #           "border-radius:10px;",
+  #           "padding:10px;"
+  #         ),
+  #         uiOutput("manual_diag_plots_ui")
+  #       )
+  #     ),
+  #     
+  #     conditionalPanel(
+  #       condition = "input.diag_show_conclusion == true",
+  #       tags$h4("Academic conclusion (Diagnostics)"),
+  #       tags$div(
+  #         style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#ffffff;",
+  #         verbatimTextOutput("manual_diag_commentary_diag")
+  #       )
+  #     )
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Plot outputs (diag)
+  # # =========================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  # 
+  #   plot(res, type = "l", main = "Residuals over time", xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  # 
+  #   plot(acf(res, plot = FALSE), main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  # 
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram", xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q-Q plot."))
+  # 
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  # 
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   if (sum(ok) > 20) lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  # 
+  #   y <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  # 
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_lb_pvals_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  # 
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  # 
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  # 
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf, "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  # 
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  # 
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  # 
+  #   if (N < 8) {
+  #     cat(
+  #       "Diagnostics summary (Manual SARIMA)\n",
+  #       "------------------------------------------------------------\n",
+  #       "- Too few residuals to run a stable diagnostic battery.\n",
+  #       "- Fit the model on more observations or reduce differencing/orders.\n",
+  #       sep = ""
+  #     )
+  #     return(invisible())
+  #   }
+  # 
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #                  error = function(e) NULL)
+  # 
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat("Ljung–Box p =", signif(lb$p.value, 3),
+  #         if (lb$p.value > ctrl$alpha) " -> no strong evidence of autocorrelation.\n"
+  #         else " -> remaining autocorrelation; revise orders/differencing.\n", sep = "")
+  #   } else {
+  #     cat("Ljung–Box unavailable.\n")
+  #   }
+  # })
+  # 
+  # # =========================
+  # # Diagnostics plot layout builder
+  # # MOD: remove forced 1-col switch; 2-col can remain large because panel can expand (scroll)
+  # # =========================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",       title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",      title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",     title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",       title = "Normal Q-Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",   title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",    title = "Scale-location"),
+  #   lb     = list(id = "manual_resid_lb_pvals_diag", title = "Ljung–Box p-values by lag")
+  # )
+  # 
+  # make_diag_plot_output <- function(plot_key, height_px, width_px = 0) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  #   
+  #   # NOTE: no max-width clipping; the panel scrolls if larger than viewport
+  #   w <- if (!is.finite(width_px) || width_px <= 0) "100%" else paste0(width_px, "px")
+  #   
+  #   tags$div(
+  #     style = "margin-bottom:12px;",
+  #     tags$h5(info$title),
+  #     plotOutput(info$id, height = height_px, width = w)
+  #   )
+  # }
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  #   
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  #   
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the left panel to select plots.")
+  #     ))
+  #   }
+  #   
+  #   height_px <- input$diag_plot_height %||% 260
+  #   width_px  <- input$diag_plot_width  %||% 0
+  #   preset    <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   if (preset == "preset_current") {
+  #     row1 <- intersect(c("ts", "acf"), keys)
+  #     row2 <- intersect(c("hist", "qq"), keys)
+  #     rest <- setdiff(keys, c("ts", "acf", "hist", "qq"))
+  #     
+  #     ui <- tagList()
+  #     if (length(row1) > 0) ui <- tagList(ui, fluidRow(lapply(row1, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     if (length(row2) > 0) ui <- tagList(ui, fluidRow(lapply(row2, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     if (length(rest) > 0) ui <- tagList(ui, lapply(rest, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #     return(ui)
+  #   }
+  #   
+  #   if (preset == "preset_two_col") {
+  #     left  <- keys[seq(1, length(keys), by = 2)]
+  #     right <- keys[seq(2, length(keys), by = 2)]
+  #     return(
+  #       fluidRow(
+  #         column(6, lapply(left,  function(k) make_diag_plot_output(k, height_px, width_px))),
+  #         column(6, lapply(right, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #       )
+  #     )
+  #   }
+  #   
+  #   # one column
+  #   tagList(lapply(keys, function(k) make_diag_plot_output(k, height_px, width_px)))
+  # })
+  
+  
+  
+ 
+  
+  # # ============================================================
+  # # Manual SARIMA Diagnostics (FULL) — scrollable canvas + builder
+  # # + NEW Ljung–Box p-values by lag plot for Diagnostics tab ONLY
+  # #
+  # # IMPORTANT:
+  # # - Keep your Academic conclusion plot output name (manual_resid_lb_pvals) unchanged.
+  # # - Diagnostics tab uses a NEW output id: manual_resid_lb_pvals_diag2
+  # # - UI must call uiOutput("manual_diag_canvas_ui") and uiOutput("manual_diag_plots_ui")
+  # #   as in the flex/canvas layout we discussed.
+  # # ============================================================
+  # 
+  # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # ============================================================
+  # # Plot outputs (Diagnostics tab versions)
+  # # ============================================================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  #   
+  #   plot(res, type = "l", main = "Residuals over time", xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  #   
+  #   plot(acf(res, plot = FALSE), main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  #   
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram", xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q–Q plot."))
+  #   
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  #   
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   if (sum(ok) > 20) lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   
+  #   y <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  #   
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # # ------------------------------------------------------------
+  # # NEW: Ljung–Box p-values by lag (Diagnostics tab ONLY)
+  # # This is the one the Diagnostics UI should use.
+  # # ------------------------------------------------------------
+  # output$manual_resid_lb_pvals_diag2 <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(
+  #     pvals = out$pvals,
+  #     L = out$L,
+  #     alpha = ctrl$alpha,
+  #     fitdf = fitdf,
+  #     main_title = "Ljung–Box p-values by lag (Diagnostics tab)"
+  #   )
+  # })
+  # 
+  # # ------------------------------------------------------------
+  # # Commentary (Diagnostics tab)
+  # # ------------------------------------------------------------
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  #   
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   if (N < 8) {
+  #     cat(
+  #       "Diagnostics summary (Manual SARIMA)\n",
+  #       "------------------------------------------------------------\n",
+  #       "- Too few residuals to run a stable diagnostic battery.\n",
+  #       "- Fit the model on more observations or reduce differencing/orders.\n",
+  #       sep = ""
+  #     )
+  #     return(invisible())
+  #   }
+  #   
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(
+  #     stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #     error = function(e) NULL
+  #   )
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat("Ljung–Box (lag ", L2, ") p = ", signif(lb$p.value, 3),
+  #         if (lb$p.value > ctrl$alpha) " -> no strong evidence of residual autocorrelation.\n"
+  #         else " -> residual autocorrelation remains; revise (p,q)(P,Q) and/or (d,D,s).\n",
+  #         sep = "")
+  #   } else {
+  #     cat("Ljung–Box test unavailable.\n")
+  #   }
+  #   
+  #   cat("\nNotes:\n")
+  #   cat("- Use Residual ACF + Ljung–Box together: spikes + small p-values suggest underfitting.\n")
+  #   cat("- If residual distribution is heavy-tailed (Q–Q), inference/intervals may be optimistic.\n")
+  # })
+  # 
+  # # ============================================================
+  # # KEEP: Academic conclusion plot output name unchanged
+  # # (this is your REPORT / Academic conclusion version)
+  # # ============================================================
+  # output$manual_resid_lb_pvals <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   nice_par()
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(
+  #     pvals = out$pvals,
+  #     L = out$L,
+  #     alpha = ctrl$alpha,
+  #     fitdf = fitdf,
+  #     main_title = "Ljung–Box p-values by lag (Manual SARIMA)"
+  #   )
+  # })
+  # 
+  # # ============================================================
+  # # Diagnostics canvas + layout builder (NO size restrictions)
+  # # - You can scroll right/down.
+  # # - Canvas size controlled by diag_canvas_width / diag_canvas_height (UI sliders).
+  # # ============================================================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",        title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",       title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",      title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",        title = "Normal Q–Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",    title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",     title = "Scale-location"),
+  #   # NEW diagnostics-only LB plot:
+  #   lb     = list(id = "manual_resid_lb_pvals_diag2", title = "Ljung–Box p-values by lag (Diagnostics)")
+  # )
+  # 
+  # make_diag_plot_output <- function(plot_key, height_px, width_px = 0) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  #   
+  #   w <- if (!is.finite(width_px) || width_px <= 0) "100%" else paste0(width_px, "px")
+  #   
+  #   tags$div(
+  #     style = "margin-bottom:14px; padding:10px; border:1px solid #eee; border-radius:10px; background:#fff;",
+  #     tags$h5(info$title),
+  #     plotOutput(info$id, height = height_px, width = w)
+  #   )
+  # }
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  #   
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  #   
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # # Outer scroll container should be in UI (flex main area with overflow:auto).
+  # # This inner canvas sets a large area to place plots into.
+  # output$manual_diag_canvas_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   canvas_w <- input$diag_canvas_width  %||% 1600
+  #   canvas_h <- input$diag_canvas_height %||% 1800
+  #   canvas_w <- suppressWarnings(as.integer(canvas_w)); if (!is.finite(canvas_w)) canvas_w <- 1600L
+  #   canvas_h <- suppressWarnings(as.integer(canvas_h)); if (!is.finite(canvas_h)) canvas_h <- 1800L
+  #   
+  #   tags$div(
+  #     style = paste0(
+  #       "width:", canvas_w, "px;",
+  #       "min-height:", canvas_h, "px;",
+  #       "background:#fcfcfc;"
+  #     ),
+  #     uiOutput("manual_diag_plots_ui")
+  #   )
+  # })
+  # 
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the left panel to select plots.")
+  #     ))
+  #   }
+  #   
+  #   height_px <- input$diag_plot_height %||% 320
+  #   width_px  <- input$diag_plot_width  %||% 0
+  #   preset    <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   if (preset == "preset_current") {
+  #     row1 <- intersect(c("ts", "acf"), keys)
+  #     row2 <- intersect(c("hist", "qq"), keys)
+  #     rest <- setdiff(keys, c("ts", "acf", "hist", "qq"))
+  #     
+  #     ui <- tagList()
+  #     if (length(row1) > 0) {
+  #       ui <- tagList(ui, fluidRow(lapply(row1, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     }
+  #     if (length(row2) > 0) {
+  #       ui <- tagList(ui, fluidRow(lapply(row2, function(k) column(6, make_diag_plot_output(k, height_px, width_px)))))
+  #     }
+  #     if (length(rest) > 0) {
+  #       ui <- tagList(ui, lapply(rest, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #     }
+  #     return(ui)
+  #   }
+  #   
+  #   if (preset == "preset_two_col") {
+  #     left  <- keys[seq(1, length(keys), by = 2)]
+  #     right <- keys[seq(2, length(keys), by = 2)]
+  #     return(
+  #       fluidRow(
+  #         column(6, lapply(left,  function(k) make_diag_plot_output(k, height_px, width_px))),
+  #         column(6, lapply(right, function(k) make_diag_plot_output(k, height_px, width_px)))
+  #       )
+  #     )
+  #   }
+  #   
+  #   # preset_one_col + preset_custom (one column)
+  #   tagList(lapply(keys, function(k) make_diag_plot_output(k, height_px, width_px)))
+  # })
+  
+  
+  
+  
+  
+  
+  
+  # # ============================================================
+  # # Manual SARIMA Diagnostics — ONLY 2 sliders (plot width/height)
+  # # Auto canvas sizing based on layout + number of plots selected
+  # # Includes NEW diagnostics-only Ljung–Box p-values plot
+  # # Keeps Academic plot output name unchanged
+  # # ============================================================
+  # 
+  # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #                      error = function(e) NULL)
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # ============================================================
+  # # Diagnostics plot outputs (independent)
+  # # ============================================================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  #   
+  #   plot(res, type = "l", main = "Residuals over time", xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  #   
+  #   plot(acf(res, plot = FALSE), main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  #   
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram", xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q–Q plot."))
+  #   
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  #   
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   if (sum(ok) > 20) lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   y   <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  #   
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  # })
+  # 
+  # # NEW diagnostics-only Ljung–Box plot (do NOT reuse academic one)
+  # output$manual_resid_lb_pvals_diag2 <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   ctrl  <- get_diag_controls(input)
+  #   out   <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # # Commentary (kept simple; you can expand later)
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  #   
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   if (N < 8) {
+  #     cat("Diagnostics summary (Manual SARIMA)\n",
+  #         "------------------------------------------------------------\n",
+  #         "- Too few residuals to run diagnostics.\n", sep = "")
+  #     return(invisible())
+  #   }
+  #   
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #                  error = function(e) NULL)
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat("Ljung–Box (lag ", L2, ") p = ", signif(lb$p.value, 3),
+  #         if (lb$p.value > ctrl$alpha) " -> no strong evidence of autocorrelation.\n"
+  #         else " -> remaining autocorrelation; revise orders/differencing.\n",
+  #         sep = "")
+  #   } else {
+  #     cat("Ljung–Box unavailable.\n")
+  #   }
+  # })
+  # 
+  # # ============================================================
+  # # KEEP academic conclusion plot output unchanged
+  # # ============================================================
+  # output$manual_resid_lb_pvals <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   ctrl  <- get_diag_controls(input)
+  #   out   <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Manual SARIMA)")
+  # })
+  # 
+  # # ============================================================
+  # # Diagnostics layout builder + AUTO canvas sizing
+  # # ============================================================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",        title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",       title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",      title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",        title = "Normal Q–Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",    title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",     title = "Scale-location"),
+  #   lb     = list(id = "manual_resid_lb_pvals_diag2", title = "Ljung–Box p-values by lag (Diagnostics)")
+  # )
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  #   
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  #   
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # # Canvas sizing from plot size + layout + number of plots
+  # diag_canvas_dims <- reactive({
+  #   keys   <- get_diag_plot_order()
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   pw <- suppressWarnings(as.integer(input$diag_plot_width))
+  #   ph <- suppressWarnings(as.integer(input$diag_plot_height))
+  #   if (!is.finite(pw) || pw < 300) pw <- 650L
+  #   if (!is.finite(ph) || ph < 200) ph <- 320L
+  #   
+  #   # layout columns
+  #   ncol <- if (preset %in% c("preset_one_col", "preset_custom")) 1L else 2L
+  #   if (preset == "preset_current") ncol <- 2L
+  #   
+  #   n <- length(keys)
+  #   nrow <- if (n == 0) 1L else ceiling(n / ncol)
+  #   
+  #   # add padding/headers per plot "card"
+  #   card_pad_w <- 60L
+  #   card_pad_h <- 90L
+  #   
+  #   canvas_w <- ncol * (pw + card_pad_w) + 40L
+  #   canvas_h <- nrow * (ph + card_pad_h) + 40L
+  #   
+  #   list(w = canvas_w, h = canvas_h, pw = pw, ph = ph, ncol = ncol)
+  # })
+  # 
+  # make_diag_plot_output <- function(plot_key, pw, ph) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  #   
+  #   tags$div(
+  #     style = sprintf(
+  #       "margin-bottom:14px; padding:10px; border:1px solid #eee; border-radius:10px; background:#fff; width:%dpx;",
+  #       pw + 20
+  #     ),
+  #     tags$h5(info$title),
+  #     plotOutput(info$id, height = ph, width = pw)
+  #   )
+  # }
+  # 
+  # # Canvas UI: width/height computed automatically (no extra sliders)
+  # output$manual_diag_canvas_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   dims <- diag_canvas_dims()
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the left panel to select plots.")
+  #     ))
+  #   }
+  #   
+  #   tags$div(
+  #     style = sprintf(
+  #       "width:%dpx; min-height:%dpx; background:#fcfcfc;",
+  #       dims$w, dims$h
+  #     ),
+  #     uiOutput("manual_diag_plots_ui")
+  #   )
+  # })
+  # 
+  # # Plot grid builder uses the same computed plot sizes
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   keys <- get_diag_plot_order()
+  #   dims <- diag_canvas_dims()
+  #   pw <- dims$pw
+  #   ph <- dims$ph
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   if (preset %in% c("preset_one_col", "preset_custom")) {
+  #     return(tagList(lapply(keys, function(k) make_diag_plot_output(k, pw, ph))))
+  #   }
+  #   
+  #   # Two-column layouts
+  #   if (preset == "preset_current" || preset == "preset_two_col") {
+  #     left  <- keys[seq(1, length(keys), by = 2)]
+  #     right <- keys[seq(2, length(keys), by = 2)]
+  #     return(
+  #       fluidRow(
+  #         column(6, lapply(left,  function(k) make_diag_plot_output(k, pw, ph))),
+  #         column(6, lapply(right, function(k) make_diag_plot_output(k, pw, ph)))
+  #       )
+  #     )
+  #   }
+  #   
+  #   # fallback
+  #   tagList(lapply(keys, function(k) make_diag_plot_output(k, pw, ph)))
+  # })
+  
+  
+  # ============================================================
+  # Diagnostics TAB (FULL) — container width slider + plot size sliders
+  # - Slider controls the flex container width (replaces width:100%)
+  # - Only TWO plot sliders: diag_plot_width + diag_plot_height
+  # - NEW Ljung–Box plot for Diagnostics only: manual_resid_lb_pvals_diag2
+  # - Keeps academic conclusion Ljung–Box output: manual_resid_lb_pvals
+  # ============================================================
+  
+  # `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  # nice_par <- function() {
+  #   par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  # }
+  # 
+  # # ---- Shared helpers ----
+  # get_diag_controls <- function(input) {
+  #   L_input <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+  #   
+  #   alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+  #   if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+  #   
+  #   list(L = L, alpha = alpha)
+  # }
+  # 
+  # compute_lb_pvals <- function(res, L, fitdf) {
+  #   res <- as.numeric(res)
+  #   res <- res[is.finite(res)]
+  #   
+  #   N <- length(res)
+  #   if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+  #   
+  #   L <- as.integer(L)
+  #   L <- max(1L, min(L, N - 1L))
+  #   
+  #   pvals <- rep(NA_real_, L)
+  #   for (k in seq_len(L)) {
+  #     if (k > fitdf) {
+  #       bt <- tryCatch(
+  #         stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+  #         error = function(e) NULL
+  #       )
+  #       pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+  #     }
+  #   }
+  #   list(pvals = pvals, L = L, N = N)
+  # }
+  # 
+  # plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+  #   plot(seq_len(L), pvals,
+  #        type = "h", lwd = 2,
+  #        xlab = "Lag (k)",
+  #        ylab = "p-value (Ljung–Box up to lag k)",
+  #        main = main_title,
+  #        ylim = c(0, 1))
+  #   points(seq_len(L), pvals, pch = 16)
+  #   abline(h = alpha, lty = 2, col = "gray40")
+  #   mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+  #         side = 3, line = 0.2, cex = 0.85)
+  #   
+  #   if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+  #     rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+  #          border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+  #     text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+  #   }
+  # }
+  # 
+  # # ============================================================
+  # # Diagnostics plots (independent outputs)
+  # # ============================================================
+  # 
+  # output$manual_resid_ts_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 3, "Not enough residuals to plot."))
+  #   
+  #   plot(res, type = "l",
+  #        main = "Residuals over time",
+  #        xlab = "Time", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  # })
+  # 
+  # output$manual_resid_acf_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+  #   
+  #   plot(acf(res, plot = FALSE), main = "Residual ACF")
+  # })
+  # 
+  # output$manual_resid_hist_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+  #   
+  #   hist(res, breaks = 30, col = "gray85", border = "white",
+  #        main = "Residual histogram", xlab = "Residual")
+  # })
+  # 
+  # output$manual_resid_qq_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   validate(need(length(res) >= 5, "Not enough residuals for Q–Q plot."))
+  #   
+  #   qqnorm(res, main = "Normal Q–Q")
+  #   qqline(res, col = "red", lwd = 2)
+  # })
+  # 
+  # output$manual_resid_fitted_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+  #   
+  #   plot(fv[ok], res[ok],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+  #        main = "Residuals vs fitted",
+  #        xlab = "Fitted values", ylab = "Residual")
+  #   abline(h = 0, col = "gray40", lty = 2)
+  #   if (sum(ok) > 20) {
+  #     lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # output$manual_resid_scale_diag <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   fv  <- as.numeric(fitted(fit))
+  #   ok  <- is.finite(res) & is.finite(fv)
+  #   y   <- sqrt(abs(res))
+  #   ok2 <- ok & is.finite(y)
+  #   validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+  #   
+  #   plot(fv[ok2], y[ok2],
+  #        pch = 16, cex = 0.7,
+  #        col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+  #        main = "Scale-location (sqrt(|res|) vs fitted)",
+  #        xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+  #   if (sum(ok2) > 20) {
+  #     lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+  #   }
+  # })
+  # 
+  # # ------------------------------------------------------------
+  # # NEW: Ljung–Box p-values by lag (Diagnostics ONLY)
+  # # ------------------------------------------------------------
+  # output$manual_resid_lb_pvals_diag2 <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Diagnostics)")
+  # })
+  # 
+  # # ------------------------------------------------------------
+  # # Commentary (Diagnostics tab)
+  # # ------------------------------------------------------------
+  # output$manual_diag_commentary_diag <- renderPrint({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   N   <- length(res)
+  #   
+  #   ctrl  <- get_diag_controls(input)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   if (N < 8) {
+  #     cat("Diagnostics summary (Manual SARIMA)\n",
+  #         "------------------------------------------------------------\n",
+  #         "- Too few residuals to run diagnostics.\n", sep = "")
+  #     return(invisible())
+  #   }
+  #   
+  #   L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+  #   lb <- tryCatch(
+  #     stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+  #     error = function(e) NULL
+  #   )
+  #   
+  #   cat("Diagnostics summary (Manual SARIMA)\n")
+  #   cat("------------------------------------------------------------\n")
+  #   if (!is.null(lb) && is.finite(lb$p.value)) {
+  #     cat("Ljung–Box (lag ", L2, ") p = ", signif(lb$p.value, 3),
+  #         if (lb$p.value > ctrl$alpha) " -> no strong evidence of autocorrelation.\n"
+  #         else " -> remaining autocorrelation; revise orders/differencing.\n",
+  #         sep = "")
+  #   } else {
+  #     cat("Ljung–Box unavailable.\n")
+  #   }
+  #   
+  #   cat("\nNotes:\n")
+  #   cat("- Use Residual ACF + Ljung–Box together: spikes + small p-values suggest underfitting.\n")
+  #   cat("- If Q–Q shows heavy tails: intervals/inference may be optimistic.\n")
+  # })
+  # 
+  # # ============================================================
+  # # KEEP: Academic conclusion plot output unchanged
+  # # ============================================================
+  # output$manual_resid_lb_pvals <- renderPlot({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+  #   fit <- manual_fit()
+  #   nice_par()
+  #   
+  #   res   <- residuals(fit)
+  #   fitdf <- length(coef(fit))
+  #   
+  #   ctrl <- get_diag_controls(input)
+  #   out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+  #   
+  #   validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+  #   validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+  #   
+  #   plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+  #                 main_title = "Ljung–Box p-values by lag (Manual SARIMA)")
+  # })
+  # 
+  # # ============================================================
+  # # Layout builder + auto canvas sizing from ONLY plot width/height
+  # # ============================================================
+  # 
+  # manual_diag_plot_map <- list(
+  #   ts     = list(id = "manual_resid_ts_diag",        title = "Residuals over time"),
+  #   acf    = list(id = "manual_resid_acf_diag",       title = "Residual ACF"),
+  #   hist   = list(id = "manual_resid_hist_diag",      title = "Residual histogram"),
+  #   qq     = list(id = "manual_resid_qq_diag",        title = "Normal Q–Q"),
+  #   fitted = list(id = "manual_resid_fitted_diag",    title = "Residuals vs fitted"),
+  #   scale  = list(id = "manual_resid_scale_diag",     title = "Scale-location"),
+  #   lb     = list(id = "manual_resid_lb_pvals_diag2", title = "Ljung–Box p-values by lag (Diagnostics)")
+  # )
+  # 
+  # get_diag_plot_order <- reactive({
+  #   sel <- input$diag_plots_selected
+  #   if (is.null(sel) || length(sel) == 0) return(character(0))
+  #   
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   if (preset != "preset_custom") {
+  #     default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+  #     return(default_order[default_order %in% sel])
+  #   }
+  #   
+  #   pos <- c(
+  #     ts     = input$pos_ts,
+  #     acf    = input$pos_acf,
+  #     hist   = input$pos_hist,
+  #     qq     = input$pos_qq,
+  #     fitted = input$pos_fitted,
+  #     scale  = input$pos_scale,
+  #     lb     = input$pos_lb
+  #   )
+  #   pos <- pos[names(pos) %in% sel]
+  #   pos_num <- suppressWarnings(as.numeric(pos))
+  #   pos_num[!is.finite(pos_num)] <- 999
+  #   ord <- order(pos_num, names(pos_num))
+  #   names(pos_num)[ord]
+  # })
+  # 
+  # # Canvas dimensions computed from plot size + how many plots + layout
+  # diag_canvas_dims <- reactive({
+  #   keys   <- get_diag_plot_order()
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   pw <- suppressWarnings(as.integer(input$diag_plot_width))
+  #   ph <- suppressWarnings(as.integer(input$diag_plot_height))
+  #   if (!is.finite(pw) || pw < 300) pw <- 650L
+  #   if (!is.finite(ph) || ph < 200) ph <- 320L
+  #   
+  #   # Use 2 columns for current/two_col; 1 column for one_col/custom
+  #   ncol <- if (preset %in% c("preset_one_col", "preset_custom")) 1L else 2L
+  #   
+  #   n <- length(keys)
+  #   nrow <- if (n == 0) 1L else ceiling(n / ncol)
+  #   
+  #   # Card padding and heading space
+  #   pad_w <- 60L
+  #   pad_h <- 110L
+  #   
+  #   canvas_w <- ncol * (pw + pad_w) + 40L
+  #   canvas_h <- nrow * (ph + pad_h) + 40L
+  #   
+  #   list(w = canvas_w, h = canvas_h, pw = pw, ph = ph)
+  # })
+  # 
+  # make_diag_plot_output <- function(plot_key, pw, ph) {
+  #   info <- manual_diag_plot_map[[plot_key]]
+  #   if (is.null(info)) return(NULL)
+  #   
+  #   tags$div(
+  #     style = sprintf(
+  #       "margin-bottom:14px; padding:10px; border:1px solid #eee; border-radius:10px; background:#fff; width:%dpx;",
+  #       pw + 30
+  #     ),
+  #     tags$h5(info$title),
+  #     plotOutput(info$id, width = pw, height = ph)
+  #   )
+  # }
+  # 
+  # output$manual_diag_plots_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   keys <- get_diag_plot_order()
+  #   if (length(keys) == 0) {
+  #     return(tags$div(
+  #       style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+  #       tags$strong("No plots selected."),
+  #       tags$p("Use the left panel to select plots.")
+  #     ))
+  #   }
+  #   
+  #   dims <- diag_canvas_dims()
+  #   pw <- dims$pw
+  #   ph <- dims$ph
+  #   preset <- input$diag_layout_preset %||% "preset_current"
+  #   
+  #   if (preset %in% c("preset_one_col", "preset_custom")) {
+  #     return(tagList(lapply(keys, function(k) make_diag_plot_output(k, pw, ph))))
+  #   }
+  #   
+  #   # Two-column
+  #   left  <- keys[seq(1, length(keys), by = 2)]
+  #   right <- keys[seq(2, length(keys), by = 2)]
+  #   fluidRow(
+  #     column(6, lapply(left,  function(k) make_diag_plot_output(k, pw, ph))),
+  #     column(6, lapply(right, function(k) make_diag_plot_output(k, pw, ph)))
+  #   )
+  # })
+  # 
+  # output$manual_diag_canvas_ui <- renderUI({
+  #   validate(need(input$fit_manual > 0, "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+  #   
+  #   dims <- diag_canvas_dims()
+  #   keys <- get_diag_plot_order()
+  #   
+  #   if (length(keys) == 0) return(NULL)
+  #   
+  #   tags$div(
+  #     style = sprintf("width:%dpx; min-height:%dpx; background:#fcfcfc;", dims$w, dims$h),
+  #     uiOutput("manual_diag_plots_ui")
+  #   )
+  # })
+  # 
+  # # ============================================================
+  # # FULL Diagnostics container UI (THIS is where width:100% becomes slider-driven)
+  # # ============================================================
+  # 
+  # output$diag_container_ui <- renderUI({
+  #   # Container width slider controls what used to be width:100%
+  #   container_w <- suppressWarnings(as.integer(input$diag_container_width_px))
+  #   if (!is.finite(container_w) || container_w <= 0) container_w <- 1600L
+  #   
+  #   tags$div(
+  #     style = sprintf("
+  #     display:flex;
+  #     gap:12px;
+  #     align-items:flex-start;
+  #     width:%dpx;          /* <-- THIS replaces width:100% */
+  #     max-width:none;
+  #   ", container_w),
+  #     
+  #     # Sidebar
+  #     tags$div(
+  #       style = "
+  #       flex:0 0 320px;
+  #       max-width:320px;
+  #       border:1px solid #e5e5e5;
+  #       border-radius:10px;
+  #       padding:10px;
+  #       background:#fff;
+  #       max-height:85vh;
+  #       overflow-y:auto;
+  #     ",
+  #       
+  #       tags$h4("Diagnostics layout builder"),
+  #       
+  #       selectInput(
+  #         "diag_layout_preset",
+  #         "Layout preset",
+  #         choices = c(
+  #           "Current layout (2x2 + Ljung-Box + Conclusion)" = "preset_current",
+  #           "Two columns (all plots, stacked)"             = "preset_two_col",
+  #           "Single column (all plots, stacked)"           = "preset_one_col",
+  #           "Custom order (choose positions below)"        = "preset_custom"
+  #         ),
+  #         selected = input$diag_layout_preset %||% "preset_current"
+  #       ),
+  #       
+  #       tags$hr(),
+  #       
+  #       checkboxGroupInput(
+  #         "diag_plots_selected",
+  #         "Plots to display",
+  #         choices = c(
+  #           "Residuals over time"                          = "ts",
+  #           "Residual ACF"                                 = "acf",
+  #           "Residual histogram"                           = "hist",
+  #           "Normal Q-Q"                                   = "qq",
+  #           "Residuals vs fitted"                          = "fitted",
+  #           "Scale-location (sqrt(|res|) vs fitted)"       = "scale",
+  #           "Ljung–Box p-values by lag"                    = "lb"
+  #         ),
+  #         selected = input$diag_plots_selected %||% c("ts","acf","hist","qq","lb","fitted","scale")
+  #       ),
+  #       
+  #       tags$hr(),
+  #       
+  #       # The slider you asked for: controls the flex container width
+  #       sliderInput(
+  #         "diag_container_width_px",
+  #         "Diagnostics container width (px)",
+  #         min = 900, max = 6000, value = container_w, step = 50
+  #       ),
+  #       helpText("This changes the flex container width that used to be width:100%. Scroll horizontally if it exceeds your screen."),
+  #       
+  #       tags$hr(),
+  #       
+  #       # ONLY TWO plot sliders
+  #       sliderInput(
+  #         "diag_plot_width",
+  #         "Plot width (px)",
+  #         min = 300, max = 2500, value = input$diag_plot_width %||% 650, step = 25
+  #       ),
+  #       sliderInput(
+  #         "diag_plot_height",
+  #         "Plot height (px)",
+  #         min = 200, max = 1400, value = input$diag_plot_height %||% 320, step = 10
+  #       ),
+  #       
+  #       tags$hr(),
+  #       
+  #       checkboxInput(
+  #         "diag_show_conclusion",
+  #         "Show academic conclusion panel",
+  #         value = isTRUE(input$diag_show_conclusion %||% TRUE)
+  #       ),
+  #       
+  #       conditionalPanel(
+  #         condition = "input.diag_layout_preset == 'preset_custom'",
+  #         tags$h5("Custom positions (1 = first)"),
+  #         helpText("Give each enabled plot a position. Ties are broken by name."),
+  #         numericInput("pos_ts",     "Residuals over time position", value = input$pos_ts %||% 1, min = 1, step = 1),
+  #         numericInput("pos_acf",    "Residual ACF position",        value = input$pos_acf %||% 2, min = 1, step = 1),
+  #         numericInput("pos_hist",   "Histogram position",           value = input$pos_hist %||% 3, min = 1, step = 1),
+  #         numericInput("pos_qq",     "Q-Q position",                 value = input$pos_qq %||% 4, min = 1, step = 1),
+  #         numericInput("pos_fitted", "Residuals vs fitted position", value = input$pos_fitted %||% 5, min = 1, step = 1),
+  #         numericInput("pos_scale",  "Scale-location position",      value = input$pos_scale %||% 6, min = 1, step = 1),
+  #         numericInput("pos_lb",     "Ljung–Box p-values position",  value = input$pos_lb %||% 7, min = 1, step = 1)
+  #       )
+  #     ),
+  #     
+  #     # Right panel (scrolls)
+  #     tags$div(
+  #       style = "
+  #       flex:1 1 auto;
+  #       border:1px solid #e5e5e5;
+  #       border-radius:10px;
+  #       background:#fcfcfc;
+  #       padding:10px;
+  #       overflow:auto;
+  #       max-height:85vh;
+  #     ",
+  #       
+  #       tags$div(
+  #         style = "margin-bottom:12px;",
+  #         tags$h4("Residual diagnostics (Manual SARIMA)"),
+  #         tags$p("Use the container width + plot width/height sliders. Scroll right/down to see everything.")
+  #       ),
+  #       
+  #       uiOutput("manual_diag_canvas_ui"),
+  #       
+  #       conditionalPanel(
+  #         condition = "input.diag_show_conclusion == true",
+  #         tags$h4("Academic conclusion (Diagnostics)"),
+  #         tags$div(
+  #           style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#ffffff;",
+  #           verbatimTextOutput("manual_diag_commentary_diag")
+  #         )
+  #       )
+  #     )
+  #   )
+  # })
+  
+  
+  
+  
+  # ============================================================
+  # ✅ DIAGNOSTICS (COPY/PASTE COMPLETE SERVER CODE)
+  # Fixes:
+  # - NO more "valeur manquante là où TRUE/FALSE est requis"
+  # - safe handling for NULL inputs (fit_manual, preset, sliders)
+  # - Diagnostics-only Ljung–Box p-values plot: manual_resid_lb_pvals_diag2
+  # - Keeps Academic conclusion plot name unchanged: manual_resid_lb_pvals
+  # - Only TWO plot sliders used: diag_plot_width, diag_plot_height
+  # - Container width slider: diag_container_width_px controls the flex width
+  #
+  # REQUIRED UI:
+  # - tabPanel("Diagnostics", uiOutput("diag_container_ui"))
+  # - plus: tags$head(tags$style(HTML("body { overflow-x: auto; }")))
+  # ============================================================
+  
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  # ---------- SAFE helpers (prevent logical(0) / NA in if/need) ----------
+  safe_chr1 <- function(x, default) {
+    if (is.null(x) || length(x) == 0 || is.na(x[1])) return(default)
+    as.character(x[1])
+  }
+  
+  safe_int1 <- function(x, default) {
+    y <- suppressWarnings(as.integer(x))
+    if (is.null(y) || length(y) == 0 || !is.finite(y[1])) return(default)
+    y[1]
+  }
+  
+  fit_manual_clicked <- function(input) {
+    fm <- input$fit_manual
+    isTRUE(!is.null(fm) && length(fm) > 0 && is.finite(fm) && fm > 0)
+  }
+  
+  nice_par <- function() {
+    par(mar = c(4, 4, 2.2, 1), mgp = c(2.2, 0.7, 0), las = 1)
+  }
+  
+  # ---- Shared helpers ----
+  get_diag_controls <- function(input) {
+    L_input <- suppressWarnings(as.integer(input$diag_lag))
+    L <- if (is.finite(L_input) && L_input > 0) L_input else 12L
+    
+    alpha <- suppressWarnings(as.numeric(input$alphaSt2))
+    if (!is.finite(alpha) || alpha <= 0 || alpha >= 1) alpha <- 0.05
+    
+    list(L = L, alpha = alpha)
+  }
+  
+  compute_lb_pvals <- function(res, L, fitdf) {
+    res <- as.numeric(res)
+    res <- res[is.finite(res)]
+    
+    N <- length(res)
+    if (N < 8) return(list(pvals = numeric(0), L = 0L, N = N))
+    
+    L <- as.integer(L)
+    L <- max(1L, min(L, N - 1L))
+    
+    pvals <- rep(NA_real_, L)
+    for (k in seq_len(L)) {
+      if (k > fitdf) {
+        bt <- tryCatch(
+          stats::Box.test(res, lag = k, type = "Ljung-Box", fitdf = fitdf),
+          error = function(e) NULL
+        )
+        pvals[k] <- if (!is.null(bt)) as.numeric(bt$p.value) else NA_real_
+      }
+    }
+    list(pvals = pvals, L = L, N = N)
+  }
+  
+  plot_lb_pvals <- function(pvals, L, alpha, fitdf, main_title) {
+    plot(seq_len(L), pvals,
+         type = "h", lwd = 2,
+         xlab = "Lag (k)",
+         ylab = "p-value (Ljung–Box up to lag k)",
+         main = main_title,
+         ylim = c(0, 1))
+    points(seq_len(L), pvals, pch = 16)
+    abline(h = alpha, lty = 2, col = "gray40")
+    mtext(sprintf("alpha = %.3f, fitdf = %d", alpha, fitdf),
+          side = 3, line = 0.2, cex = 0.85)
+    
+    if (is.finite(fitdf) && fitdf >= 1 && fitdf < L) {
+      rect(xleft = 0.5, ybottom = -0.02, xright = fitdf + 0.5, ytop = 1.02,
+           border = NA, col = grDevices::adjustcolor("gray", alpha.f = 0.15))
+      text(x = (fitdf + 1) / 2, y = 0.95, labels = "df ≤ 0 (omitted)", cex = 0.8)
+    }
+  }
+  
+  # ============================================================
+  # Diagnostics plots (independent outputs)
+  # ============================================================
+  
+  output$manual_resid_ts_diag <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res <- as.numeric(residuals(fit))
+    res <- res[is.finite(res)]
+    validate(need(length(res) >= 3, "Not enough residuals to plot."))
+    
+    plot(res, type = "l",
+         main = "Residuals over time",
+         xlab = "Time", ylab = "Residual")
+    abline(h = 0, col = "gray40", lty = 2)
+  })
+  
+  output$manual_resid_acf_diag <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res <- as.numeric(residuals(fit))
+    res <- res[is.finite(res)]
+    validate(need(length(res) >= 5, "Not enough residuals for ACF."))
+    
+    plot(acf(res, plot = FALSE), main = "Residual ACF")
+  })
+  
+  output$manual_resid_hist_diag <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res <- as.numeric(residuals(fit))
+    res <- res[is.finite(res)]
+    validate(need(length(res) >= 5, "Not enough residuals for histogram."))
+    
+    hist(res, breaks = 30, col = "gray85", border = "white",
+         main = "Residual histogram", xlab = "Residual")
+  })
+  
+  output$manual_resid_qq_diag <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res <- as.numeric(residuals(fit))
+    res <- res[is.finite(res)]
+    validate(need(length(res) >= 5, "Not enough residuals for Q–Q plot."))
+    
+    qqnorm(res, main = "Normal Q–Q")
+    qqline(res, col = "red", lwd = 2)
+  })
+  
+  output$manual_resid_fitted_diag <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res <- as.numeric(residuals(fit))
+    fv  <- as.numeric(fitted(fit))
+    ok  <- is.finite(res) & is.finite(fv)
+    validate(need(sum(ok) >= 10, "Not enough valid points for residuals vs fitted."))
+    
+    plot(fv[ok], res[ok],
+         pch = 16, cex = 0.7,
+         col = grDevices::adjustcolor("steelblue", alpha.f = 0.7),
+         main = "Residuals vs fitted",
+         xlab = "Fitted values", ylab = "Residual")
+    abline(h = 0, col = "gray40", lty = 2)
+    if (sum(ok) > 20) {
+      lines(stats::lowess(fv[ok], res[ok], f = 2/3), col = "tomato", lwd = 2)
+    }
+  })
+  
+  output$manual_resid_scale_diag <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res <- as.numeric(residuals(fit))
+    fv  <- as.numeric(fitted(fit))
+    ok  <- is.finite(res) & is.finite(fv)
+    y   <- sqrt(abs(res))
+    ok2 <- ok & is.finite(y)
+    validate(need(sum(ok2) >= 10, "Not enough valid points for scale-location plot."))
+    
+    plot(fv[ok2], y[ok2],
+         pch = 16, cex = 0.7,
+         col = grDevices::adjustcolor("darkgreen", alpha.f = 0.65),
+         main = "Scale-location (sqrt(|res|) vs fitted)",
+         xlab = "Fitted values", ylab = expression(sqrt("|Residual|")))
+    if (sum(ok2) > 20) {
+      lines(stats::lowess(fv[ok2], y[ok2], f = 2/3), col = "tomato", lwd = 2)
+    }
+  })
+  
+  # ------------------------------------------------------------
+  # NEW: Ljung–Box p-values by lag (Diagnostics ONLY)
+  # ------------------------------------------------------------
+  output$manual_resid_lb_pvals_diag2 <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res   <- residuals(fit)
+    fitdf <- length(coef(fit))
+    
+    ctrl <- get_diag_controls(input)
+    out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+    
+    validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+    validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+    
+    plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+                  main_title = "Ljung–Box p-values by lag (Diagnostics)")
+  })
+  
+  # ------------------------------------------------------------
+  # Commentary (Diagnostics tab)
+  # ------------------------------------------------------------
+  output$manual_diag_commentary_diag <- renderPrint({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    
+    res <- as.numeric(residuals(fit))
+    res <- res[is.finite(res)]
+    N   <- length(res)
+    
+    ctrl  <- get_diag_controls(input)
+    fitdf <- length(coef(fit))
+    
+    if (N < 8) {
+      cat("Diagnostics summary (Manual SARIMA)\n",
+          "------------------------------------------------------------\n",
+          "- Too few residuals to run diagnostics.\n", sep = "")
+      return(invisible())
+    }
+    
+    L2 <- max(1L, min(as.integer(ctrl$L), N - 1L))
+    lb <- tryCatch(
+      stats::Box.test(res, lag = L2, type = "Ljung-Box", fitdf = fitdf),
+      error = function(e) NULL
+    )
+    
+    cat("Diagnostics summary (Manual SARIMA)\n")
+    cat("------------------------------------------------------------\n")
+    if (!is.null(lb) && is.finite(lb$p.value)) {
+      cat("Ljung–Box (lag ", L2, ") p = ", signif(lb$p.value, 3),
+          if (lb$p.value > ctrl$alpha) " -> no strong evidence of autocorrelation.\n"
+          else " -> remaining autocorrelation; revise orders/differencing.\n",
+          sep = "")
+    } else {
+      cat("Ljung–Box unavailable.\n")
+    }
+    
+    cat("\nNotes:\n")
+    cat("- Use Residual ACF + Ljung–Box together: spikes + small p-values suggest underfitting.\n")
+    cat("- If Q–Q shows heavy tails: intervals/inference may be optimistic.\n")
+  })
+  
+  # ============================================================
+  # KEEP: Academic conclusion plot output unchanged
+  # ============================================================
+  output$manual_resid_lb_pvals <- renderPlot({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) to generate diagnostics."))
+    req(manual_fit())
+    fit <- manual_fit()
+    nice_par()
+    
+    res   <- residuals(fit)
+    fitdf <- length(coef(fit))
+    
+    ctrl <- get_diag_controls(input)
+    out  <- compute_lb_pvals(res, L = ctrl$L, fitdf = fitdf)
+    
+    validate(need(out$N >= 8, "Too few residuals (N < 8) to compute Ljung–Box p-values."))
+    validate(need(out$L >= 1, "No valid lags available for Ljung–Box p-values."))
+    
+    plot_lb_pvals(out$pvals, out$L, ctrl$alpha, fitdf,
+                  main_title = "Ljung–Box p-values by lag (Manual SARIMA)")
+  })
+  
+  # ============================================================
+  # Layout builder + auto canvas sizing from ONLY plot width/height
+  # ============================================================
+  
+  manual_diag_plot_map <- list(
+    ts     = list(id = "manual_resid_ts_diag",        title = "Residuals over time"),
+    acf    = list(id = "manual_resid_acf_diag",       title = "Residual ACF"),
+    hist   = list(id = "manual_resid_hist_diag",      title = "Residual histogram"),
+    qq     = list(id = "manual_resid_qq_diag",        title = "Normal Q–Q"),
+    fitted = list(id = "manual_resid_fitted_diag",    title = "Residuals vs fitted"),
+    scale  = list(id = "manual_resid_scale_diag",     title = "Scale-location"),
+    lb     = list(id = "manual_resid_lb_pvals_diag2", title = "Ljung–Box p-values by lag (Diagnostics)")
+  )
+  
+  get_diag_plot_order <- reactive({
+    sel <- input$diag_plots_selected
+    if (is.null(sel) || length(sel) == 0) return(character(0))
+    
+    preset <- safe_chr1(input$diag_layout_preset, "preset_current")
+    
+    if (!identical(preset, "preset_custom")) {
+      default_order <- c("ts", "acf", "hist", "qq", "fitted", "scale", "lb")
+      return(default_order[default_order %in% sel])
+    }
+    
+    pos <- c(
+      ts     = input$pos_ts,
+      acf    = input$pos_acf,
+      hist   = input$pos_hist,
+      qq     = input$pos_qq,
+      fitted = input$pos_fitted,
+      scale  = input$pos_scale,
+      lb     = input$pos_lb
+    )
+    pos <- pos[names(pos) %in% sel]
+    pos_num <- suppressWarnings(as.numeric(pos))
+    pos_num[!is.finite(pos_num)] <- 999
+    ord <- order(pos_num, names(pos_num))
+    names(pos_num)[ord]
+  })
+  
+  diag_canvas_dims <- reactive({
+    keys   <- get_diag_plot_order()
+    preset <- safe_chr1(input$diag_layout_preset, "preset_current")
+    
+    pw <- safe_int1(input$diag_plot_width, 650L)
+    ph <- safe_int1(input$diag_plot_height, 320L)
+    
+    # If you want to allow "auto width", set slider min >=300; we keep px always.
+    if (pw < 300) pw <- 300L
+    if (ph < 200) ph <- 200L
+    
+    ncol <- if (identical(preset, "preset_one_col") || identical(preset, "preset_custom")) 1L else 2L
+    n <- length(keys)
+    nrow <- if (n == 0) 1L else ceiling(n / ncol)
+    
+    pad_w <- 60L
+    pad_h <- 110L
+    
+    canvas_w <- ncol * (pw + pad_w) + 40L
+    canvas_h <- nrow * (ph + pad_h) + 40L
+    
+    list(w = canvas_w, h = canvas_h, pw = pw, ph = ph)
+  })
+  
+  make_diag_plot_output <- function(plot_key, pw, ph) {
+    info <- manual_diag_plot_map[[plot_key]]
+    if (is.null(info)) return(NULL)
+    
+    tags$div(
+      style = sprintf(
+        "margin-bottom:14px; padding:10px; border:1px solid #eee; border-radius:10px; background:#fff; width:%dpx;",
+        pw + 30
+      ),
+      tags$h5(info$title),
+      plotOutput(info$id, width = pw, height = ph)
+    )
+  }
+  
+  output$manual_diag_plots_ui <- renderUI({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+    
+    keys <- get_diag_plot_order()
+    if (length(keys) == 0) {
+      return(tags$div(
+        style = "padding:10px;border:1px dashed #ccc;border-radius:10px;background:#fff;",
+        tags$strong("No plots selected."),
+        tags$p("Use the left panel to select plots.")
+      ))
+    }
+    
+    dims <- diag_canvas_dims()
+    pw <- dims$pw
+    ph <- dims$ph
+    preset <- safe_chr1(input$diag_layout_preset, "preset_current")
+    
+    if (identical(preset, "preset_one_col") || identical(preset, "preset_custom")) {
+      return(tagList(lapply(keys, function(k) make_diag_plot_output(k, pw, ph))))
+    }
+    
+    left  <- keys[seq(1, length(keys), by = 2)]
+    right <- keys[seq(2, length(keys), by = 2)]
+    fluidRow(
+      column(6, lapply(left,  function(k) make_diag_plot_output(k, pw, ph))),
+      column(6, lapply(right, function(k) make_diag_plot_output(k, pw, ph)))
+    )
+  })
+  
+  output$manual_diag_canvas_ui <- renderUI({
+    validate(need(fit_manual_clicked(input), "Click 'Fit' (Manual SARIMA) first, then diagnostics will appear."))
+    
+    dims <- diag_canvas_dims()
+    keys <- get_diag_plot_order()
+    if (length(keys) == 0) return(NULL)
+    
+    tags$div(
+      style = sprintf("width:%dpx; min-height:%dpx; background:#fcfcfc;", dims$w, dims$h),
+      uiOutput("manual_diag_plots_ui")
+    )
+  })
+  
+  # ============================================================
+  # FULL Diagnostics container UI (slider-driven width)
+  # ============================================================
+  
+  output$diag_container_ui <- renderUI({
+    container_w <- safe_int1(input$diag_container_width_px, 1600L)
+    if (container_w < 900) container_w <- 900L
+    
+    # keep selected values stable even if UI rebuilds
+    preset_now <- safe_chr1(input$diag_layout_preset, "preset_current")
+    sel_now    <- input$diag_plots_selected %||% c("ts","acf","hist","qq","lb","fitted","scale")
+    pw_now     <- safe_int1(input$diag_plot_width, 450L)
+    ph_now     <- safe_int1(input$diag_plot_height, 320L)
+    show_conc  <- isTRUE(input$diag_show_conclusion %||% TRUE)
+    
+    tags$div(
+      style = sprintf("
+      display:flex;
+      gap:12px;
+      align-items:flex-start;
+      width:%dpx;
+      max-width:none;
+    ", container_w),
+      
+      # Sidebar
+      tags$div(
+        style = "
+        flex:0 0 220px;
+        max-width:320px;
+        border:1px solid #e5e5e5;
+        border-radius:10px;
+        padding:10px;
+        background:#fff;
+        max-height:85vh;
+        overflow-y:auto;
+      ",
+        
+        tags$h4("Diagnostics layout builder"),
+        
+        selectInput(
+          "diag_layout_preset",
+          "Layout preset",
+          choices = c(
+            "Current layout" = "preset_current",
+            "Two columns"    = "preset_two_col",
+            "Single column"  = "preset_one_col",
+            "Custom order"   = "preset_custom"
+          ),
+          selected = preset_now
+        ),
+        
+        tags$hr(),
+        
+        checkboxGroupInput(
+          "diag_plots_selected",
+          "Plots to display",
+          choices = c(
+            "Residuals over time"                          = "ts",
+            "Residual ACF"                                 = "acf",
+            "Residual histogram"                           = "hist",
+            "Normal Q-Q"                                   = "qq",
+            "Residuals vs fitted"                          = "fitted",
+            "Scale-location (sqrt(|res|) vs fitted)"       = "scale",
+            "Ljung–Box p-values by lag"                    = "lb"
+          ),
+          selected = sel_now
+        ),
+        
+        tags$hr(),
+        
+        sliderInput(
+          "diag_container_width_px",
+          "Container width (px)",
+          min = 1000, max = 5000, value = container_w, step = 50
+        ),
+        # helpText("Controls the whole Diagnostics width (was width:100%). Scroll horizontally if needed."),
+        
+        tags$hr(),
+        
+        # ONLY TWO plot sliders
+        sliderInput(
+          "diag_plot_width",
+          "Plot width (px)",
+          min = 300, max = 2500, value = pw_now, step = 25
+        ),
+        sliderInput(
+          "diag_plot_height",
+          "Plot height (px)",
+          min = 200, max = 1400, value = ph_now, step = 10
+        ),
+        
+        tags$hr(),
+        
+        checkboxInput("diag_show_conclusion", "Show academic conclusion panel", value = show_conc),
+        
+        conditionalPanel(
+          condition = "input.diag_layout_preset == 'preset_custom'",
+          tags$h5("Custom positions (1 = first)"),
+          helpText("Give each enabled plot a position. Ties are broken by name."),
+          numericInput("pos_ts",     "Residuals over time position", value = safe_int1(input$pos_ts, 1L), min = 1, step = 1),
+          numericInput("pos_acf",    "Residual ACF position",        value = safe_int1(input$pos_acf, 2L), min = 1, step = 1),
+          numericInput("pos_hist",   "Histogram position",           value = safe_int1(input$pos_hist, 3L), min = 1, step = 1),
+          numericInput("pos_qq",     "Q-Q position",                 value = safe_int1(input$pos_qq, 4L), min = 1, step = 1),
+          numericInput("pos_fitted", "Residuals vs fitted position", value = safe_int1(input$pos_fitted, 5L), min = 1, step = 1),
+          numericInput("pos_scale",  "Scale-location position",      value = safe_int1(input$pos_scale, 6L), min = 1, step = 1),
+          numericInput("pos_lb",     "Ljung–Box p-values position",  value = safe_int1(input$pos_lb, 7L), min = 1, step = 1)
+        )
+      ),
+      
+      # Right panel
+      tags$div(
+        style = "
+        flex:1 1 auto;
+        border:1px solid #e5e5e5;
+        border-radius:10px;
+        background:#fcfcfc;
+        padding:10px;
+        overflow:auto;
+        max-height:85vh;
+      ",
+        
+        tags$div(
+          style = "margin-bottom:12px;",
+          tags$h4("Residual diagnostics (Manual SARIMA)"),
+          tags$p("Use container width + plot width/height. Scroll right/down to see everything.")
+        ),
+        
+        uiOutput("manual_diag_canvas_ui"),
+        
+        conditionalPanel(
+          condition = "input.diag_show_conclusion == true",
+          tags$h4("Academic conclusion (Diagnostics)"),
+          tags$div(
+            style = "padding:10px;border:1px solid #e5e5e5;border-radius:10px;background:#ffffff;",
+            verbatimTextOutput("manual_diag_commentary_diag")
+          )
+        )
+      )
+    )
+  })
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
+  # ---------------------------------------------   # --------------------------------------------- 
   # --------------------------------------------- 
   
   # output$manual_diag_tests <- renderText({ req(manual_fit()); diag_tests_text(residuals(manual_fit()), lag = as.numeric(input$diag_lag), fitdf = length(coef(manual_fit()))) })
@@ -3448,243 +11061,216 @@ server <- function(input, output, session) {
   
   
   
-  
-  
-  # --- MOD: Replace/Update your manual_equations() reactive with this FULL version ---
-  # manual_equations <- reactive({
-  #   req(manual_fit(), ts_train_test())
-  #   
-  #   fit <- manual_fit()
-  #   coefs <- coef(fit)
-  #   
-  #   # Orders
-  #   p <- as.integer(input$p); d <- as.integer(input$d); q <- as.integer(input$q)
-  #   P <- as.integer(input$P); D <- as.integer(input$D); Q <- as.integer(input$Q)
-  #   
-  #   # Seasonal period (never NA)
-  #   s <- if (!is.na(input$s) && input$s >= 1) {
-  #     as.integer(input$s)
-  #   } else {
-  #     f <- frequency(ts_train_test()$ts_train)
-  #     if (is.na(f) || f < 1) 1L else as.integer(f)
-  #   }
-  #   
-  #   ip <- if (p > 0) seq_len(p) else integer(0)
-  #   iq <- if (q > 0) seq_len(q) else integer(0)
-  #   iP <- if (P > 0) seq_len(P) else integer(0)
-  #   iQ <- if (Q > 0) seq_len(Q) else integer(0)
-  #   
-  #   # Intercept/mean (show only if not ~0)
-  #   intercept_name <- intersect(c("intercept", "mean"), names(coefs))
-  #   intercept_val <- if (length(intercept_name) > 0) unname(coefs[intercept_name[1]]) else 0
-  #   show_intercept <- is.finite(intercept_val) && abs(intercept_val) > 1e-8
-  #   intercept_num <- if (show_intercept) sprintf("%.3f", intercept_val) else ""
-  #   
-  #   # Drift
-  #   drift_sym <- if (isTRUE(input$manual_drift)) " + \\delta t" else ""
-  #   drift_val <- if (isTRUE(input$manual_drift) && "drift" %in% names(coefs)) unname(coefs["drift"]) else NA_real_
-  #   drift_num <- if (isTRUE(input$manual_drift) && is.finite(drift_val) && abs(drift_val) > 1e-8) {
-  #     paste0(" + ", sprintf("%.3f", drift_val), "t")
-  #   } else if (isTRUE(input$manual_drift)) {
-  #     " + \\delta t"
-  #   } else ""
-  #   
-  #   # --- MOD: MathJax-safe equation blocks ---
-  #   # Use \\[ ... \\] and align with aligned/array (supported).
-  #   tex_display <- function(x) paste0("\\[", x, "\\]")
-  #   
-  #   # --- MOD: clean cosmetics in numeric equation line ---
-  #   simplify_tex <- function(x) {
-  #     x <- gsub("\\(1\\)", "", x)                      # remove (1)
-  #     x <- gsub("\\s+", " ", x)                        # normalize spaces
-  #     x <- gsub("\\+\\s*\\+", "+", x)                  # ++ -> +
-  #     x <- gsub("\\+\\s*-", "-", x)                    # +- -> -
-  #     x <- gsub("-\\s*\\+", "-", x)                    # -+ -> -
-  #     x <- gsub("-\\s*-", "+", x)                      # -- -> +
-  #     x <- gsub("\\s*\\+\\s*0\\.000\\b", "", x)        # remove + 0.000
-  #     # x <- gsub("\\b0\\.000\\s*\\+\\s*", "", x)        # remove leading 0.000 +
-  #     # x <- gsub("\\s*\\+\\s*0\\b", "", x)              # remove + 0
-  #     # x <- gsub("\\b0\\s*\\+\\s*", "", x)              # remove leading 0 +
-  #     trimws(x)
-  #   }
-  #   
-  #   # Parameter-polynomial strings (line 3)
-  #   poly_param_ar  <- function() if (p == 0) "1" else paste0("1", paste0(" - \\phi_{", ip, "}L^{", ip, "}", collapse = ""))
-  #   poly_param_sar <- function() if (P == 0) "1" else paste0("1", paste0(" - \\Phi_{", iP, "}L^{", s * iP, "}", collapse = ""))
-  #   poly_param_ma  <- function() if (q == 0) "1" else paste0("1", paste0(" + \\theta_{", iq, "}L^{", iq, "}", collapse = ""))
-  #   poly_param_sma <- function() if (Q == 0) "1" else paste0("1", paste0(" + \\Theta_{", iQ, "}L^{", s * iQ, "}", collapse = ""))
-  #   
-  #   # Numeric-polynomial strings (line 4) with NA-safe filtering and correct signs
-  #   poly_num_ar <- function() {
-  #     if (p == 0) return("1")
-  #     nms <- paste0("ar", ip)
-  #     v <- suppressWarnings(unname(coefs[nms]))
-  #     keep <- is.finite(v)
-  #     if (!any(keep)) return("1")
-  #     paste0("1", paste(sprintf(" %+.3fL^{%d}", -v[keep], ip[keep]), collapse = ""))
-  #   }
-  #   poly_num_sar <- function() {
-  #     if (P == 0) return("1")
-  #     nms <- paste0("sar", iP)
-  #     v <- suppressWarnings(unname(coefs[nms]))
-  #     keep <- is.finite(v)
-  #     if (!any(keep)) return("1")
-  #     lags <- s * iP
-  #     paste0("1", paste(sprintf(" %+.3fL^{%d}", -v[keep], lags[keep]), collapse = ""))
-  #   }
-  #   poly_num_ma <- function() {
-  #     if (q == 0) return("1")
-  #     nms <- paste0("ma", iq)
-  #     v <- suppressWarnings(unname(coefs[nms]))
-  #     keep <- is.finite(v)
-  #     if (!any(keep)) return("1")
-  #     paste0("1", paste(sprintf(" %+.3fL^{%d}", v[keep], iq[keep]), collapse = ""))
-  #   }
-  #   poly_num_sma <- function() {
-  #     if (Q == 0) return("1")
-  #     nms <- paste0("sma", iQ)
-  #     v <- suppressWarnings(unname(coefs[nms]))
-  #     keep <- is.finite(v)
-  #     if (!any(keep)) return("1")
-  #     lags <- s * iQ
-  #     paste0("1", paste(sprintf(" %+.3fL^{%d}", v[keep], lags[keep]), collapse = ""))
-  #   }
-  #   
-  #   # Differencing operators
-  #   diff_part  <- if (d > 0) paste0("(1-L)^{", d, "}") else ""
-  #   sdiff_part <- if (D > 0) paste0("(1-L^{", s, "})^{", D, "}") else ""
-  #   
-  #   # ---------- Line 1: General operator form ----------
-  #   line1 <- paste0(
-  #     "\\phi_p(L)\\,\\Phi_P(L^{S})\\,(1-L)^{d}(1-L^{S})^{D}Y_t",
-  #     " = c + \\theta_q(L)\\,\\Theta_Q(L^{S})\\varepsilon_t", drift_sym
-  #   )
-  #   
-  #   # ---------- Line 2: Expanded operator (summation) ----------
-  #   line2 <- paste0(
-  #     "\\left(1-\\sum_{i=1}^{p}\\phi_i L^{i}\\right)",
-  #     "\\left(1-\\sum_{j=1}^{P}\\Phi_j L^{jS}\\right)",
-  #     "(1-L)^{d}(1-L^{S})^{D}Y_t",
-  #     " = c + ",
-  #     "\\left(1+\\sum_{i=1}^{q}\\theta_i L^{i}\\right)",
-  #     "\\left(1+\\sum_{j=1}^{Q}\\Theta_j L^{jS}\\right)",
-  #     "\\varepsilon_t", drift_sym
-  #   )
-  #   
-  #   # ---------- Line 3: parameter-expanded polynomials ----------
-  #   line3 <- paste0(
-  #     "(", poly_param_ar(), ")",
-  #     "(", poly_param_sar(), ")",
-  #     diff_part, sdiff_part,
-  #     "Y_t = c + ",
-  #     "(", poly_param_ma(), ")",
-  #     "(", poly_param_sma(), ")\\varepsilon_t",
-  #     drift_sym
-  #   )
-  #   
-  #   # ---------- Line 4: numeric-expanded polynomials ----------
-  #   rhs_intercept <- if (show_intercept) paste0(intercept_num, " + ") else ""
-  #   line4 <- paste0(
-  #     "(", poly_num_ar(), ")",
-  #     "(", poly_num_sar(), ")",
-  #     diff_part, sdiff_part,
-  #     "Y_t = ",
-  #     rhs_intercept,
-  #     "(", poly_num_ma(), ")",
-  #     "(", poly_num_sma(), ")\\varepsilon_t",
-  #     drift_num
-  #   )
-  #   line4 <- simplify_tex(line4)
-  #   
-  #   # ---------- Equivalent time-domain (teaching form) ----------
-  #   ar_vals  <- if (p > 0) suppressWarnings(unname(coefs[paste0("ar", ip)])) else numeric(0)
-  #   sar_vals <- if (P > 0) suppressWarnings(unname(coefs[paste0("sar", iP)])) else numeric(0)
-  #   ma_vals  <- if (q > 0) suppressWarnings(unname(coefs[paste0("ma", iq)])) else numeric(0)
-  #   sma_vals <- if (Q > 0) suppressWarnings(unname(coefs[paste0("sma", iQ)])) else numeric(0)
-  #   
-  #   keep_ar  <- is.finite(ar_vals)
-  #   keep_sar <- is.finite(sar_vals)
-  #   keep_ma  <- is.finite(ma_vals)
-  #   keep_sma <- is.finite(sma_vals)
-  #   
-  #   td <- paste0(
-  #     "Y_t = ",
-  #     if (show_intercept) intercept_num else "0",
-  #     if (p > 0 && any(keep_ar))  paste0(paste(sprintf(" %+.3fY_{t-%d}", ar_vals[keep_ar], ip[keep_ar]), collapse = "")) else "",
-  #     if (P > 0 && any(keep_sar)) paste0(paste(sprintf(" %+.3fY_{t-%d}", sar_vals[keep_sar], (s * iP)[keep_sar]), collapse = "")) else "",
-  #     if (q > 0 && any(keep_ma))  paste0(paste(sprintf(" %+.3f\\varepsilon_{t-%d}", ma_vals[keep_ma], iq[keep_ma]), collapse = "")) else "",
-  #     if (Q > 0 && any(keep_sma)) paste0(paste(sprintf(" %+.3f\\varepsilon_{t-%d}", sma_vals[keep_sma], (s * iQ)[keep_sma]), collapse = "")) else "",
-  #     " + \\varepsilon_t",
-  #     if (d > 0 || D > 0) paste0(" \\\\ \\text{(with differencing: }(1-L)^{", d, "}(1-L^{", s, "})^{", D, "}\\text{)}") else ""
-  #   )
-  #   td <- simplify_tex(td)
-  #   
-  #   # --- MOD: coefficient listing, including ar/ma/sar/sma ---
-  #   coef_lines <- c()
-  #   
-  #   if (show_intercept) coef_lines <- c(coef_lines, paste0("c (intercept/mean) = ", sprintf("%.4f", intercept_val)))
-  #   if (isTRUE(input$manual_drift)) {
-  #     if (is.finite(drift_val)) coef_lines <- c(coef_lines, paste0("drift = ", sprintf("%.4f", drift_val)))
-  #     else coef_lines <- c(coef_lines, "drift included (value not estimated explicitly)")
-  #   }
-  #   
-  #   if (p > 0) {
-  #     for (i in ip) {
-  #       nm <- paste0("ar", i)
-  #       if (nm %in% names(coefs) && is.finite(coefs[nm])) {
-  #         coef_lines <- c(coef_lines, paste0("ar", i, " (\\phi_", i, ") = ", sprintf("%.4f", coefs[nm])))
-  #       }
-  #     }
-  #   }
-  #   if (q > 0) {
-  #     for (i in iq) {
-  #       nm <- paste0("ma", i)
-  #       if (nm %in% names(coefs) && is.finite(coefs[nm])) {
-  #         coef_lines <- c(coef_lines, paste0("ma", i, " (\\theta_", i, ") = ", sprintf("%.4f", coefs[nm])))
-  #       }
-  #     }
-  #   }
-  #   if (P > 0) {
-  #     for (i in iP) {
-  #       nm <- paste0("sar", i)
-  #       if (nm %in% names(coefs) && is.finite(coefs[nm])) {
-  #         coef_lines <- c(coef_lines, paste0("sar", i, " (\\Phi_", i, ") = ", sprintf("%.4f", coefs[nm])))
-  #       }
-  #     }
-  #   }
-  #   if (Q > 0) {
-  #     for (i in iQ) {
-  #       nm <- paste0("sma", i)
-  #       if (nm %in% names(coefs) && is.finite(coefs[nm])) {
-  #         coef_lines <- c(coef_lines, paste0("sma", i, " (\\Theta_", i, ") = ", sprintf("%.4f", coefs[nm])))
-  #       }
-  #     }
-  #   }
-  #   
-  #   if (length(coef_lines) == 0) coef_lines <- c("No coefficients available.")
-  #   
-  #   # --- MOD: package sections as MathJax display blocks ---
-  #   list(
-  #     p = p, d = d, q = q, P = P, D = D, Q = Q, s = s,
-  #     coef_lines = coef_lines,
-  #     eq_general = tex_display(line1),
-  #     eq_expanded = tex_display(line2),
-  #     eq_line3 = tex_display(line3),
-  #     eq_line4 = tex_display(line4),
-  #     eq_time_domain = tex_display(td)
-  #   )
-  # })
+ 
   
   # ============================================================
   # --- MOD: Render the equation panel with LEFT alignment (CSS) and headings ---
   #   NOTE: Left alignment is done via an HTML wrapper div.
   # ============================================================
+  
+  # --- helper: scientific formatting (uppercase E), preserves NA ---
+  fmt_sci <- function(x, digits = 4) {
+    ifelse(is.na(x),
+           NA_character_,
+           toupper(formatC(x, format = "e", digits = digits)))
+  }
+  
+  # --- helper: show scientific only when needed (tiny/huge), else fixed ---
+  fmt_auto <- function(x, digits_fixed = 6, digits_sci = 4) {
+    ifelse(
+      is.na(x),
+      NA_character_,
+      ifelse(abs(x) > 0 & (abs(x) < 1e-4 | abs(x) >= 1e5),
+             toupper(formatC(x, format = "e", digits = digits_sci)),
+             formatC(x, format = "fg", digits = digits_fixed, flag = "#"))
+    )
+  }
+  
+  # Parameter significance table for Manual SARIMA (robust to tiny numbers)
+  output$manual_param_table <- renderTable({
+    req(manual_fit())
+    fit <- manual_fit()
+    
+    # 1) Coefficients
+    est <- tryCatch(stats::coef(fit), error = function(e) NULL)
+    validate(need(!is.null(est) && length(est) > 0, "No estimated parameters available."))
+    
+    # 2) Covariance → SE (robust fallbacks)
+    V <- tryCatch(stats::vcov(fit), error = function(e) NULL)
+    if (is.null(V)) V <- tryCatch(fit$var.coef, error = function(e) NULL)  # forecast::Arima stores var.coef
+    se <- if (!is.null(V)) sqrt(diag(V)) else rep(NA_real_, length(est))
+    
+    # 3) Test stats and p-values (normal/Z approx)
+    tst <- est / se
+    pvl <- 2 * stats::pnorm(abs(tst), lower.tail = FALSE)
+    
+    # 4) Nice names (optional)
+    s <- suppressWarnings(tryCatch(manual_equations()$s, error = function(e) NA_integer_))
+    map_name <- function(nm) {
+      nm <- gsub("^ar(\\d+)$", "AR{\\1}", nm, ignore.case = TRUE)
+      nm <- gsub("^ma(\\d+)$", "MA{\\1}", nm, ignore.case = TRUE)
+      if (isTRUE(!is.na(s))) {
+        nm <- gsub("^sar\\d+$", paste0("SAR{", s, "}"), nm, ignore.case = TRUE)
+        nm <- gsub("^sma\\d+$", paste0("SMA{", s, "}"), nm, ignore.case = TRUE)
+      } else {
+        nm <- gsub("^sar\\d+$", "SAR", nm, ignore.case = TRUE)
+        nm <- gsub("^sma\\d+$", "SMA", nm, ignore.case = TRUE)
+      }
+      nm <- gsub("^intercept$", "Constant", nm, ignore.case = TRUE)
+      nm <- gsub("^mean$",      "Constant", nm, ignore.case = TRUE)
+      nm <- gsub("^drift$",     "Drift",    nm, ignore.case = TRUE)
+      nm
+    }
+    
+    df_num <- data.frame(
+      Parameter        = vapply(names(est), map_name, character(1)),
+      Value            = as.numeric(est),
+      `Standard Error` = as.numeric(se),
+      `t Statistic`    = as.numeric(tst),
+      `P-Value`        = as.numeric(pvl),
+      check.names = FALSE
+    )
+    
+    # 5) Append variance (no significance test)
+    sigma2 <- suppressWarnings(as.numeric(fit$sigma2))
+    if (is.finite(sigma2)) {
+      df_num <- rbind(
+        df_num,
+        data.frame(Parameter = "Variance",
+                   Value = sigma2,
+                   `Standard Error` = NA_real_,
+                   `t Statistic` = NA_real_,
+                   `P-Value` = NA_real_,
+                   check.names = FALSE)
+      )
+    }
+    
+    # 6) FORMAT: keep numbers that need scientific notation in E form (e.g., 5.2E-12)
+    df_out <- transform(
+      df_num,
+      Value            = fmt_auto(Value),
+      `Standard Error` = fmt_auto(`Standard Error`),
+      `t Statistic`    = fmt_auto(`t Statistic`),
+      `P-Value`        = fmt_sci(`P-Value`, digits = 3)  # always scientific for p-values
+    )
+    
+    df_out
+  }, rownames = FALSE)
+  
+  # Parameter significance table for Manual SARIMA
+  # output$manual_param_table <- renderTable({
+  #   req(manual_fit())
+  #   
+  #   fit <- manual_fit()
+  #   
+  #   # estimates and covariance (works for forecast::Arima or stats::arima)
+  #   est <- tryCatch(coef(fit), error = function(e) NULL)
+  #   V   <- tryCatch(vcov(fit), error = function(e) NULL)
+  #   
+  #   validate(need(!is.null(est) && length(est) > 0, "No estimated parameters available."))
+  #   
+  #   se <- if (!is.null(V)) sqrt(diag(V)) else rep(NA_real_, length(est))
+  #   tst <- est / se
+  #   pvl <- 2 * pnorm(abs(tst), lower.tail = FALSE)   # large-sample normal approx
+  #   
+  #   # friendly parameter names
+  #   s <- tryCatch(manual_equations()$s, error = function(e) NA_integer_)
+  #   map_name <- function(nm) {
+  #     nm <- gsub("^ar(\\d+)$", "AR{\\1}", nm, ignore.case = TRUE)
+  #     nm <- gsub("^ma(\\d+)$", "MA{\\1}", nm, ignore.case = TRUE)
+  #     if (isTRUE(!is.na(s))) {
+  #       nm <- gsub("^sar\\d+$", paste0("SAR{", s, "}"), nm, ignore.case = TRUE)
+  #       nm <- gsub("^sma\\d+$", paste0("SMA{", s, "}"), nm, ignore.case = TRUE)
+  #     } else {
+  #       nm <- gsub("^sar\\d+$", "SAR", nm, ignore.case = TRUE)
+  #       nm <- gsub("^sma\\d+$", "SMA", nm, ignore.case = TRUE)
+  #     }
+  #     nm <- gsub("^intercept$", "Constant", nm, ignore.case = TRUE)
+  #     nm <- gsub("^mean$",      "Constant", nm, ignore.case = TRUE)
+  #     nm <- gsub("^drift$",     "Drift",    nm, ignore.case = TRUE)
+  #     nm
+  #   }
+  #   
+  #   out <- data.frame(
+  #     Parameter       = vapply(names(est), map_name, character(1)),
+  #     Value           = as.numeric(est),
+  #     `Standard Error`= as.numeric(se),
+  #     `t Statistic`   = as.numeric(tst),
+  #     `P-Value`       = as.numeric(pvl),
+  #     check.names = FALSE
+  #   )
+  #   
+  #   # Append Variance row (no significance test provided)
+  #   sigma2 <- tryCatch(as.numeric(fit$sigma2), error = function(e) NA_real_)
+  #   if (is.finite(sigma2)) {
+  #     out <- rbind(
+  #       out,
+  #       data.frame(Parameter = "Variance",
+  #                  Value = sigma2,
+  #                  `Standard Error` = NA_real_,
+  #                  `t Statistic` = NA_real_,
+  #                  `P-Value` = NA_real_,
+  #                  check.names = FALSE)
+  #     )
+  #   }
+  #   
+  #   # tidy formatting
+  #   num_cols <- c("Value", "Standard Error", "t Statistic", "P-Value")
+  #   for (cc in intersect(names(out), num_cols)) {
+  #     out[[cc]] <- ifelse(is.na(out[[cc]]), NA, signif(out[[cc]], 6))
+  #   }
+  #   
+  #   out
+  # }, rownames = FALSE)
+  
+  
+  # Goodness-of-fit table for Manual SARIMA
+  output$manual_gof_table <- renderTable({
+    req(manual_fit())
+    
+    fit <- manual_fit()
+    
+    # sample size and parameter count
+    n <- tryCatch(length(residuals(fit)), error = function(e) NA_integer_)
+    k <- tryCatch(length(coef(fit)),      error = function(e) NA_integer_)
+    
+    # AIC
+    AIC_val <- suppressWarnings(tryCatch(stats::AIC(fit), error = function(e) NA_real_))
+    
+    # BIC (use generic first; if unavailable, compute from logLik)
+    BIC_val <- suppressWarnings(tryCatch(stats::BIC(fit), error = function(e) NA_real_))
+    if (!is.finite(BIC_val)) {
+      ll <- suppressWarnings(tryCatch(as.numeric(logLik(fit)), error = function(e) NA_real_))
+      if (is.finite(ll) && is.finite(k) && is.finite(n) && n > 0) {
+        BIC_val <- (-2 * ll) + k * log(n)
+      }
+    }
+    
+    # AICc (use forecast::AICc if available; otherwise use formula)
+    AICc_val <- suppressWarnings(tryCatch(forecast::AICc(fit), error = function(e) NA_real_))
+    if (!is.finite(AICc_val) && is.finite(AIC_val) && is.finite(k) && is.finite(n) && (n - k - 1) > 0) {
+      AICc_val <- AIC_val + (2 * k * (k + 1)) / (n - k - 1)
+    }
+    
+    # Assemble table
+    out <- data.frame(
+      Metric = c("AIC", "AICc", "BIC"),
+      Value  = c(AIC_val, AICc_val, BIC_val),
+      check.names = FALSE
+    )
+    
+    # Numeric formatting
+    out$Value <- ifelse(is.na(out$Value), NA, signif(out$Value, 6))
+    out
+  }, rownames = FALSE)
+  
+  
+  
   output$manual_model_equation <- renderUI({
     req(manual_equations())
     eq <- manual_equations()
     
     tagList(
-      # --- MOD: left alignment wrapper for all MathJax blocks ---
       tags$div(
         style = "text-align:left;",
         
@@ -3694,8 +11280,17 @@ server <- function(input, output, session) {
         tags$h5("Estimated coefficients"),
         tags$ul(lapply(eq$coef_lines, function(x) tags$li(HTML(x)))),
         
+        ## parameter significance table
         tags$hr(),
+        tags$h4("Table: Estimation Results"),
+        tableOutput("manual_param_table"), 
         
+        
+        tags$hr(),
+        tags$h4("Table: Goodness of Fit"),
+        tableOutput("manual_gof_table"),
+        
+        tags$hr(),
         tags$h4("General SARIMA formulation"),
         HTML(eq$eq_general),
         
@@ -3707,23 +11302,69 @@ server <- function(input, output, session) {
         tags$hr(),
         
         tags$h4("Numerical model"),
-        # --- MOD: show line 3 then line 4 under the same heading ---
         HTML(eq$eq_line3),
         tags$hr(),
-        
-        # HTML(tex_display("\\text{------------}")),
         HTML(eq$eq_line4),
         
         tags$hr(),
         
-        # tags$h4("Equivalent time-domain representation (teaching form)"),
-        # HTML(eq$eq_time_domain)
+  
       ),
       
-      # --- MOD: Force MathJax typesetting for dynamically inserted content ---
+      # keep MathJax refresh
       tags$script(HTML("if (window.MathJax && MathJax.Hub) MathJax.Hub.Queue(['Typeset', MathJax.Hub]);"))
     )
   })
+  
+  
+  
+  
+  
+  # output$manual_model_equation <- renderUI({
+  #   req(manual_equations())
+  #   eq <- manual_equations()
+  #   
+  #   tagList(
+  #     # --- MOD: left alignment wrapper for all MathJax blocks ---
+  #     tags$div(
+  #       style = "text-align:left;",
+  #       
+  #       tags$h4("Manual SARIMA model"),
+  #       tags$p(sprintf("SARIMA(%d,%d,%d)(%d,%d,%d)[%d]", eq$p, eq$d, eq$q, eq$P, eq$D, eq$Q, eq$s)),
+  #       
+  #       tags$h5("Estimated coefficients"),
+  #       tags$ul(lapply(eq$coef_lines, function(x) tags$li(HTML(x)))),
+  #       
+  #       tags$hr(),
+  #       
+  #       tags$h4("General SARIMA formulation"),
+  #       HTML(eq$eq_general),
+  #       
+  #       tags$hr(),
+  #       
+  #       tags$h4("Expanded operator form"),
+  #       HTML(eq$eq_expanded),
+  #       
+  #       tags$hr(),
+  #       
+  #       tags$h4("Numerical model"),
+  #       # --- MOD: show line 3 then line 4 under the same heading ---
+  #       HTML(eq$eq_line3),
+  #       tags$hr(),
+  #       
+  #       # HTML(tex_display("\\text{------------}")),
+  #       HTML(eq$eq_line4),
+  #       
+  #       tags$hr(),
+  #       
+  #       # tags$h4("Equivalent time-domain representation (teaching form)"),
+  #       # HTML(eq$eq_time_domain)
+  #     ),
+  #     
+  #     # --- MOD: Force MathJax typesetting for dynamically inserted content ---
+  #     tags$script(HTML("if (window.MathJax && MathJax.Hub) MathJax.Hub.Queue(['Typeset', MathJax.Hub]);"))
+  #   )
+  # })
   
   # --- MOD: helper used above inside renderUI (place near other helpers or above output block) ---
   tex_display <- function(x) paste0("\\[", x, "\\]")
@@ -3784,6 +11425,2029 @@ server <- function(input, output, session) {
       sep = ""
     )
   })
+  
+  
+  
+  
+  
+  
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  
+  
+  # ---- Manual SARIMA: academic conclusion (cached on Fit click) ----
+  
+  # =========================
+  # Manual SARIMA: FULL academic conclusion object (robust + detailed)
+  # =========================
+  
+  # manual_conclusion_full_obj <- eventReactive(input$fit_manual, {
+  #   req(manual_fit(), manual_fc(), manual_equations(), ts_train_test())
+  #   
+  #   fit <- manual_fit()
+  #   fc0 <- manual_fc()
+  #   fc  <- fc0$fc
+  #   eq  <- manual_equations()
+  #   s   <- ts_train_test()
+  #   
+  #   # ---------- helpers (local + safe)
+  #   fmt_num_local <- function(x, d = 3) {
+  #     if (length(x) == 0 || all(is.na(x))) return("NA")
+  #     x <- suppressWarnings(as.numeric(x[1]))
+  #     if (!is.finite(x)) return("NA")
+  #     formatC(x, format = "f", digits = d)
+  #   }
+  #   fmt_p_local <- function(p) {
+  #     if (length(p) == 0 || all(is.na(p))) return("NA")
+  #     p <- suppressWarnings(as.numeric(p[1]))
+  #     if (!is.finite(p)) return("NA")
+  #     if (p < .001) "&lt; .001" else sprintf("= %.3f", p)
+  #   }
+  #   sig_stars <- function(p) {
+  #     p <- suppressWarnings(as.numeric(p))
+  #     if (!is.finite(p)) return("")
+  #     if (p < .001) "***" else if (p < .01) "**" else if (p < .05) "*" else if (p < .10) "†" else ""
+  #   }
+  #   safe_len <- function(x) if (is.null(x)) 0L else length(x)
+  #   
+  #   html_table <- function(df) {
+  #     if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+  #       return(tags$em("Table unavailable."))
+  #     }
+  #     tags$table(
+  #       class = "table table-striped table-condensed",
+  #       tags$thead(
+  #         tags$tr(lapply(names(df), function(nm) tags$th(nm)))
+  #       ),
+  #       tags$tbody(
+  #         lapply(seq_len(nrow(df)), function(i) {
+  #           tags$tr(lapply(df[i, , drop = FALSE], function(cell) tags$td(HTML(as.character(cell)))))
+  #         })
+  #       )
+  #     )
+  #   }
+  #   
+  #   # ---------- sample sizes (safe)
+  #   n_train <- suppressWarnings(as.integer(s$train_n))
+  #   if (!is.finite(n_train) || n_train < 1) n_train <- tryCatch(length(residuals(fit)), error = function(e) 0L)
+  #   
+  #   n_test <- suppressWarnings(as.integer(s$test_n))
+  #   if (!is.finite(n_test) || n_test < 0) n_test <- 0L
+  #   
+  #   N <- n_train + n_test
+  #   
+  #   # ---------- lag choice (safe)
+  #   L_in <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_in) && L_in > 0) L_in else 12L
+  #   
+  #   # ---------- IC (safe)
+  #   AIC_val  <- suppressWarnings(tryCatch(as.numeric(stats::AIC(fit)), error = function(e) NA_real_))
+  #   BIC_val  <- suppressWarnings(tryCatch(as.numeric(stats::BIC(fit)), error = function(e) NA_real_))
+  #   AICc_val <- suppressWarnings(tryCatch(as.numeric(forecast::AICc(fit)), error = function(e) NA_real_))
+  #   
+  #   ic_df <- data.frame(
+  #     Criterion = c("AIC", "AICc", "BIC"),
+  #     Value     = c(fmt_num_local(AIC_val, 2), fmt_num_local(AICc_val, 2), fmt_num_local(BIC_val, 2)),
+  #     check.names = FALSE
+  #   )
+  #   
+  #   # ---------- coefficients + significance (robust)
+  #   est <- suppressWarnings(tryCatch(stats::coef(fit), error = function(e) NULL))
+  #   V   <- suppressWarnings(tryCatch(stats::vcov(fit), error = function(e) NULL))
+  #   if (is.null(V)) V <- suppressWarnings(tryCatch(fit$var.coef, error = function(e) NULL))
+  #   
+  #   coef_df <- NULL
+  #   if (!is.null(est) && length(est) > 0) {
+  #     est <- as.numeric(est)
+  #     nm  <- names(stats::coef(fit))
+  #     if (is.null(nm)) nm <- paste0("param_", seq_along(est))
+  #     
+  #     se <- rep(NA_real_, length(est))
+  #     if (!is.null(V)) {
+  #       dV <- tryCatch(diag(V), error = function(e) rep(NA_real_, length(est)))
+  #       if (length(dV) == length(est)) se <- sqrt(pmax(dV, 0))
+  #     }
+  #     z  <- est / se
+  #     p  <- 2 * stats::pnorm(-abs(z))
+  #     
+  #     coef_df <- data.frame(
+  #       Term     = nm,
+  #       Estimate = sprintf("%.6f", est),
+  #       SE       = ifelse(is.finite(se), sprintf("%.6f", se), "NA"),
+  #       `z/t`    = ifelse(is.finite(z),  sprintf("%.3f",  z),  "NA"),
+  #       `p`      = ifelse(is.finite(p),  sprintf("%.3f",  p),  "NA"),
+  #       Sig      = vapply(p, sig_stars, character(1)),
+  #       check.names = FALSE
+  #     )
+  #   }
+  #   
+  #   n_sig <- if (!is.null(coef_df)) sum(suppressWarnings(as.numeric(coef_df$p)) < 0.05, na.rm = TRUE) else 0L
+  #   
+  #   # ---------- residuals (safe)
+  #   res <- suppressWarnings(tryCatch(as.numeric(residuals(fit)), error = function(e) numeric(0)))
+  #   res <- res[is.finite(res)]
+  #   n_res <- length(res)
+  #   
+  #   # fitdf for LB: number of estimated parameters (safe)
+  #   fitdf <- if (!is.null(est)) length(est) else 0L
+  #   
+  #   # choose LB lag not exceeding sample
+  #   lb_lag <- min(L, max(1L, floor(n_res / 3)))
+  #   lb <- if (n_res >= 5) {
+  #     tryCatch(stats::Box.test(res, lag = lb_lag, type = "Ljung-Box", fitdf = fitdf), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   bp <- if (n_res >= 5) {
+  #     tryCatch(stats::Box.test(res, lag = lb_lag, type = "Box-Pierce", fitdf = fitdf), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   jb <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 5) {
+  #     tryCatch(tseries::jarque.bera.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   sw <- if (n_res >= 3 && n_res <= 5000) {
+  #     tryCatch(stats::shapiro.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   arch <- if (requireNamespace("FinTS", quietly = TRUE) && n_res >= 10) {
+  #     tryCatch(FinTS::ArchTest(res, lags = min(12L, max(1L, floor(L / 2)))), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   runs <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 10) {
+  #     tryCatch(tseries::runs.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   ad <- if (requireNamespace("nortest", quietly = TRUE) && n_res >= 8) {
+  #     tryCatch(nortest::ad.test(res), error = function(e) NULL)
+  #   } else NULL
+  #   
+  #   # ---------- compact residual-test table (academic reporting style)
+  #   test_rows <- list()
+  #   
+  #   add_test <- function(name, stat, pval, note = "") {
+  #     test_rows[[length(test_rows) + 1L]] <<- data.frame(
+  #       Test = name,
+  #       Statistic = if (is.null(stat)) "NA" else fmt_num_local(stat, 3),
+  #       `p-value` = if (is.null(pval)) "NA" else fmt_p_local(pval),
+  #       Interpretation = note,
+  #       check.names = FALSE
+  #     )
+  #   }
+  #   
+  #   add_test(
+  #     "Ljung–Box (residuals)",
+  #     if (!is.null(lb)) unname(lb$statistic) else NULL,
+  #     if (!is.null(lb)) unname(lb$p.value) else NULL,
+  #     if (!is.null(lb)) {
+  #       if (is.finite(lb$p.value) && lb$p.value >= 0.05) "No evidence of remaining autocorrelation (white-noise compatible)."
+  #       else "Evidence of remaining autocorrelation (model may be under-specified)."
+  #     } else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "Box–Pierce (residuals)",
+  #     if (!is.null(bp)) unname(bp$statistic) else NULL,
+  #     if (!is.null(bp)) unname(bp$p.value) else NULL,
+  #     if (!is.null(bp)) {
+  #       if (is.finite(bp$p.value) && bp$p.value >= 0.05) "Consistent with uncorrelated residuals."
+  #       else "Suggests residual autocorrelation."
+  #     } else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "Jarque–Bera (normality)",
+  #     if (!is.null(jb)) unname(jb$statistic) else NULL,
+  #     if (!is.null(jb)) unname(jb$p.value) else NULL,
+  #     if (!is.null(jb)) {
+  #       if (is.finite(jb$p.value) && jb$p.value >= 0.05) "No evidence against normality."
+  #       else "Residuals deviate from normality (common in real series)."
+  #     } else "Package 'tseries' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Shapiro–Wilk (normality)",
+  #     if (!is.null(sw)) unname(sw$statistic) else NULL,
+  #     if (!is.null(sw)) unname(sw$p.value) else NULL,
+  #     if (!is.null(sw)) {
+  #       if (is.finite(sw$p.value) && sw$p.value >= 0.05) "No evidence against normality."
+  #       else "Evidence against normality."
+  #     } else if (n_res > 5000) "Not computed (n > 5000)." else "Not available."
+  #   )
+  #   
+  #   add_test(
+  #     "ARCH LM (heteroskedasticity)",
+  #     if (!is.null(arch)) unname(arch$statistic) else NULL,
+  #     if (!is.null(arch)) unname(arch$p.value) else NULL,
+  #     if (!is.null(arch)) {
+  #       if (is.finite(arch$p.value) && arch$p.value >= 0.05) "No evidence of remaining ARCH effects."
+  #       else "Evidence of ARCH effects → consider GARCH for variance."
+  #     } else "Package 'FinTS' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Runs test (randomness)",
+  #     if (!is.null(runs)) unname(runs$statistic) else NULL,
+  #     if (!is.null(runs)) unname(runs$p.value) else NULL,
+  #     if (!is.null(runs)) {
+  #       if (is.finite(runs$p.value) && runs$p.value >= 0.05) "No evidence against randomness."
+  #       else "Evidence of non-randomness (structure may remain)."
+  #     } else "Package 'tseries' missing or test unavailable."
+  #   )
+  #   
+  #   add_test(
+  #     "Anderson–Darling (normality)",
+  #     if (!is.null(ad)) unname(ad$statistic) else NULL,
+  #     if (!is.null(ad)) unname(ad$p.value) else NULL,
+  #     if (!is.null(ad)) {
+  #       if (is.finite(ad$p.value) && ad$p.value >= 0.05) "No evidence against normality."
+  #       else "Evidence against normality (sensitive in tails)."
+  #     } else "Package 'nortest' missing or test unavailable."
+  #   )
+  #   
+  #   tests_df <- if (length(test_rows)) do.call(rbind, test_rows) else data.frame()
+  #   
+  #   # ---------- forecast accuracy (safe)
+  #   acc_df <- NULL
+  #   acc_sentence <- "No holdout test set was detected; therefore, out-of-sample accuracy was not computed."
+  #   
+  #   y_test <- s$ts_test
+  #   has_test <- !is.null(y_test) && safe_len(y_test) > 0 && n_test > 0
+  #   
+  #   if (has_test) {
+  #     y_test_num <- as.numeric(y_test)
+  #     y_hat_num  <- suppressWarnings(tryCatch(as.numeric(fc$mean), error = function(e) rep(NA_real_, length(y_test_num))))
+  #     h <- min(length(y_test_num), length(y_hat_num))
+  #     if (h >= 1) {
+  #       e <- y_test_num[seq_len(h)] - y_hat_num[seq_len(h)]
+  #       rmse <- sqrt(mean(e^2, na.rm = TRUE))
+  #       mae  <- mean(abs(e), na.rm = TRUE)
+  #       mape <- mean(abs(e) / pmax(abs(y_test_num[seq_len(h)]), .Machine$double.eps), na.rm = TRUE)
+  #       
+  #       acc_df <- data.frame(
+  #         Metric = c("RMSE", "MAE", "MAPE"),
+  #         Value  = c(fmt_num_local(rmse, 3), fmt_num_local(mae, 3), paste0(fmt_num_local(100*mape, 2), "%")),
+  #         check.names = FALSE
+  #       )
+  #       
+  #       acc_sentence <- paste0(
+  #         "Over the holdout period (test n = ", h, "), forecast performance was ",
+  #         "RMSE = ", fmt_num_local(rmse, 3), ", ",
+  #         "MAE = ", fmt_num_local(mae, 3), ", ",
+  #         "MAPE = ", fmt_num_local(100*mape, 2), "%."
+  #       )
+  #     }
+  #   }
+  #   
+  #   
+  #   
+  #   # =========================
+  #   # Manual report plots (used inside manual_conclusion_full_obj)
+  #   # =========================
+  #   
+  #   # helper: apply differencing D (seasonal) then d (non-seasonal)
+  #   apply_sarima_diffs <- function(y, d = 0L, D = 0L, s = 1L) {
+  #     y <- as.numeric(y)
+  #     y <- y[is.finite(y)]
+  #     if (length(y) < 3) return(y)
+  #     
+  #     d <- as.integer(d); if (!is.finite(d) || d < 0) d <- 0L
+  #     D <- as.integer(D); if (!is.finite(D) || D < 0) D <- 0L
+  #     s <- as.integer(s); if (!is.finite(s) || s < 1) s <- 1L
+  #     
+  #     yy <- y
+  #     
+  #     # seasonal differences first (common SARIMA workflow)
+  #     if (D > 0 && s > 1) {
+  #       for (i in seq_len(D)) {
+  #         if (length(yy) <= s + 1) break
+  #         yy <- diff(yy, lag = s)
+  #       }
+  #     }
+  #     
+  #     # then non-seasonal differences
+  #     if (d > 0) {
+  #       for (i in seq_len(d)) {
+  #         if (length(yy) <= 2) break
+  #         yy <- diff(yy, lag = 1)
+  #       }
+  #     }
+  #     
+  #     yy
+  #   }
+  #   
+  #   # ---- A) Time series plot (dates + dashed split) ----
+  #   output$manual_report_ts_plot <- renderPlot({
+  #     req(ts_train_test(), prepared())
+  #     s <- ts_train_test()
+  #     p <- prepared()
+  #     
+  #     df <- s$dfm
+  #     validate(need(nrow(df) >= 3, "Not enough observations to plot the time series."))
+  #     
+  #     df$set <- ifelse(seq_len(nrow(df)) <= s$train_n, "Train", "Test/Future")
+  #     
+  #     # split x-position (draw at boundary between train and test)
+  #     has_test <- isTRUE(s$test_n > 0)
+  #     x_split  <- if (has_test) df$x[s$train_n] else NA
+  #     
+  #     g <- ggplot(df, aes(x = x, y = y_trans, color = set)) +
+  #       geom_line(linewidth = 0.9) +
+  #       theme_minimal() +
+  #       labs(
+  #         title = "Observed time series (transformed)",
+  #         x = p$x_label,
+  #         y = "Value",
+  #         color = NULL
+  #       ) +
+  #       theme(legend.position = "bottom")
+  #     
+  #     # dashed split line
+  #     if (has_test && !is.na(x_split)) {
+  #       g <- g + geom_vline(xintercept = as.numeric(x_split), linetype = "dashed", linewidth = 0.7, color = "gray40")
+  #     }
+  #     
+  #     # Date-safe axis
+  #     if (inherits(df$x, "Date")) {
+  #       g <- g + scale_x_date(labels = scales::date_format("%Y-%m"), breaks = scales::pretty_breaks(n = 8))
+  #     } else if (inherits(df$x, "POSIXt")) {
+  #       g <- g + scale_x_datetime(labels = scales::date_format("%Y-%m"), breaks = scales::pretty_breaks(n = 8))
+  #     }
+  #     
+  #     g
+  #   })
+  #   
+  #   # ---- B) ACF / PACF of training series ----
+  #   output$manual_report_acf <- renderPlot({
+  #     req(ts_train_test())
+  #     x <- ts_train_test()$ts_train
+  #     validate(need(length(x) >= 5, "Not enough training observations for ACF."))
+  #     forecast::ggAcf(x, lag.max = min(60, length(x) - 1)) +
+  #       theme_minimal() +
+  #       labs(title = "ACF (training)")
+  #   })
+  #   
+  #   output$manual_report_pacf <- renderPlot({
+  #     req(ts_train_test())
+  #     x <- ts_train_test()$ts_train
+  #     validate(need(length(x) >= 5, "Not enough training observations for PACF."))
+  #     forecast::ggPacf(x, lag.max = min(60, length(x) - 1)) +
+  #       theme_minimal() +
+  #       labs(title = "PACF (training)")
+  #   })
+  #   
+  #   # ---- C) ACF / PACF of modified (differenced) series based on current d, D, s ----
+  #   output$manual_report_acf_mod <- renderPlot({
+  #     req(ts_train_test(), prepared())
+  #     s_obj <- ts_train_test()
+  #     p <- prepared()
+  #     
+  #     # use training series for identification (typical)
+  #     y <- as.numeric(s_obj$ts_train)
+  #     
+  #     s_use <- if (is.na(input$s)) p$freq else as.integer(input$s)
+  #     y_mod <- apply_sarima_diffs(y, d = input$d, D = input$D, s = s_use)
+  #     
+  #     validate(need(length(y_mod) >= 5, "Differencing left too few observations for ACF."))
+  #     
+  #     ts_mod <- ts(y_mod, frequency = p$freq)
+  #     
+  #     forecast::ggAcf(ts_mod, lag.max = min(60, length(ts_mod) - 1)) +
+  #       theme_minimal() +
+  #       labs(title = paste0("ACF (d=", input$d, ", D=", input$D, ", s=", s_use, ")"))
+  #   })
+  #   
+  #   output$manual_report_pacf_mod <- renderPlot({
+  #     req(ts_train_test(), prepared())
+  #     s_obj <- ts_train_test()
+  #     p <- prepared()
+  #     
+  #     y <- as.numeric(s_obj$ts_train)
+  #     
+  #     s_use <- if (is.na(input$s)) p$freq else as.integer(input$s)
+  #     y_mod <- apply_sarima_diffs(y, d = input$d, D = input$D, s = s_use)
+  #     
+  #     validate(need(length(y_mod) >= 5, "Differencing left too few observations for PACF."))
+  #     
+  #     ts_mod <- ts(y_mod, frequency = p$freq)
+  #     
+  #     forecast::ggPacf(ts_mod, lag.max = min(60, length(ts_mod) - 1)) +
+  #       theme_minimal() +
+  #       labs(title = paste0("PACF (d=", input$d, ", D=", input$D, ", s=", s_use, ")"))
+  #   })
+  #   
+  #   output$manual_report_ts_trans_and_diff <- renderPlot({
+  #     req(ts_train_test(), prepared())
+  #     s_obj <- ts_train_test()
+  #     p <- prepared()
+  #     
+  #     df <- s_obj$dfm
+  #     validate(need(nrow(df) >= 5, "Not enough observations to plot."))
+  #     
+  #     # Use ONLY training portion if split exists
+  #     train_n <- s_obj$train_n
+  #     has_test <- isTRUE(s_obj$test_n > 0)
+  #     df_train <- if (has_test) df[seq_len(train_n), , drop = FALSE] else df
+  #     
+  #     validate(need(nrow(df_train) >= 5, "Not enough training observations to plot."))
+  #     
+  #     # Base transformed training series
+  #     x_train <- df_train$x
+  #     y_train <- df_train$y_trans
+  #     
+  #     # Differenced series (based on current d, D, s)
+  #     # Use p$freq if input$s is NA
+  #     s_use <- if (is.null(input$s) || is.na(input$s)) p$freq else as.integer(input$s)
+  #     
+  #     y_mod <- apply_sarima_diffs(y_train, d = input$d, D = input$D, s = s_use)
+  #     validate(need(length(y_mod) >= 3, "Differencing left too few observations to plot."))
+  #     
+  #     # Align differenced series to the LAST dates of training (since diff shortens length)
+  #     x_mod <- tail(x_train, length(y_mod))
+  #     
+  #     plot_df <- rbind(
+  #       data.frame(x = x_train, y = y_train, series = "Transformed (train)"),
+  #       data.frame(x = x_mod,   y = y_mod,   series = paste0("Differenced (d=", input$d, ", D=", input$D, ", s=", s_use, ")"))
+  #     )
+  #     
+  #     g <- ggplot(plot_df, aes(x = x, y = y, color = series)) +
+  #       geom_line(linewidth = 0.9) +
+  #       theme_minimal() +
+  #       labs(
+  #         title = "Training series: transformed vs differenced",
+  #         x = p$x_label,
+  #         y = "Value",
+  #         color = NULL
+  #       ) +
+  #       theme(legend.position = "bottom")
+  #     
+  #     # Date-safe axis
+  #     if (inherits(plot_df$x, "Date")) {
+  #       g <- g + scale_x_date(labels = scales::date_format("%Y-%m"), breaks = scales::pretty_breaks(n = 8))
+  #     } else if (inherits(plot_df$x, "POSIXt")) {
+  #       g <- g + scale_x_datetime(labels = scales::date_format("%Y-%m"), breaks = scales::pretty_breaks(n = 8))
+  #     }
+  #     
+  #     g
+  #   })
+  #   
+  #   
+  #   
+  #   
+  #   
+  #   
+  #   # ---------- horizon narrative (as in your PDF style)
+  #   horizon_txt <- if (has_test) {
+  #     paste0("Validation mode was used: the forecast horizon was forced to match the test length (h = ", n_test, ").")
+  #   } else {
+  #     paste0("Future mode was used: forecasts were produced beyond the training sample (h = ", fc0$h, ").")
+  #   }
+  #   
+  #   # ---------- model string (safe)
+  #   season_txt <- suppressWarnings(as.integer(eq$s))
+  #   s_txt <- if (is.finite(season_txt) && season_txt > 0) as.character(season_txt) else "s"
+  #   
+  #   model_str <- sprintf(
+  #     "SARIMA(%d,%d,%d)(%d,%d,%d)[%s]",
+  #     eq$p, eq$d, eq$q, eq$P, eq$D, eq$Q, s_txt
+  #   )
+  #   
+  #   # ---------- final decision bullets (lightweight logic)
+  #   lb_ok <- !is.null(lb) && is.finite(lb$p.value) && lb$p.value >= 0.05
+  #   arch_ok <- is.null(arch) || (is.finite(arch$p.value) && arch$p.value >= 0.05)  # if no test, don't overstate
+  #   diag_verdict <- paste0(
+  #     if (lb_ok) "Residual autocorrelation was not statistically detected (Ljung–Box p ≥ .05). "
+  #     else "Residual autocorrelation may remain (Ljung–Box p < .05). ",
+  #     if (arch_ok) "No clear evidence of residual ARCH effects was found (or test unavailable)."
+  #     else "Residual ARCH effects were detected → a GARCH extension is recommended."
+  #   )
+  #   
+  #   # ---------- build UI (includes your existing plots/tables)
+  #   tagList(
+  #     tags$h3("Manual SARIMA: Full academic conclusion (report-ready)"),
+  #     
+  #     tags$h4("1. Objective and modelling rationale"),
+  #     tags$p(
+  #       "A manually specified seasonal ARIMA (SARIMA) model was estimated to represent linear temporal dependence,",
+  #       " including seasonal structure, and to provide an interpretable baseline for forecasting."
+  #     ),
+  #     
+  #     tags$h4("2. Data design and sample split"),
+  #     tags$p(HTML(paste0(
+  #       "The analysis used <b>N = ", N, "</b> observations (training <b>n = ", n_train, "</b>",
+  #       if (has_test) paste0(", test <b>n = ", n_test, "</b>") else "",
+  #       ")."
+  #     ))),
+  #     tags$p(tags$b("Forecast design. "), horizon_txt),
+  #     
+  #     
+  #     
+  #     # --- NEW: Identification visuals for the report ---
+  #     tags$h4("3. Identification visuals (time series + ACF/PACF)"),
+  #     tags$p(
+  #       "The plots below summarize the observed series (with the train/test split, if applicable), ",
+  #       "followed by ACF/PACF for the training series and for the differenced series implied by the chosen (d, D, s)."
+  #     ),
+  #     
+  #     tags$h5("Figure A1. Time series with split marker"),
+  #     plotOutput("manual_report_ts_plot", height = 360),
+  #     
+  #     tags$h5("Figure A2. Transformed training series and differenced (d, D, s) series"),
+  #     plotOutput("manual_report_ts_trans_and_diff", height = 360),
+  #     
+  #     tags$h5("Figure B. ACF and PACF (training series)"),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_report_acf",  height = 280)),
+  #       column(6, plotOutput("manual_report_pacf", height = 280))
+  #     ),
+  #     
+  #     tags$h5("Figure C. ACF and PACF (modified / differenced series using current d, D, s)"),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_report_acf_mod",  height = 280)),
+  #       column(6, plotOutput("manual_report_pacf_mod", height = 280))
+  #     ),
+  #     
+  #     
+  #     
+  #     
+  #     
+  #     tags$h4("4. Final model specification and fit quality"),
+  #     tags$p(HTML(paste0(
+  #       "The final manual specification was <b>", model_str, "</b>",
+  #       if (isTRUE(input$manual_drift)) " including drift/mean." else " without drift/mean.",
+  #       " Model adequacy was assessed using information criteria, coefficient inference, residual diagnostics, and forecast performance."
+  #     ))),
+  #     
+  #     tags$h5("Table A. Goodness-of-fit (information criteria)"),
+  #     html_table(ic_df),
+  #     
+  #     tags$h5("Table B. Parameter estimates and significance (approx. z/t tests)"),
+  #     if (!is.null(coef_df)) html_table(coef_df) else tags$em("No coefficients available."),
+  #     tags$p(HTML(paste0(
+  #       "In total, <b>", n_sig, "</b> parameter(s) were significant at α = .05 (marked by *, **, ***)."
+  #     ))),
+  #     
+  #     tags$h4("5. Model equations (replication-ready)"),
+  #     tags$p(
+  #       "The fitted model is reported below in operator notation (general form), expanded form, and the numerical equation",
+  #       " based on the estimated parameters."
+  #     ),
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;",
+  #       tags$h5("General SARIMA formulation"),
+  #       HTML(eq$eq_general),
+  #       tags$hr(),
+  #       tags$h5("Expanded operator form"),
+  #       HTML(eq$eq_expanded),
+  #       tags$hr(),
+  #       tags$h5("Numerical model"),
+  #       HTML(eq$eq_line3),
+  #       tags$hr(),
+  #       HTML(eq$eq_line4)
+  #     ),
+  #     
+  #     tags$h4("6. Residual diagnostics (graphical evidence)"),
+  #     tags$p(
+  #       "Graphical diagnostics evaluate whether residuals resemble white noise (no systematic autocorrelation),",
+  #       " approximate normality (Q–Q and histogram), and stable variance."
+  #     ),
+  #     
+  #     fluidRow(
+  #       column(6, plotOutput("manual_resid_ts",   height = 220)),
+  #       column(6, plotOutput("manual_resid_acf",  height = 220))
+  #     ),
+  #     fluidRow(
+  #       column(6, plotOutput("manual_resid_hist", height = 220)),
+  #       column(6, plotOutput("manual_resid_qq",   height = 220))
+  #     ),
+  #     tags$h5("Ljung–Box p-values by lag"),
+  #     plotOutput("manual_resid_lb_pvals", height = 260),
+  #     
+  #     tags$h4("7. Residual tests (formal inference)"),
+  #     tags$p(
+  #       "Formal tests complement the plots: Ljung–Box/Box–Pierce assess remaining autocorrelation;",
+  #       " Jarque–Bera/Shapiro–Wilk/Anderson–Darling assess normality;",
+  #       " ARCH LM tests conditional heteroskedasticity; the runs test checks randomness."
+  #     ),
+  #     tags$h5("Table C. Residual test summary"),
+  #     html_table(tests_df),
+  #     tags$p(tags$b("Diagnostic synthesis. "), diag_verdict),
+  #     
+  #     tags$h4("8. Forecasting results and predictive performance"),
+  #     tags$p(acc_sentence),
+  #     
+  #     if (!is.null(acc_df)) tagList(
+  #       tags$h5("Table D. Holdout accuracy (test set)"),
+  #       html_table(acc_df)
+  #     ) else NULL,
+  #     
+  #     tags$h5("Forecast plot"),
+  #     plotOutput("manual_forecast_plot", height = 420),
+  #     
+  #     tags$h5("Forecast table"),
+  #     tableOutput("manual_forecast_table"),
+  #     
+  #     tags$h5("Accuracy table (your app output)"),
+  #     tableOutput("manual_accuracy_table"),
+  #     
+  #     tags$h4("9. Final conclusion (academic)"),
+  #     tags$p(
+  #       "Overall, the manually specified SARIMA model provides a coherent and interpretable representation of seasonal linear dynamics,",
+  #       " supported by information criteria, statistically interpretable parameters, and diagnostic checks.",
+  #       " When diagnostics indicate remaining autocorrelation, refinement should prioritize revising differencing (d, D) and AR/MA orders guided by ACF/PACF and Ljung–Box.",
+  #       " When conditional heteroskedasticity is detected (ARCH LM), a volatility model (e.g., GARCH) should be added to the mean equation to better represent time-varying variance."
+  #     ),
+  #     tags$p(
+  #       "For reporting, the results above provide the full chain of evidence typically expected in academic manuscripts:",
+  #       " (i) specification + IC, (ii) parameter inference, (iii) equation reporting, (iv) residual validation with plots and tests, and (v) forecasting with accuracy assessment."
+  #     )
+  #   )
+  # })
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # ============================================================
+  # CORRECTED STRUCTURE
+  #   1) Define ALL report outputs ONCE (outside eventReactive)
+  #   2) manual_conclusion_full_obj ONLY computes + returns tagList UI
+  # ============================================================
+  
+  
+  # ------------------------------------------------------------
+  # (A) REPORT OUTPUTS (define ONCE, outside manual_conclusion_full_obj)
+  # ------------------------------------------------------------
+  
+  # ---- A) Time series plot (dates + dashed split) ----
+  output$manual_report_ts_plot <- renderPlot({
+    req(manual_conclusion_full_obj())     # ensures this is shown after Fit Manual
+    req(ts_train_test(), prepared())
+    
+    s <- ts_train_test()
+    p <- prepared()
+    
+    df <- s$dfm
+    validate(need(nrow(df) >= 3, "Not enough observations to plot the time series."))
+    
+    df$set <- ifelse(seq_len(nrow(df)) <= s$train_n, "Train", "Test/Future")
+    
+    has_test <- isTRUE(s$test_n > 0)
+    x_split  <- if (has_test) df$x[s$train_n] else NA
+    
+    g <- ggplot(df, aes(x = x, y = y_trans, color = set)) +
+      geom_line(linewidth = 0.9) +
+      theme_minimal() +
+      labs(
+        title = "Observed time series (transformed)",
+        x = p$x_label,
+        y = "Value",
+        color = NULL
+      ) +
+      theme(legend.position = "bottom")
+    
+    if (has_test && !is.na(x_split)) {
+      g <- g + geom_vline(
+        xintercept = as.numeric(x_split),
+        linetype = "dashed",
+        linewidth = 0.7,
+        color = "gray40"
+      )
+    }
+    
+    if (inherits(df$x, "Date")) {
+      g <- g + scale_x_date(labels = scales::date_format("%Y-%m"),
+                            breaks = scales::pretty_breaks(n = 8))
+    } else if (inherits(df$x, "POSIXt")) {
+      g <- g + scale_x_datetime(labels = scales::date_format("%Y-%m"),
+                                breaks = scales::pretty_breaks(n = 8))
+    }
+    
+    g
+  })
+  
+  
+  # ---- NEW: Stationarity tests (ADF + PP + KPSS) + conclusion paragraph ----
+  output$manual_report_stationarity <- renderUI({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test())
+    
+    validate(need(requireNamespace("tseries", quietly = TRUE),
+                  "Package 'tseries' is required for stationarity tests (ADF/PP/KPSS)."))
+    
+    s_obj <- ts_train_test()
+    
+    # Use training series for stationarity assessment
+    x <- as.numeric(s_obj$ts_train)
+    x <- x[is.finite(x)]
+    validate(need(length(x) >= 10, "Not enough training observations to run stationarity tests (need ≥ 10)."))
+    
+    fmt_num <- function(z, d = 3) {
+      z <- suppressWarnings(as.numeric(z))
+      if (length(z) == 0 || !is.finite(z[1])) return("NA")
+      formatC(z[1], format = "f", digits = d)
+    }
+    fmt_p <- function(p) {
+      p <- suppressWarnings(as.numeric(p))
+      if (length(p) == 0 || !is.finite(p[1])) return("NA")
+      if (p[1] < .001) "p < .001" else paste0("p = ", sub("^0\\.", ".", sprintf("%.3f", p[1])))
+    }
+    
+    # safe lag choice for ADF
+    k_adf <- max(0, min(12, floor((length(x) - 1)^(1/3))))
+    
+    adf <- tryCatch(tseries::adf.test(x, k = k_adf), error = function(e) NULL)
+    pp  <- tryCatch(tseries::pp.test(x, lshort = TRUE), error = function(e) NULL)
+    kpss_level <- tryCatch(tseries::kpss.test(x, null = "Level", lshort = TRUE), error = function(e) NULL)
+    kpss_trend <- tryCatch(tseries::kpss.test(x, null = "Trend", lshort = TRUE), error = function(e) NULL)
+    
+    rows <- list()
+    add_row <- function(test, null_h, stat, pval, decision) {
+      rows[[length(rows) + 1L]] <<- data.frame(
+        Test = test,
+        `H0 (null)` = null_h,
+        Statistic = stat,
+        `p-value` = pval,
+        Decision = decision,
+        check.names = FALSE
+      )
+    }
+    
+    # ADF: H0 = unit root (non-stationary); reject => stationarity evidence
+    if (!is.null(adf)) {
+      p <- adf$p.value
+      dec <- if (is.finite(p) && p < 0.05) "Reject H0 → evidence for stationarity"
+      else "Fail to reject H0 → unit root plausible"
+      add_row("ADF (Augmented Dickey–Fuller)", "Unit root (non-stationary)",
+              fmt_num(unname(adf$statistic)), fmt_p(p), dec)
+    } else {
+      add_row("ADF (Augmented Dickey–Fuller)", "Unit root (non-stationary)", "NA", "NA", "Not available")
+    }
+    
+    # PP: H0 = unit root (non-stationary); reject => stationarity evidence
+    if (!is.null(pp)) {
+      p <- pp$p.value
+      dec <- if (is.finite(p) && p < 0.05) "Reject H0 → evidence for stationarity"
+      else "Fail to reject H0 → unit root plausible"
+      add_row("PP (Phillips–Perron)", "Unit root (non-stationary)",
+              fmt_num(unname(pp$statistic)), fmt_p(p), dec)
+    } else {
+      add_row("PP (Phillips–Perron)", "Unit root (non-stationary)", "NA", "NA", "Not available")
+    }
+    
+    # KPSS(Level): H0 = level-stationary; reject => non-stationarity evidence
+    if (!is.null(kpss_level)) {
+      p <- kpss_level$p.value
+      dec <- if (is.finite(p) && p < 0.05) "Reject H0 → evidence against stationarity"
+      else "Fail to reject H0 → stationarity plausible"
+      add_row("KPSS (Level)", "Level-stationary",
+              fmt_num(unname(kpss_level$statistic)), fmt_p(p), dec)
+    } else {
+      add_row("KPSS (Level)", "Level-stationary", "NA", "NA", "Not available")
+    }
+    
+    # KPSS(Trend): H0 = trend-stationary
+    if (!is.null(kpss_trend)) {
+      p <- kpss_trend$p.value
+      dec <- if (is.finite(p) && p < 0.05) "Reject H0 → evidence against trend-stationarity"
+      else "Fail to reject H0 → trend-stationarity plausible"
+      add_row("KPSS (Trend)", "Trend-stationary",
+              fmt_num(unname(kpss_trend$statistic)), fmt_p(p), dec)
+    } else {
+      add_row("KPSS (Trend)", "Trend-stationary", "NA", "NA", "Not available")
+    }
+    
+    st_df <- do.call(rbind, rows)
+    
+    # synthesis
+    adf_p <- if (!is.null(adf)) adf$p.value else NA_real_
+    pp_p  <- if (!is.null(pp))  pp$p.value  else NA_real_
+    kL_p  <- if (!is.null(kpss_level)) kpss_level$p.value else NA_real_
+    
+    unit_root_rejected <- any(c(adf_p, pp_p) < 0.05, na.rm = TRUE)
+    kpss_ok <- is.finite(kL_p) && kL_p >= 0.05
+    
+    conclusion <- if (unit_root_rejected && kpss_ok) {
+      "Across tests, ADF/PP reject the unit-root null (p < .05) while KPSS(Level) does not reject stationarity (p ≥ .05), which is consistent with a stationary series (given the current transformation)."
+    } else if (!unit_root_rejected && !kpss_ok) {
+      "ADF/PP do not reject the unit-root null (p ≥ .05) while KPSS(Level) rejects stationarity (p < .05), providing convergent evidence of non-stationarity and supporting the need for differencing (d and/or D)."
+    } else if (unit_root_rejected && !kpss_ok) {
+      "Evidence is mixed: ADF/PP suggest stationarity but KPSS(Level) rejects it. This can occur under breaks, strong seasonality, or test sensitivity; complement these results with differencing checks and ACF/PACF."
+    } else {
+      "Evidence is inconclusive: ADF/PP do not reject a unit root while KPSS(Level) does not reject stationarity. Because power can be limited, complement these tests with differencing diagnostics and ACF/PACF."
+    }
+    
+    # table renderer (HTML)
+    html_tbl <- tags$table(
+      class = "table table-striped table-condensed",
+      tags$thead(tags$tr(lapply(names(st_df), tags$th))),
+      tags$tbody(lapply(seq_len(nrow(st_df)), function(i) {
+        tags$tr(lapply(st_df[i, , drop = FALSE], function(cell) tags$td(HTML(as.character(cell)))))
+      }))
+    )
+    
+    tagList(
+      # tags$h4(tags$strong("3. Stationarity assessment (ADF, KPSS, and Phillips–Perron)")),
+      # tags$p("Stationarity tests were applied to the training series to evaluate whether differencing is required before SARIMA identification and estimation."),
+      html_tbl,
+      tags$p(tags$b("Conclusion. "), conclusion)
+    )
+  })
+  
+  
+  # ---- helper used by multiple outputs (define ONCE) ----
+  apply_sarima_diffs_report <- function(y, d = 0L, D = 0L, s = 1L) {
+    y <- as.numeric(y)
+    y <- y[is.finite(y)]
+    if (length(y) < 3) return(y)
+    
+    d <- as.integer(d); if (!is.finite(d) || d < 0) d <- 0L
+    D <- as.integer(D); if (!is.finite(D) || D < 0) D <- 0L
+    s <- as.integer(s); if (!is.finite(s) || s < 1) s <- 1L
+    
+    yy <- y
+    
+    if (D > 0 && s > 1) {
+      for (i in seq_len(D)) {
+        if (length(yy) <= s + 1) break
+        yy <- diff(yy, lag = s)
+      }
+    }
+    if (d > 0) {
+      for (i in seq_len(d)) {
+        if (length(yy) <= 2) break
+        yy <- diff(yy, lag = 1)
+      }
+    }
+    yy
+  }
+  
+  
+  # ---- B) Transformed training series vs differenced (d,D,s) ----
+  output$manual_report_ts_trans_and_diff <- renderPlot({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test(), prepared())
+    
+    s_obj <- ts_train_test()
+    p <- prepared()
+    
+    df <- s_obj$dfm
+    validate(need(nrow(df) >= 5, "Not enough observations to plot."))
+    
+    train_n <- s_obj$train_n
+    has_test <- isTRUE(s_obj$test_n > 0)
+    df_train <- if (has_test) df[seq_len(train_n), , drop = FALSE] else df
+    
+    validate(need(nrow(df_train) >= 5, "Not enough training observations to plot."))
+    
+    x_train <- df_train$x
+    y_train <- df_train$y_trans
+    
+    s_use <- if (is.null(input$s) || is.na(input$s)) p$freq else as.integer(input$s)
+    y_mod <- apply_sarima_diffs_report(y_train, d = input$d, D = input$D, s = s_use)
+    validate(need(length(y_mod) >= 3, "Differencing left too few observations to plot."))
+    
+    x_mod <- tail(x_train, length(y_mod))
+    
+    plot_df <- rbind(
+      data.frame(x = x_train, y = y_train, series = "Transformed (train)"),
+      data.frame(x = x_mod,   y = y_mod,   series = paste0("Differenced (d=", input$d, ", D=", input$D, ", s=", s_use, ")"))
+    )
+    
+    g <- ggplot(plot_df, aes(x = x, y = y, color = series)) +
+      geom_line(linewidth = 0.9) +
+      theme_minimal() +
+      labs(
+        title = "Training series: transformed vs differenced",
+        x = p$x_label,
+        y = "Value",
+        color = NULL
+      ) +
+      theme(legend.position = "bottom")
+    
+    if (inherits(plot_df$x, "Date")) {
+      g <- g + scale_x_date(labels = scales::date_format("%Y-%m"),
+                            breaks = scales::pretty_breaks(n = 8))
+    } else if (inherits(plot_df$x, "POSIXt")) {
+      g <- g + scale_x_datetime(labels = scales::date_format("%Y-%m"),
+                                breaks = scales::pretty_breaks(n = 8))
+    }
+    
+    g
+  })
+  
+  
+  # ---- C) Seasonal subseries (full observed) ----
+  # output$manual_report_subseries <- renderPlot({
+  #   req(manual_conclusion_full_obj())
+  #   req(ts_train_test())
+  #   
+  #   s_obj <- ts_train_test()
+  #   
+  #   x_full <- ts(
+  #     c(as.numeric(s_obj$ts_train),
+  #       if (!is.null(s_obj$ts_test) && length(s_obj$ts_test) > 0) as.numeric(s_obj$ts_test) else numeric(0)),
+  #     start = 1,
+  #     frequency = frequency(s_obj$ts_train)
+  #   )
+  #   
+  #   validate(need(frequency(x_full) >= 2, "Seasonal subseries plot requires seasonal frequency (s) >= 2."))
+  #   validate(need(length(x_full) >= 2 * frequency(x_full), "Need at least 2 seasonal cycles for a subseries plot."))
+  #   
+  #   forecast::ggsubseriesplot(x_full) +
+  #     theme_minimal() +
+  #     labs(title = "Seasonal subseries (observed series)", x = "Seasonal period", y = "Value")
+  # })
+  
+  
+  # ---- D) Seasonal box-plot (full observed) ----
+  # output$manual_report_seasonal_box <- renderPlot({
+  #   req(manual_conclusion_full_obj())
+  #   req(ts_train_test())
+  #   
+  #   s_obj <- ts_train_test()
+  #   
+  #   x_full <- ts(
+  #     c(as.numeric(s_obj$ts_train),
+  #       if (!is.null(s_obj$ts_test) && length(s_obj$ts_test) > 0) as.numeric(s_obj$ts_test) else numeric(0)),
+  #     start = 1,
+  #     frequency = frequency(s_obj$ts_train)
+  #   )
+  #   
+  #   validate(need(frequency(x_full) >= 2, "Seasonal box-plot requires seasonal frequency (s) >= 2."))
+  #   validate(need(length(x_full) >= frequency(x_full), "Need at least 1 seasonal cycle for a box-plot."))
+  #   
+  #   df <- data.frame(
+  #     value  = as.numeric(x_full),
+  #     season = factor(cycle(x_full), ordered = TRUE)
+  #   )
+  #   df <- df[is.finite(df$value), , drop = FALSE]
+  #   validate(need(nrow(df) >= 5, "Not enough valid observations for seasonal box-plot."))
+  #   
+  #   ggplot(df, aes(x = season, y = value)) +
+  #     geom_boxplot(fill = "#2C7FB8", alpha = 0.45, outlier.alpha = 0.4) +
+  #     theme_minimal() +
+  #     labs(title = "Seasonal box-plot (observed series)", x = "Seasonal period", y = "Value")
+  # })
+  
+  
+  # ---- C) Seasonal subseries (TRAINING ONLY) ----
+  output$manual_report_subseries <- renderPlot({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test())
+    
+    s_obj <- ts_train_test()
+    
+    x_train <- s_obj$ts_train
+    validate(need(inherits(x_train, "ts"), "Training series is not a 'ts' object."))
+    validate(need(stats::frequency(x_train) >= 2, "Seasonal subseries plot requires seasonal frequency (s) >= 2."))
+    validate(need(length(x_train) >= 2 * stats::frequency(x_train),
+                  "Need at least 2 seasonal cycles in the TRAINING set for a subseries plot."))
+    
+    forecast::ggsubseriesplot(x_train) +
+      theme_minimal() +
+      labs(title = "Seasonal subseries (training series)", x = "Seasonal period", y = "Value")
+  })
+  
+  
+  # ---- D) Seasonal box-plot (TRAINING ONLY) ----
+  output$manual_report_seasonal_box <- renderPlot({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test())
+    
+    s_obj <- ts_train_test()
+    
+    x_train <- s_obj$ts_train
+    validate(need(inherits(x_train, "ts"), "Training series is not a 'ts' object."))
+    validate(need(stats::frequency(x_train) >= 2, "Seasonal box-plot requires seasonal frequency (s) >= 2."))
+    validate(need(length(x_train) >= stats::frequency(x_train),
+                  "Need at least 1 seasonal cycle in the TRAINING set for a box-plot."))
+    
+    df <- data.frame(
+      value  = as.numeric(x_train),
+      season = factor(stats::cycle(x_train), ordered = TRUE)
+    )
+    df <- df[is.finite(df$value), , drop = FALSE]
+    validate(need(nrow(df) >= 5, "Not enough valid training observations for seasonal box-plot."))
+    
+    ggplot(df, aes(x = season, y = value)) +
+      geom_boxplot(fill = "#2C7FB8", alpha = 0.45, outlier.alpha = 0.4) +
+      theme_minimal() +
+      labs(title = "Seasonal box-plot (training series)", x = "Seasonal period", y = "Value")
+  })
+  
+  
+  # ---- E) ACF / PACF of training series ----
+  output$manual_report_acf <- renderPlot({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test())
+    
+    x <- ts_train_test()$ts_train
+    validate(need(length(x) >= 5, "Not enough training observations for ACF."))
+    
+    forecast::ggAcf(x, lag.max = min(60, length(x) - 1)) +
+      theme_minimal() +
+      labs(title = "ACF (training)")
+  })
+  
+  output$manual_report_pacf <- renderPlot({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test())
+    
+    x <- ts_train_test()$ts_train
+    validate(need(length(x) >= 5, "Not enough training observations for PACF."))
+    
+    forecast::ggPacf(x, lag.max = min(60, length(x) - 1)) +
+      theme_minimal() +
+      labs(title = "PACF (training)")
+  })
+  
+  
+  # ---- F) ACF / PACF of differenced series ----
+  output$manual_report_acf_mod <- renderPlot({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test(), prepared())
+    
+    s_obj <- ts_train_test()
+    p <- prepared()
+    
+    y <- as.numeric(s_obj$ts_train)
+    s_use <- if (is.null(input$s) || is.na(input$s)) p$freq else as.integer(input$s)
+    y_mod <- apply_sarima_diffs_report(y, d = input$d, D = input$D, s = s_use)
+    
+    validate(need(length(y_mod) >= 5, "Differencing left too few observations for ACF."))
+    
+    ts_mod <- ts(y_mod, frequency = p$freq)
+    
+    forecast::ggAcf(ts_mod, lag.max = min(60, length(ts_mod) - 1)) +
+      theme_minimal() +
+      labs(title = paste0("ACF (d=", input$d, ", D=", input$D, ", s=", s_use, ")"))
+  })
+  
+  output$manual_report_pacf_mod <- renderPlot({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test(), prepared())
+    
+    s_obj <- ts_train_test()
+    p <- prepared()
+    
+    y <- as.numeric(s_obj$ts_train)
+    s_use <- if (is.null(input$s) || is.na(input$s)) p$freq else as.integer(input$s)
+    y_mod <- apply_sarima_diffs_report(y, d = input$d, D = input$D, s = s_use)
+    
+    validate(need(length(y_mod) >= 5, "Differencing left too few observations for PACF."))
+    
+    ts_mod <- ts(y_mod, frequency = p$freq)
+    
+    forecast::ggPacf(ts_mod, lag.max = min(60, length(ts_mod) - 1)) +
+      theme_minimal() +
+      labs(title = paste0("PACF (d=", input$d, ", D=", input$D, ", s=", s_use, ")"))
+  })
+  
+  
+  
+  # ---- NEW: Stationarity tests on differenced/transformed series (d, D, s) ----
+  output$manual_report_stationarity_mod <- renderUI({
+    req(manual_conclusion_full_obj())
+    req(ts_train_test(), prepared())
+    
+    validate(need(requireNamespace("tseries", quietly = TRUE),
+                  "Package 'tseries' is required for stationarity tests (ADF/PP/KPSS)."))
+    
+    s_obj <- ts_train_test()
+    p <- prepared()
+    
+    # training series
+    y <- as.numeric(s_obj$ts_train)
+    y <- y[is.finite(y)]
+    
+    # apply differencing implied by current d, D, s
+    s_use <- if (is.null(input$s) || is.na(input$s)) p$freq else as.integer(input$s)
+    y_mod <- apply_sarima_diffs_report(y, d = input$d, D = input$D, s = s_use)
+    y_mod <- as.numeric(y_mod)
+    y_mod <- y_mod[is.finite(y_mod)]
+    
+    validate(need(length(y_mod) >= 10,
+                  "Not enough observations after differencing (d, D, s) to run stationarity tests (need ≥ 10)."))
+    
+    fmt_num <- function(z, d = 3) {
+      z <- suppressWarnings(as.numeric(z))
+      if (length(z) == 0 || !is.finite(z[1])) return("NA")
+      formatC(z[1], format = "f", digits = d)
+    }
+    fmt_p <- function(pv) {
+      pv <- suppressWarnings(as.numeric(pv))
+      if (length(pv) == 0 || !is.finite(pv[1])) return("NA")
+      if (pv[1] < .001) "p < .001" else paste0("p = ", sub("^0\\.", ".", sprintf("%.3f", pv[1])))
+    }
+    
+    # safe lag choice for ADF (based on effective sample)
+    k_adf <- max(0, min(12, floor((length(y_mod) - 1)^(1/3))))
+    
+    adf <- tryCatch(tseries::adf.test(y_mod, k = k_adf), error = function(e) NULL)
+    pp  <- tryCatch(tseries::pp.test(y_mod, lshort = TRUE), error = function(e) NULL)
+    kpss_level <- tryCatch(tseries::kpss.test(y_mod, null = "Level", lshort = TRUE), error = function(e) NULL)
+    kpss_trend <- tryCatch(tseries::kpss.test(y_mod, null = "Trend", lshort = TRUE), error = function(e) NULL)
+    
+    rows <- list()
+    add_row <- function(test, null_h, stat, pval, decision) {
+      rows[[length(rows) + 1L]] <<- data.frame(
+        Test = test,
+        `H0 (null)` = null_h,
+        Statistic = stat,
+        `p-value` = pval,
+        Decision = decision,
+        check.names = FALSE
+      )
+    }
+    
+    # ADF
+    if (!is.null(adf)) {
+      pv <- adf$p.value
+      dec <- if (is.finite(pv) && pv < 0.05) "Reject H0 → evidence for stationarity"
+      else "Fail to reject H0 → unit root plausible"
+      add_row("ADF (Augmented Dickey–Fuller)", "Unit root (non-stationary)",
+              fmt_num(unname(adf$statistic)), fmt_p(pv), dec)
+    } else {
+      add_row("ADF (Augmented Dickey–Fuller)", "Unit root (non-stationary)", "NA", "NA", "Not available")
+    }
+    
+    # PP
+    if (!is.null(pp)) {
+      pv <- pp$p.value
+      dec <- if (is.finite(pv) && pv < 0.05) "Reject H0 → evidence for stationarity"
+      else "Fail to reject H0 → unit root plausible"
+      add_row("PP (Phillips–Perron)", "Unit root (non-stationary)",
+              fmt_num(unname(pp$statistic)), fmt_p(pv), dec)
+    } else {
+      add_row("PP (Phillips–Perron)", "Unit root (non-stationary)", "NA", "NA", "Not available")
+    }
+    
+    # KPSS Level
+    if (!is.null(kpss_level)) {
+      pv <- kpss_level$p.value
+      dec <- if (is.finite(pv) && pv < 0.05) "Reject H0 → evidence against stationarity"
+      else "Fail to reject H0 → stationarity plausible"
+      add_row("KPSS (Level)", "Level-stationary",
+              fmt_num(unname(kpss_level$statistic)), fmt_p(pv), dec)
+    } else {
+      add_row("KPSS (Level)", "Level-stationary", "NA", "NA", "Not available")
+    }
+    
+    # KPSS Trend
+    if (!is.null(kpss_trend)) {
+      pv <- kpss_trend$p.value
+      dec <- if (is.finite(pv) && pv < 0.05) "Reject H0 → evidence against trend-stationarity"
+      else "Fail to reject H0 → trend-stationarity plausible"
+      add_row("KPSS (Trend)", "Trend-stationary",
+              fmt_num(unname(kpss_trend$statistic)), fmt_p(pv), dec)
+    } else {
+      add_row("KPSS (Trend)", "Trend-stationary", "NA", "NA", "Not available")
+    }
+    
+    st_df <- do.call(rbind, rows)
+    
+    # synthesis
+    adf_p <- if (!is.null(adf)) adf$p.value else NA_real_
+    pp_p  <- if (!is.null(pp))  pp$p.value  else NA_real_
+    kL_p  <- if (!is.null(kpss_level)) kpss_level$p.value else NA_real_
+    
+    unit_root_rejected <- any(c(adf_p, pp_p) < 0.05, na.rm = TRUE)
+    kpss_ok <- is.finite(kL_p) && kL_p >= 0.05
+    
+    conclusion <- if (unit_root_rejected && kpss_ok) {
+      paste0(
+        "After applying differencing (d=", input$d, ", D=", input$D, ", s=", s_use, "), ",
+        "ADF/PP reject the unit-root null (p < .05) while KPSS(Level) does not reject stationarity (p ≥ .05). ",
+        "This pattern is consistent with a stationary series after differencing."
+      )
+    } else if (!unit_root_rejected && !kpss_ok) {
+      paste0(
+        "After differencing (d=", input$d, ", D=", input$D, ", s=", s_use, "), ",
+        "ADF/PP do not reject a unit root (p ≥ .05) and KPSS(Level) rejects stationarity (p < .05). ",
+        "This suggests the series may still be non-stationary (consider revising d/D or checking breaks/seasonality)."
+      )
+    } else if (unit_root_rejected && !kpss_ok) {
+      paste0(
+        "After differencing (d=", input$d, ", D=", input$D, ", s=", s_use, "), evidence is mixed: ",
+        "ADF/PP suggest stationarity but KPSS(Level) rejects it. This can happen with breaks, strong seasonal effects, ",
+        "or finite-sample sensitivity; complement with diagnostics/visual checks."
+      )
+    } else {
+      paste0(
+        "After differencing (d=", input$d, ", D=", input$D, ", s=", s_use, "), evidence is inconclusive: ",
+        "ADF/PP do not reject a unit root while KPSS(Level) does not reject stationarity. ",
+        "Use ACF/PACF of the differenced series and consider alternative lag choices or structural breaks."
+      )
+    }
+    
+    html_tbl <- tags$table(
+      class = "table table-striped table-condensed",
+      tags$thead(tags$tr(lapply(names(st_df), tags$th))),
+      tags$tbody(lapply(seq_len(nrow(st_df)), function(i) {
+        tags$tr(lapply(st_df[i, , drop = FALSE], function(cell) tags$td(HTML(as.character(cell)))))
+      }))
+    )
+    
+    tagList(
+      tags$h4(tags$strong(paste0(
+        "Stationarity assessment after differencing (d=", input$d,
+        ", D=", input$D, ", s=", s_use, ")"
+      ))),
+      tags$p("The same stationarity tests were re-applied to the training series after applying the current differencing settings to verify that the working series is stationary."),
+      tags$br(),
+      html_tbl,
+      tags$p(tags$b("Conclusion. "), conclusion)
+    )
+  })
+  
+  
+  
+  # ------------------------------------------------------------
+  # (B) manual_conclusion_full_obj (eventReactive) — UI builder ONLY
+  # ------------------------------------------------------------
+  manual_conclusion_full_obj <- eventReactive(input$fit_manual, {
+    req(manual_fit(), manual_fc(), manual_equations(), ts_train_test())
+    
+    fit <- manual_fit()
+    fc0 <- manual_fc()
+    fc  <- fc0$fc
+    eq  <- manual_equations()
+    s   <- ts_train_test()
+    
+    # ---------- helpers (local + safe)
+    fmt_num_local <- function(x, d = 3) {
+      if (length(x) == 0 || all(is.na(x))) return("NA")
+      x <- suppressWarnings(as.numeric(x[1]))
+      if (!is.finite(x)) return("NA")
+      formatC(x, format = "f", digits = d)
+    }
+    fmt_p_local <- function(p) {
+      if (length(p) == 0 || all(is.na(p))) return("NA")
+      p <- suppressWarnings(as.numeric(p[1]))
+      if (!is.finite(p)) return("NA")
+      if (p < .001) "&lt; .001" else sprintf("= %.3f", p)
+    }
+    sig_stars <- function(p) {
+      p <- suppressWarnings(as.numeric(p))
+      if (!is.finite(p)) return("")
+      if (p < .001) "***" else if (p < .01) "**" else if (p < .05) "*" else if (p < .10) "†" else ""
+    }
+    safe_len <- function(x) if (is.null(x)) 0L else length(x)
+    
+    html_table <- function(df) {
+      if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+        return(tags$em("Table unavailable."))
+      }
+      tags$table(
+        class = "table table-striped table-condensed",
+        tags$thead(tags$tr(lapply(names(df), function(nm) tags$th(nm)))),
+        tags$tbody(
+          lapply(seq_len(nrow(df)), function(i) {
+            tags$tr(lapply(df[i, , drop = FALSE], function(cell) tags$td(HTML(as.character(cell)))))
+          })
+        )
+      )
+    }
+    
+    # ---------- sample sizes (safe)
+    n_train <- suppressWarnings(as.integer(s$train_n))
+    if (!is.finite(n_train) || n_train < 1) n_train <- tryCatch(length(residuals(fit)), error = function(e) 0L)
+    
+    n_test <- suppressWarnings(as.integer(s$test_n))
+    if (!is.finite(n_test) || n_test < 0) n_test <- 0L
+    
+    N <- n_train + n_test
+    
+    # ---------- lag choice (safe)
+    L_in <- suppressWarnings(as.integer(input$diag_lag))
+    L <- if (is.finite(L_in) && L_in > 0) L_in else 12L
+    
+    # ============================================================
+    # ---------- IC (safe + robust AICc fallback)
+    # ============================================================
+    AIC_val <- suppressWarnings(tryCatch(as.numeric(stats::AIC(fit)), error = function(e) NA_real_))
+    BIC_val <- suppressWarnings(tryCatch(as.numeric(stats::BIC(fit)), error = function(e) NA_real_))
+    
+    AICc_val <- suppressWarnings(tryCatch(as.numeric(forecast::AICc(fit)), error = function(e) NA_real_))
+    
+    if (!is.finite(AICc_val) && is.finite(AIC_val)) {
+      n_fit <- suppressWarnings(tryCatch(stats::nobs(fit), error = function(e) NA_integer_))
+      if (!is.finite(n_fit) || n_fit <= 0) {
+        r <- suppressWarnings(tryCatch(as.numeric(residuals(fit)), error = function(e) numeric(0)))
+        n_fit <- sum(is.finite(r))
+      }
+      if (!is.finite(n_fit) || n_fit <= 0) n_fit <- n_train
+      
+      k <- suppressWarnings(tryCatch(length(stats::coef(fit)), error = function(e) NA_integer_))
+      if (!is.finite(k) || k < 0) k <- 0L
+      k <- k + 1L
+      
+      if (is.finite(n_fit) && n_fit > (k + 1)) {
+        AICc_val <- AIC_val + (2 * k * (k + 1)) / (n_fit - k - 1)
+      } else {
+        AICc_val <- NA_real_
+      }
+    }
+    
+    ic_df <- data.frame(
+      Criterion = c("AIC", "AICc", "BIC"),
+      Value     = c(fmt_num_local(AIC_val, 2), fmt_num_local(AICc_val, 2), fmt_num_local(BIC_val, 2)),
+      check.names = FALSE
+    )
+    
+    # ---------- coefficients + significance (robust)
+    est <- suppressWarnings(tryCatch(stats::coef(fit), error = function(e) NULL))
+    V   <- suppressWarnings(tryCatch(stats::vcov(fit), error = function(e) NULL))
+    if (is.null(V)) V <- suppressWarnings(tryCatch(fit$var.coef, error = function(e) NULL))
+    
+    coef_df <- NULL
+    if (!is.null(est) && length(est) > 0) {
+      est <- as.numeric(est)
+      nm  <- names(stats::coef(fit))
+      if (is.null(nm)) nm <- paste0("param_", seq_along(est))
+      
+      se <- rep(NA_real_, length(est))
+      if (!is.null(V)) {
+        dV <- tryCatch(diag(V), error = function(e) rep(NA_real_, length(est)))
+        if (length(dV) == length(est)) se <- sqrt(pmax(dV, 0))
+      }
+      z  <- est / se
+      p  <- 2 * stats::pnorm(-abs(z))
+      
+      coef_df <- data.frame(
+        Term     = nm,
+        Estimate = sprintf("%.6f", est),
+        SE       = ifelse(is.finite(se), sprintf("%.6f", se), "NA"),
+        `z/t`    = ifelse(is.finite(z),  sprintf("%.3f",  z),  "NA"),
+        `p`      = ifelse(is.finite(p),  sprintf("%.3f",  p),  "NA"),
+        Sig      = vapply(p, sig_stars, character(1)),
+        check.names = FALSE
+      )
+    }
+    
+    n_sig <- if (!is.null(coef_df)) sum(suppressWarnings(as.numeric(coef_df$p)) < 0.05, na.rm = TRUE) else 0L
+    
+    # ---------- residuals (safe)
+    res <- suppressWarnings(tryCatch(as.numeric(residuals(fit)), error = function(e) numeric(0)))
+    res <- res[is.finite(res)]
+    n_res <- length(res)
+    
+    fitdf <- if (!is.null(est)) length(est) else 0L
+    
+    lb_lag <- min(L, max(1L, floor(n_res / 3)))
+    lb <- if (n_res >= 5) {
+      tryCatch(stats::Box.test(res, lag = lb_lag, type = "Ljung-Box", fitdf = fitdf), error = function(e) NULL)
+    } else NULL
+    
+    bp <- if (n_res >= 5) {
+      tryCatch(stats::Box.test(res, lag = lb_lag, type = "Box-Pierce", fitdf = fitdf), error = function(e) NULL)
+    } else NULL
+    
+    jb <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 5) {
+      tryCatch(tseries::jarque.bera.test(res), error = function(e) NULL)
+    } else NULL
+    
+    sw <- if (n_res >= 3 && n_res <= 5000) {
+      tryCatch(stats::shapiro.test(res), error = function(e) NULL)
+    } else NULL
+    
+    arch <- if (requireNamespace("FinTS", quietly = TRUE) && n_res >= 10) {
+      tryCatch(FinTS::ArchTest(res, lags = min(12L, max(1L, floor(L / 2)))), error = function(e) NULL)
+    } else NULL
+    
+    runs <- if (requireNamespace("tseries", quietly = TRUE) && n_res >= 10) {
+      tryCatch(tseries::runs.test(res), error = function(e) NULL)
+    } else NULL
+    
+    ad <- if (requireNamespace("nortest", quietly = TRUE) && n_res >= 8) {
+      tryCatch(nortest::ad.test(res), error = function(e) NULL)
+    } else NULL
+    
+    test_rows <- list()
+    add_test <- function(name, stat, pval, note = "") {
+      test_rows[[length(test_rows) + 1L]] <<- data.frame(
+        Test = name,
+        Statistic = if (is.null(stat)) "NA" else fmt_num_local(stat, 3),
+        `p-value` = if (is.null(pval)) "NA" else fmt_p_local(pval),
+        Interpretation = note,
+        check.names = FALSE
+      )
+    }
+    
+    add_test(
+      "Ljung–Box (residuals)",
+      if (!is.null(lb)) unname(lb$statistic) else NULL,
+      if (!is.null(lb)) unname(lb$p.value) else NULL,
+      if (!is.null(lb)) {
+        if (is.finite(lb$p.value) && lb$p.value >= 0.05) "No evidence of remaining autocorrelation (white-noise compatible)."
+        else "Evidence of remaining autocorrelation (model may be under-specified)."
+      } else "Not available."
+    )
+    
+    add_test(
+      "Box–Pierce (residuals)",
+      if (!is.null(bp)) unname(bp$statistic) else NULL,
+      if (!is.null(bp)) unname(bp$p.value) else NULL,
+      if (!is.null(bp)) {
+        if (is.finite(bp$p.value) && bp$p.value >= 0.05) "Consistent with uncorrelated residuals."
+        else "Suggests residual autocorrelation."
+      } else "Not available."
+    )
+    
+    add_test(
+      "Jarque–Bera (normality)",
+      if (!is.null(jb)) unname(jb$statistic) else NULL,
+      if (!is.null(jb)) unname(jb$p.value) else NULL,
+      if (!is.null(jb)) {
+        if (is.finite(jb$p.value) && jb$p.value >= 0.05) "No evidence against normality."
+        else "Residuals deviate from normality (common in real series)."
+      } else "Package 'tseries' missing or test unavailable."
+    )
+    
+    add_test(
+      "Shapiro–Wilk (normality)",
+      if (!is.null(sw)) unname(sw$statistic) else NULL,
+      if (!is.null(sw)) unname(sw$p.value) else NULL,
+      if (!is.null(sw)) {
+        if (is.finite(sw$p.value) && sw$p.value >= 0.05) "No evidence against normality."
+        else "Evidence against normality."
+      } else if (n_res > 5000) "Not computed (n > 5000)." else "Not available."
+    )
+    
+    add_test(
+      "ARCH LM (heteroskedasticity)",
+      if (!is.null(arch)) unname(arch$statistic) else NULL,
+      if (!is.null(arch)) unname(arch$p.value) else NULL,
+      if (!is.null(arch)) {
+        if (is.finite(arch$p.value) && arch$p.value >= 0.05) "No evidence of remaining ARCH effects."
+        else "Evidence of ARCH effects → consider GARCH for variance."
+      } else "Package 'FinTS' missing or test unavailable."
+    )
+    
+    add_test(
+      "Runs test (randomness)",
+      if (!is.null(runs)) unname(runs$statistic) else NULL,
+      if (!is.null(runs)) unname(runs$p.value) else NULL,
+      if (!is.null(runs)) {
+        if (is.finite(runs$p.value) && runs$p.value >= 0.05) "No evidence against randomness."
+        else "Evidence of non-randomness (structure may remain)."
+      } else "Package 'tseries' missing or test unavailable."
+    )
+    
+    add_test(
+      "Anderson–Darling (normality)",
+      if (!is.null(ad)) unname(ad$statistic) else NULL,
+      if (!is.null(ad)) unname(ad$p.value) else NULL,
+      if (!is.null(ad)) {
+        if (is.finite(ad$p.value) && ad$p.value >= 0.05) "No evidence against normality."
+        else "Evidence against normality (sensitive in tails)."
+      } else "Package 'nortest' missing or test unavailable."
+    )
+    
+    tests_df <- if (length(test_rows)) do.call(rbind, test_rows) else data.frame()
+    
+    # ---------- forecast accuracy (safe)
+    acc_df <- NULL
+    acc_sentence <- "No holdout test set was detected; therefore, out-of-sample accuracy was not computed."
+    
+    y_test <- s$ts_test
+    has_test <- !is.null(y_test) && safe_len(y_test) > 0 && n_test > 0
+    
+    if (has_test) {
+      y_test_num <- as.numeric(y_test)
+      y_hat_num  <- suppressWarnings(tryCatch(as.numeric(fc$mean), error = function(e) rep(NA_real_, length(y_test_num))))
+      h <- min(length(y_test_num), length(y_hat_num))
+      if (h >= 1) {
+        e <- y_test_num[seq_len(h)] - y_hat_num[seq_len(h)]
+        rmse <- sqrt(mean(e^2, na.rm = TRUE))
+        mae  <- mean(abs(e), na.rm = TRUE)
+        mape <- mean(abs(e) / pmax(abs(y_test_num[seq_len(h)]), .Machine$double.eps), na.rm = TRUE)
+        
+        acc_df <- data.frame(
+          Metric = c("RMSE", "MAE", "MAPE"),
+          Value  = c(fmt_num_local(rmse, 3), fmt_num_local(mae, 3), paste0(fmt_num_local(100*mape, 2), "%")),
+          check.names = FALSE
+        )
+        
+        acc_sentence <- paste0(
+          "Over the holdout period (test n = ", h, "), forecast performance was ",
+          "RMSE = ", fmt_num_local(rmse, 3), ", ",
+          "MAE = ", fmt_num_local(mae, 3), ", ",
+          "MAPE = ", fmt_num_local(100*mape, 2), "%."
+        )
+      }
+    }
+    
+    # ---------- horizon narrative
+    horizon_txt <- if (has_test) {
+      paste0("Validation mode was used: the forecast horizon was forced to match the test length (h = ", n_test, ").")
+    } else {
+      paste0("Future mode was used: forecasts were produced beyond the training sample (h = ", fc0$h, ").")
+    }
+    
+    # ---------- model string
+    season_txt <- suppressWarnings(as.integer(eq$s))
+    s_txt <- if (is.finite(season_txt) && season_txt > 0) as.character(season_txt) else "s"
+    
+    model_str <- sprintf(
+      "SARIMA(%d,%d,%d)(%d,%d,%d)[%s]",
+      eq$p, eq$d, eq$q, eq$P, eq$D, eq$Q, s_txt
+    )
+    
+    # ---------- diagnostic verdict
+    lb_ok <- !is.null(lb) && is.finite(lb$p.value) && lb$p.value >= 0.05
+    arch_ok <- is.null(arch) || (is.finite(arch$p.value) && arch$p.value >= 0.05)
+    diag_verdict <- paste0(
+      if (lb_ok) "Residual autocorrelation was not statistically detected (Ljung–Box p ≥ .05). "
+      else "Residual autocorrelation may remain (Ljung–Box p < .05). ",
+      if (arch_ok) "No clear evidence of residual ARCH effects was found (or test unavailable)."
+      else "Residual ARCH effects were detected → a GARCH extension is recommended."
+    )
+    
+    # ---------- build report UI (NO output$ definitions here)
+    tagList(
+      tags$h3("Manual SARIMA: Full academic conclusion (report-ready)"),
+      
+      
+      # 1. Objective and modelling rationale
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("1. Objective and modelling rationale")),
+      tags$p(
+        "A manually specified seasonal ARIMA (SARIMA) model was estimated to represent linear temporal dependence,",
+        " including seasonal structure, and to provide an interpretable baseline for forecasting."
+      ),
+      
+      
+      # 2. Data design and sample split
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("2. Data design and sample split")),
+      tags$p(HTML(paste0(
+        "The analysis used <b>N = ", N, "</b> observations (training <b>n = ", n_train, "</b>",
+        if (has_test) paste0(", test <b>n = ", n_test, "</b>") else "",
+        ")."
+      ))),
+      tags$p(tags$b("Forecast design. "), horizon_txt),
+      
+      
+      # 3. Identification visuals (time series + ACF/PACF)
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("3. Identification visuals (time series + ACF/PACF)")),
+      tags$p(
+        "The plots below summarize the observed series (with the train/test split, if applicable), ",
+        "followed by ACF/PACF for the training series and for the differenced series implied by the chosen (d, D, s)."
+      ),
+      
+      tags$br(), 
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure A. Time series with split marker")),
+      plotOutput("manual_report_ts_plot", height = 360),
+      
+      # 4. Stationarity assessment (ADF, KPSS, and Phillips–Perron)
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("4. Stationarity assessment (ADF, KPSS, and Phillips–Perron)")),
+      tags$p("Stationarity tests were applied to the training series to evaluate whether differencing is required before SARIMA identification and estimation."),
+      tags$hr(),
+      uiOutput("manual_report_stationarity"),
+      
+      
+      # 5. Transformed series: differencing and seasonality
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("5. Transformed series: differencing and seasonality")),
+      
+
+      tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure B. Seasonal subseries")),
+      plotOutput("manual_report_subseries", height = 360),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure C. Seasonal box-plot")),
+      plotOutput("manual_report_seasonal_box", height = 360),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure D. Transformed training series and differenced (d, D, s) series")),
+      plotOutput("manual_report_ts_trans_and_diff", height = 360),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure E. ACF and PACF (training series)")),
+      fluidRow(
+        column(6, plotOutput("manual_report_acf",  height = 280)),
+        column(6, plotOutput("manual_report_pacf", height = 280))
+      ),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Figure F. ACF and PACF (modified / differenced series using current d, D, s)")),
+      fluidRow(
+        column(6, plotOutput("manual_report_acf_mod",  height = 280)),
+        column(6, plotOutput("manual_report_pacf_mod", height = 280))
+      ),
+      
+      
+      tags$hr(), tags$br(),
+      uiOutput("manual_report_stationarity_mod"),
+      
+      # 6. Final model specification and fit quality
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("6. Final model specification and fit quality")),
+      tags$p(HTML(paste0(
+        "The final manual specification was <b>", model_str, "</b>",
+        if (isTRUE(input$manual_drift)) " including drift/mean." else " without drift/mean.",
+        " Model adequacy was assessed using information criteria, coefficient inference, residual diagnostics, and forecast performance."
+      ))),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table A. Goodness-of-fit (information criteria)")),
+      html_table(ic_df),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table B. Parameter estimates and significance (approx. z/t tests)")),
+      if (!is.null(coef_df)) html_table(coef_df) else tags$em("No coefficients available."),
+      tags$p(HTML(paste0(
+        "In total, <b>", n_sig, "</b> parameter(s) were significant at α = .05 (marked by *, **, ***)."
+      ))),
+      
+      
+      
+      # 7. Model equations (replication-ready
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("7. Model equations (replication-ready)")),
+      tags$p(
+        "The fitted model is reported below in operator notation (general form), expanded form, and the numerical equation",
+        " based on the estimated parameters."
+      ),
+      tags$div(
+        style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;",
+        tags$h5("General SARIMA formulation"),
+        HTML(eq$eq_general),
+        tags$hr(),
+        tags$h5("Expanded operator form"),
+        HTML(eq$eq_expanded),
+        tags$hr(),
+        tags$h5("Numerical model"),
+        HTML(eq$eq_line3),
+        tags$hr(),
+        HTML(eq$eq_line4)
+      ),
+      
+      
+      
+      # 8. Residual diagnostics (graphical evidence
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("8. Residual diagnostics (graphical evidence)")),
+      tags$p(
+        "Graphical diagnostics evaluate whether residuals resemble white noise (no systematic autocorrelation),",
+        " approximate normality (Q–Q and histogram), and stable variance."
+      ),
+      
+      fluidRow(
+        column(6, plotOutput("manual_resid_ts",   height = 220)),
+        column(6, plotOutput("manual_resid_acf",  height = 220))
+      ),
+      fluidRow(
+        column(6, plotOutput("manual_resid_hist", height = 220)),
+        column(6, plotOutput("manual_resid_qq",   height = 220))
+      ),
+      
+      
+      tags$h5("Ljung–Box p-values by lag"),
+      plotOutput("manual_resid_lb_pvals", height = 260),
+      
+      
+      
+      # "9. Residual tests (formal inference
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("9. Residual tests (formal inference)")),
+      tags$p(
+        "Formal tests complement the plots: Ljung–Box/Box–Pierce assess remaining autocorrelation;",
+        " Jarque–Bera/Shapiro–Wilk/Anderson–Darling assess normality;",
+        " ARCH LM tests conditional heteroskedasticity; the runs test checks randomness."
+      ),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Table C. Residual test summary")),
+      html_table(tests_df),
+      tags$p(tags$b("Diagnostic synthesis. "), diag_verdict),
+      
+      
+      
+      # 10. Forecasting results and predictive performance
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("10. Forecasting results and predictive performance")),
+      tags$p(acc_sentence),
+      
+      if (!is.null(acc_df)) tagList(
+        tags$h5("Table D. Holdout accuracy (test set)"),
+        html_table(acc_df)
+      ) else NULL,
+      
+      tags$hr(),  tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Forecast plot")),
+      plotOutput("manual_forecast_plot", height = 420),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Forecast table")),
+      tableOutput("manual_forecast_table"),
+      
+      tags$hr(), tags$br(),
+      tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Accuracy table (your app output)")),
+      tableOutput("manual_accuracy_table"),
+      
+      
+      # 11. Final conclusion (academic)
+      tags$hr(), tags$br(),
+      tags$h4(tags$strong("11. Final conclusion")),
+      tags$p(
+        "Overall, the manually specified SARIMA model provides a coherent and interpretable representation of seasonal linear dynamics,",
+        " supported by information criteria, statistically interpretable parameters, and diagnostic checks.",
+        " When diagnostics indicate remaining autocorrelation, refinement should prioritize revising differencing (d, D) and AR/MA orders guided by ACF/PACF and Ljung–Box.",
+        " When conditional heteroskedasticity is detected (ARCH LM), a volatility model (e.g., GARCH) should be added to the mean equation to better represent time-varying variance."
+      ),
+      tags$p(
+        "For reporting, the results above provide the full chain of evidence typically expected in academic manuscripts:",
+        " (i) specification + IC, (ii) parameter inference, (iii) equation reporting, (iv) residual validation with plots and tests, and (v) forecasting with accuracy assessment."
+      ),
+      
+      tags$br(), tags$hr(), tags$br(), tags$br(),
+      
+    )
+  })
+  
+  
+  
+  # IMPORTANT: renderUI wrapper + MathJax re-typeset (this is what makes equations show correctly)
+  output$manual_conclusion_full <- renderUI({
+    ui <- manual_conclusion_full_obj()
+    
+    # Re-typeset MathJax after the UI is inserted into the DOM
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "manual_conclusion_box")
+    }, once = TRUE)
+    
+    ui
+  })
+  
+  
+  
+  
+  
+  # manual_conclusion_full_obj <- eventReactive(input$fit_manual, {
+  #   req(manual_fit(), manual_fc(), manual_equations(), ts_train_test())
+  #   
+  #   fit <- manual_fit()
+  #   fc0 <- manual_fc()
+  #   fc  <- fc0$fc
+  #   eq  <- manual_equations()
+  #   s   <- ts_train_test()
+  #   
+  #   # ---- safe values
+  #   n_train <- suppressWarnings(as.integer(s$train_n)); if (!is.finite(n_train)) n_train <- length(residuals(fit))
+  #   n_test  <- suppressWarnings(as.integer(s$test_n));  if (!is.finite(n_test))  n_test  <- 0L
+  #   N <- n_train + n_test
+  #   
+  #   L_in <- suppressWarnings(as.integer(input$diag_lag))
+  #   L <- if (is.finite(L_in) && L_in > 0) L_in else 12L
+  #   fitdf <- length(coef(fit))
+  #   
+  #   # ---- IC
+  #   AIC_val  <- suppressWarnings(as.numeric(fit$aic))
+  #   AICc_val <- suppressWarnings(as.numeric(fit$aicc))
+  #   BIC_val  <- suppressWarnings(as.numeric(fit$bic))
+  #   
+  #   # ---- residual test (minimal)
+  #   res <- as.numeric(residuals(fit))
+  #   res <- res[is.finite(res)]
+  #   lb <- tryCatch(Box.test(res, lag = min(L, max(1L, floor(length(res) / 3))), type = "Ljung-Box", fitdf = fitdf),
+  #                  error = function(e) NULL)
+  #   
+  #   # ---- accuracy
+  #   acc_line <- NULL
+  #   if (n_test > 0) {
+  #     acc <- tryCatch(accuracy_df(s$ts_test, fc$mean), error = function(e) NULL)
+  #     if (!is.null(acc) && all(c("Metric", "Value") %in% names(acc))) {
+  #       rmse <- acc$Value[acc$Metric == "RMSE"][1]
+  #       mae  <- acc$Value[acc$Metric == "MAE"][1]
+  #       mape <- acc$Value[acc$Metric == "MAPE"][1]
+  #       acc_line <- tags$p(
+  #         tags$b("Forecast accuracy (test set). "),
+  #         HTML(paste0(
+  #           "Over the holdout period (n = ", n_test, "), performance was RMSE = ",
+  #           fmt_num(rmse, 3), ", MAE = ", fmt_num(mae, 3),
+  #           if (is.finite(mape)) paste0(", MAPE = ", fmt_num(100 * mape, 2), "%") else "",
+  #           "."
+  #         ))
+  #       )
+  #     }
+  #   }
+  #   if (is.null(acc_line)) {
+  #     acc_line <- tags$p(tags$b("Forecast accuracy. "),
+  #                        "No holdout test set was detected; therefore, out-of-sample accuracy was not computed.")
+  #   }
+  #   
+  #   # ---- horizon narrative
+  #   horizon_txt <- if (n_test > 0) {
+  #     paste0("Validation mode was used: the forecast horizon was forced to match the test length (h = ", n_test, ").")
+  #   } else {
+  #     paste0("Future mode was used: forecasts were produced beyond the training sample (h = ", fc0$h, ").")
+  #   }
+  #   
+  #   # ---- model text (manual)
+  #   season_txt <- if (is.finite(eq$s)) eq$s else NA_integer_
+  #   model_str <- sprintf("SARIMA(%d,%d,%d)(%d,%d,%d)[%s]",
+  #                        eq$p, eq$d, eq$q, eq$P, eq$D, eq$Q,
+  #                        if (is.finite(season_txt)) as.character(season_txt) else "s")
+  #   
+  #   tagList(
+  #     tags$h3("Manual SARIMA: Full academic conclusion"),
+  #     
+  #     tags$h4("1. Rationale and modelling objective"),
+  #     tags$p(
+  #       "A manually specified seasonal ARIMA (SARIMA) model was estimated to provide explicit control over non-seasonal and seasonal dynamics. ",
+  #       "This approach is appropriate when domain knowledge and diagnostic patterns (ACF/PACF after differencing) motivate targeted structure beyond automated search."
+  #     ),
+  #     
+  #     tags$h4("2. Sample design"),
+  #     tags$p(HTML(paste0(
+  #       "The analysis used <b>N = ", N, "</b> observations (training <b>n = ", n_train, "</b>",
+  #       if (n_test > 0) paste0(", test <b>n = ", n_test, "</b>") else "",
+  #       ")."
+  #     ))),
+  #     tags$p(tags$b("Forecast design. "), horizon_txt),
+  #     
+  #     tags$h4("3. Final specification and fit"),
+  #     tags$p(HTML(paste0(
+  #       "The fitted manual specification was <b>", model_str, "</b>",
+  #       if (isTRUE(input$manual_drift)) " with drift/mean." else " without drift/mean.",
+  #       " The corresponding fitted object was reported as <b>", as.character(fit), "</b>."
+  #     ))),
+  #     tags$ul(
+  #       tags$li(HTML(paste0("AIC = <b>", fmt_num(AIC_val, 2), "</b>"))),
+  #       tags$li(HTML(paste0("AICc = <b>", fmt_num(AICc_val, 2), "</b>"))),
+  #       tags$li(HTML(paste0("BIC = <b>", fmt_num(BIC_val, 2), "</b>")))
+  #     ),
+  #     
+  #     tags$h4("4. Model equations (reporting-ready)"),
+  #     tags$p(
+  #       "For academic reporting and replication, the fitted model is expressed in standard operator notation, followed by an expanded form ",
+  #       "and a numerical representation using the estimated coefficients."
+  #     ),
+  #     tags$div(
+  #       style = "padding:10px;border:1px solid #e5e5e5;border-radius:6px;background:#fcfcfc;text-align:left;",
+  #       tags$h5("General SARIMA formulation"),
+  #       HTML(eq$eq_general),
+  #       tags$hr(),
+  #       tags$h5("Expanded operator form"),
+  #       HTML(eq$eq_expanded),
+  #       tags$hr(),
+  #       tags$h5("Numerical model"),
+  #       HTML(eq$eq_line3),
+  #       tags$hr(),
+  #       HTML(eq$eq_line4)
+  #     ),
+  #     
+  #     tags$h4("5. Residual diagnostics (adequacy of linear dynamics)"),
+  #     tags$p(
+  #       "Adequacy was evaluated using residual plots and formal tests. A key criterion is that residuals resemble white noise, ",
+  #       "indicating that the model has captured the systematic linear dependence."
+  #     ),
+  #     if (!is.null(lb)) {
+  #       tags$p(HTML(paste0(
+  #         "<b>Ljung–Box test:</b> Q(", lb$parameter, ") = ", fmt_num(lb$statistic, 3),
+  #         ", p ", fmt_p(lb$p.value), "."
+  #       )))
+  #     } else {
+  #       tags$p(tags$b("Ljung–Box test:"), " unavailable (insufficient residuals or test error).")
+  #     },
+  #     
+  #     tags$h4("6. Forecasting and predictive performance"),
+  #     acc_line,
+  #     
+  #     tags$h4("7. Overall conclusion and recommended next steps"),
+  #     tags$p(
+  #       "In sum, the manual SARIMA specification provides an interpretable representation of linear dependence, contingent on residual whiteness. ",
+  #       "If residual autocorrelation persists, revise differencing (d, D) or adjust AR/MA orders guided by diagnostics. ",
+  #       "If volatility clustering is evident, consider modelling conditional variance (e.g., GARCH) alongside the SARIMA mean equation."
+  #     )
+  #   )
+  # })
+  
+  output$manual_conclusion_full <- renderUI({
+    validate(need(input$fit_manual > 0, "Click “Fit” in the Manual tab to generate the full academic conclusion."))
+    req(manual_conclusion_full_obj())
+    
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "manual_conclusion_box")
+    }, once = TRUE)
+    
+    manual_conclusion_full_obj()
+  })
+  
+  
+  
+  
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  #================================================================================================
+  
+  
+  
+  
+  
+  
 
   # ---- Step 7 Comparison & Paper builder ----
 
@@ -3863,47 +13527,6 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$refresh_all, { invisible(NULL) })
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
   
   
   
@@ -4057,24 +13680,7 @@ server <- function(input, output, session) {
   
   
   
-  
-  
-  
-  # myData_Choice <- reactive({
-  #   getMyData(
-  #     tsData    = ts_base(),
-  #     frequency = frequency(ts_base()),
-  #     islog     = values$islog,
-  #     d_n       = input$d_n,
-  #     DS_n      = input$DS_n
-  #   )
-  # })
-  
-  # # --- UI wrapper for the combined diagnostics plot ---
-  # output$d_D_Log_ts_Choice_UI <- renderUI({
-  #   plotOutput("d_D_Log_ts_Choice", width = "100%", height = 420)
-  # })
-  
+
   # UI wrapper: uses textInput("plot_width"), textInput("plot_height")
   output$d_D_Log_ts_Choice_UI <- renderUI({
     plotOutput(
@@ -4162,6 +13768,241 @@ server <- function(input, output, session) {
   })
   
   # ---- Plot router for the Plot (*) tab (uses theme) ----
+  # output$tsPlot_Choice <- renderPlot({
+  #   req(myData_Choice())
+  #   req(input$plot_type_choice)
+  #   
+  #   ts_obj <- myData_Choice()
+  #   p      <- prepared()  # for x-axis label
+  #   freq   <- tryCatch(stats::frequency(ts_obj), error = function(e) NA_real_)
+  #   
+  #   df_ts <- function(z) {
+  #     if (inherits(z, "ts")) {
+  #       data.frame(t = as.numeric(stats::time(z)), y = as.numeric(z))
+  #     } else {
+  #       data.frame(t = seq_along(z), y = as.numeric(z))
+  #     }
+  #   }
+  #   
+  #   k_ma  <- max(2L, as.integer(input$ma_k %||% 5))
+  #   lag_m <- max(1L, as.integer(input$lag_m %||% 12))
+  #   
+  #   plt <- switch(
+  #     input$plot_type_choice,
+  #     
+  #     "Line" = {
+  #       forecast::autoplot(
+  #         ts_obj,
+  #         size   = 1,
+  #         colour = input$ts_line_color %||% "#2C7FB8"
+  #       ) +
+  #         ggplot2::labs(title = "Transformed series", x = p$x_label, y = "Transformed value")
+  #     },
+  #     
+  #     "Points" = {
+  #       d <- df_ts(ts_obj)
+  #       ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+  #         ggplot2::geom_point(size = 1) +
+  #         ggplot2::labs(title = "Points", x = p$x_label, y = "Transformed value")
+  #     },
+  #     
+  #     "Line + Points" = {
+  #       d <- df_ts(ts_obj)
+  #       ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+  #         ggplot2::geom_line() +
+  #         ggplot2::geom_point(size = 0.9, alpha = 0.8) +
+  #         ggplot2::labs(title = "Line + Points", x = p$x_label, y = "Transformed value")
+  #     },
+  #     
+  #     "Smoothed (LOESS)" = {
+  #       d <- df_ts(ts_obj)
+  #       ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+  #         ggplot2::geom_line(alpha = 0.4) +
+  #         ggplot2::geom_smooth(method = "loess", se = FALSE, span = 0.2) +
+  #         ggplot2::labs(title = "LOESS smooth", x = p$x_label, y = "Transformed value")
+  #     },
+  #     
+  #     "Moving average" = {
+  #       d <- df_ts(ts_obj)
+  #       ma <- stats::filter(d$y, rep(1/k_ma, k_ma), sides = 2)
+  #       d$ma <- as.numeric(ma)
+  #       ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+  #         ggplot2::geom_line(alpha = 0.4) +
+  #         ggplot2::geom_line(ggplot2::aes(y = ma), size = 1) +
+  #         ggplot2::labs(title = sprintf("Moving average (k = %d)", k_ma), x = p$x_label, y = "Transformed value")
+  #     },
+  #     
+  #     "Cumulative sum" = {
+  #       d <- df_ts(ts_obj); d$cum <- cumsum(d$y)
+  #       ggplot2::ggplot(d, ggplot2::aes(t, cum)) +
+  #         ggplot2::geom_line() +
+  #         ggplot2::labs(title = "Cumulative sum", x = p$x_label, y = "Cumulative value")
+  #     },
+  #     
+  #     "Seasonal plot" = {
+  #       validate(need(is.finite(freq) && freq > 1, "Seasonal plot requires frequency > 1."))
+  #       forecast::ggseasonplot(ts_obj, year.labels = TRUE) +
+  #         ggplot2::labs(title = "Seasonal plot", x = p$x_label, y = "Value")
+  #     },
+  #     
+  #     "Seasonal subseries" = {
+  #       validate(need(is.finite(freq) && freq > 1, "Seasonal subseries requires frequency > 1."))
+  #       forecast::ggsubseriesplot(ts_obj) +
+  #         ggplot2::labs(title = "Seasonal subseries", x = p$x_label, y = "Value")
+  #     },
+  #     
+  #     "Polar seasonal" = {
+  #       validate(need(is.finite(freq) && freq > 1, "Polar seasonal requires frequency > 1."))
+  #       forecast::ggseasonplot(ts_obj, polar = TRUE) +
+  #         ggplot2::labs(title = "Polar seasonal plot", x = p$x_label, y = "Value")
+  #     },
+  #     
+  #     "Seasonal boxplot" = {
+  #       validate(need(is.finite(freq) && freq > 1, "Seasonal boxplot requires frequency > 1."))
+  #       d <- if (inherits(ts_obj, "ts")) data.frame(season = stats::cycle(ts_obj), y = as.numeric(ts_obj))
+  #       else data.frame(season = factor(1), y = as.numeric(ts_obj))
+  #       ggplot2::ggplot(d, ggplot2::aes(x = factor(season), y = y)) +
+  #         ggplot2::geom_boxplot() +
+  #         ggplot2::labs(title = "Seasonal boxplot", x = "Season", y = "Value")
+  #     },
+  #     
+  #     "Classical decomposition (additive)" = {
+  #       validate(need(is.finite(freq) && freq > 1, "Classical decomposition requires frequency > 1."))
+  #       dc <- stats::decompose(ts_obj, type = "additive")
+  #       forecast::autoplot(dc) + ggplot2::labs(title = "Classical decomposition (additive)")
+  #     },
+  #     
+  #     "Classical decomposition (multiplicative)" = {
+  #       validate(need(is.finite(freq) && freq > 1, "Classical decomposition requires frequency > 1."))
+  #       dc <- stats::decompose(ts_obj, type = "multiplicative")
+  #       forecast::autoplot(dc) + ggplot2::labs(title = "Classical decomposition (multiplicative)")
+  #     },
+  #     
+  #     "STL decomposition" = {
+  #       validate(need(is.finite(freq) && freq > 1, "STL decomposition requires frequency > 1."))
+  #       decomp <- stats::stl(ts_obj, s.window = "periodic")
+  #       forecast::autoplot(decomp) + ggplot2::labs(title = "STL decomposition")
+  #     },
+  #     
+  #     "Histogram" = {
+  #       xx <- as.numeric(stats::na.omit(ts_obj))
+  #       ggplot2::ggplot(data.frame(x = xx), ggplot2::aes(x)) +
+  #         ggplot2::geom_histogram(bins = 30) +
+  #         ggplot2::labs(title = "Histogram", x = "Value", y = "Count")
+  #     },
+  #     
+  #     "Density" = {
+  #       xx <- as.numeric(stats::na.omit(ts_obj))
+  #       ggplot2::ggplot(data.frame(x = xx), ggplot2::aes(x)) +
+  #         ggplot2::geom_density() +
+  #         ggplot2::labs(title = "Density", x = "Value", y = "Density")
+  #     },
+  #     
+  #     "QQ plot" = {
+  #       xx <- as.numeric(stats::na.omit(ts_obj))
+  #       ggplot2::ggplot(data.frame(x = xx), ggplot2::aes(sample = x)) +
+  #         ggplot2::stat_qq() +
+  #         ggplot2::stat_qq_line() +
+  #         ggplot2::labs(title = "Normal Q-Q plot", x = "Theoretical quantiles", y = "Sample quantiles")
+  #     },
+  #     
+  #     "Lag-1 scatter" = {
+  #       xx <- as.numeric(stats::na.omit(ts_obj))
+  #       validate(need(length(xx) >= 2, "Not enough data for lag-1 scatter."))
+  #       d <- data.frame(x = xx[-length(xx)], y = xx[-1])
+  #       ggplot2::ggplot(d, ggplot2::aes(x, y)) +
+  #         ggplot2::geom_point() +
+  #         ggplot2::geom_smooth(method = "lm", se = FALSE) +
+  #         ggplot2::labs(title = "Lag-1 scatter", x = "y(t-1)", y = "y(t)")
+  #     },
+  #     
+  #     "Lag plot (1..m)" = {
+  #       xx <- as.numeric(stats::na.omit(ts_obj))
+  #       validate(need(length(xx) > (lag_m + 1), "Increase data or reduce m for lag plots."))
+  #       forecast::gglagplot(ts_obj, lags = lag_m) +
+  #         ggplot2::labs(title = sprintf("Lag plot (1..%d)", lag_m))
+  #     },
+  #     
+  #     "ACF" = {
+  #       forecast::ggAcf(ts_obj) + ggplot2::labs(title = "ACF")
+  #     },
+  #     
+  #     "PACF" = {
+  #       forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
+  #     },
+  #     
+  # 
+  #     # inside your switch(input$plot_type_choice, ...)
+  #     "ACF+PACF" = {
+  #       # ACF (top) & PACF (bottom)
+  #       p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
+  #       p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
+  #       
+  #       # Apply your theme helper
+  #       p_acf  <- add_theme(p_acf)
+  #       p_pacf <- add_theme(p_pacf)
+  #       
+  #       # Vertical layout: ACF on top, PACF below
+  #       gridExtra::grid.arrange(p_acf, p_pacf, ncol = 1, heights = c(1, 1))
+  #     },
+  #     
+  #   
+  # 
+  #     # library(gridExtra)
+  #     
+  #     "Time + ACF+PACF" = {
+  #       # Time plot (top)
+  #       p_time <- forecast::autoplot(
+  #         ts_obj,
+  #         size   = 1,
+  #         colour = input$ts_line_color %||% "#2C7FB8"
+  #       ) +
+  #         ggplot2::labs(
+  #           title = "Time plot",
+  #           x = p$x_label,
+  #           y = "Transformed value"
+  #         )
+  # 
+  #       # ACF (bottom-left) & PACF (bottom-right)
+  #       p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
+  #       p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
+  # 
+  #       # Apply your selected theme to each plot
+  #       p_time <- add_theme(p_time)
+  #       p_acf  <- add_theme(p_acf)
+  #       p_pacf <- add_theme(p_pacf)
+  # 
+  #       # Bottom row: ACF (left) | PACF (right)
+  #       bottom_row <- gridExtra::arrangeGrob(p_acf, p_pacf, ncol = 2)
+  # 
+  #       # Final layout: Time on top; ACF+PACF in one row at bottom
+  #       gridExtra::grid.arrange(p_time, bottom_row, ncol = 1, heights = c(1.3, 1))
+  #     }
+  #     
+  #     
+  # 
+  #     "Periodogram" = {
+  #       xx <- as.numeric(stats::na.omit(ts_obj))
+  #       validate(need(length(xx) > 5, "More data needed for periodogram."))
+  #       sp <- stats::spec.pgram(xx, detrend = TRUE, taper = 0.1, plot = FALSE)
+  #       d  <- data.frame(freq = sp$freq, spec = sp$spec)
+  #       ggplot2::ggplot(d, ggplot2::aes(freq, spec)) +
+  #         ggplot2::geom_line() +
+  #         ggplot2::labs(title = "Periodogram", x = "Frequency", y = "Spectral density")
+  #     }
+  #   )
+  #   
+  #   # apply theme (for ggplot outputs)
+  #   if (inherits(plt, "ggplot")) {
+  #     plt <- add_theme(plt)
+  #   }
+  #   plt
+  # }, res = 96)
+  # 
+  
+  
+  
+ 
   output$tsPlot_Choice <- renderPlot({
     req(myData_Choice())
     req(input$plot_type_choice)
@@ -4223,7 +14064,10 @@ server <- function(input, output, session) {
         ggplot2::ggplot(d, ggplot2::aes(t, y)) +
           ggplot2::geom_line(alpha = 0.4) +
           ggplot2::geom_line(ggplot2::aes(y = ma), size = 1) +
-          ggplot2::labs(title = sprintf("Moving average (k = %d)", k_ma), x = p$x_label, y = "Transformed value")
+          ggplot2::labs(
+            title = sprintf("Moving average (k = %d)", k_ma),
+            x = p$x_label, y = "Transformed value"
+          )
       },
       
       "Cumulative sum" = {
@@ -4325,43 +14169,17 @@ server <- function(input, output, session) {
         forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
       },
       
-
-      
-      
-      # inside your switch(input$plot_type_choice, ...)
       "ACF+PACF" = {
-        # ACF (top) & PACF (bottom)
-        p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
-        p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
+        p_acf  <- add_theme(forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF"))
+        p_pacf <- add_theme(forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF"))
         
-        # Apply your theme helper
-        p_acf  <- add_theme(p_acf)
-        p_pacf <- add_theme(p_pacf)
-        
-        # Vertical layout: ACF on top, PACF below
-        gridExtra::grid.arrange(p_acf, p_pacf, ncol = 1, heights = c(1, 1))
+        # patchwork vertical
+        (p_acf / p_pacf) + patchwork::plot_layout(heights = c(1, 1))
       },
       
       
       
-      # # inside your switch(input$plot_type_choice, ...)
-      # "ACF+PACF" = {
-      #   # ACF / PACF only
-      #   p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
-      #   p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
-      #   
-      #   # Apply theme
-      #   p_acf  <- add_theme(p_acf)
-      #   p_pacf <- add_theme(p_pacf)
-      #   
-      #   # Side-by-side layout (1 row, 2 columns)
-      #   gridExtra::grid.arrange(p_acf, p_pacf, ncol = 2)
-      # },
-      
-      
-       
-      # "ACF+PACF" = {
-      #   # Time plot
+      # "Time + ACF+PACF" = {
       #   p_time <- forecast::autoplot(
       #     ts_obj,
       #     size   = 1,
@@ -4373,27 +14191,102 @@ server <- function(input, output, session) {
       #       y = "Transformed value"
       #     )
       #   
-      #   # ACF / PACF
       #   p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
       #   p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
       #   
-      #   # Apply your theme to each ggplot
       #   p_time <- add_theme(p_time)
       #   p_acf  <- add_theme(p_acf)
       #   p_pacf <- add_theme(p_pacf)
       #   
-      #   # Stack them (1 column)
-      #   gridExtra::grid.arrange(p_time, p_acf, p_pacf, ncol = 1,
-      #                           heights = c(2, 1, 1))
+      #   # patchwork: time on top, acf|pacf on bottom
+      #   (p_time / (p_acf | p_pacf)) + patchwork::plot_layout(heights = c(1.3, 1))
+      # },  
+      
+      
+      # "Time + ACF+PACF" = {
+      #   p_time <- forecast::autoplot(
+      #     ts_obj,
+      #     size   = 1,
+      #     colour = input$ts_line_color %||% "#2C7FB8"
+      #   ) +
+      #     ggplot2::labs(
+      #       title = "Time plot",
+      #       x = p$x_label,
+      #       y = "Transformed value"
+      #     )
+      #   
+      #   p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
+      #   p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
+      #   
+      #   p_time <- add_theme(p_time)
+      #   p_acf  <- add_theme(p_acf)
+      #   p_pacf <- add_theme(p_pacf)
+      #   
+      #   # turn ggplots into grobs
+      #   g_time <- ggplot2::ggplotGrob(p_time)
+      #   g_acf  <- ggplot2::ggplotGrob(p_acf)
+      #   g_pacf <- ggplot2::ggplotGrob(p_pacf)
+      #   
+      #   # bottom row: 2 columns
+      #   g_bottom <- gridExtra::arrangeGrob(g_acf, g_pacf, ncol = 2)
+      #   
+      #   # full layout: top then bottom; heights control proportion
+      #   g_all <- gridExtra::arrangeGrob(
+      #     g_time, g_bottom,
+      #     ncol = 1,
+      #     heights = grid::unit(c(1.3, 1), "null")
+      #   )
+      #   
+      #   grid::grid.newpage()
+      #   grid::grid.draw(g_all)
+      # },
+      
+      
+      # "Time + ACF+PACF" = {
+      #   p_time <- forecast::autoplot(
+      #     ts_obj,
+      #     size   = 1,
+      #     colour = input$ts_line_color %||% "#2C7FB8"
+      #   ) +
+      #     ggplot2::labs(
+      #       title = "Time plot",
+      #       x = p$x_label,
+      #       y = "Transformed value"
+      #     )
+      #   
+      #   p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
+      #   p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
+      #   
+      #   p_time <- add_theme(p_time)
+      #   p_acf  <- add_theme(p_acf)
+      #   p_pacf <- add_theme(p_pacf)
+      #   
+      #   g_time <- ggplot2::ggplotGrob(p_time)
+      #   g_acf  <- ggplot2::ggplotGrob(p_acf)
+      #   g_pacf <- ggplot2::ggplotGrob(p_pacf)
+      #   
+      #   g_bottom <- gridExtra::arrangeGrob(g_acf, g_pacf, ncol = 2)
+      #   
+      #   # empty middle row
+      #   g_spacer <- grid::nullGrob()
+      #   
+      #   g_all <- gridExtra::arrangeGrob(
+      #     g_time,
+      #     g_spacer,
+      #     g_bottom,
+      #     ncol = 1,
+      #     heights = grid::unit(c(2, 0.1, 1.2), "null")  # adjust 0.15 to control empty space
+      #   )
+      #   
+      #   grid::grid.newpage()
+      #   grid::grid.draw(g_all)
       # },
       
       
       
-      # at top of server.R (if not already)
-      # library(gridExtra)
       
       "Time + ACF+PACF" = {
-        # Time plot (top)
+        # Top: time plot
         p_time <- forecast::autoplot(
           ts_obj,
           size   = 1,
@@ -4404,45 +14297,49 @@ server <- function(input, output, session) {
             x = p$x_label,
             y = "Transformed value"
           )
-        
-        # ACF (bottom-left) & PACF (bottom-right)
+
+        # Bottom: ACF + PACF
         p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
         p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
-        
-        # Apply your selected theme to each plot
+
+        # Apply theme
         p_time <- add_theme(p_time)
         p_acf  <- add_theme(p_acf)
         p_pacf <- add_theme(p_pacf)
-        
-        # Bottom row: ACF (left) | PACF (right)
-        bottom_row <- gridExtra::arrangeGrob(p_acf, p_pacf, ncol = 2)
-        
-        # Final layout: Time on top; ACF+PACF in one row at bottom
-        gridExtra::grid.arrange(p_time, bottom_row, ncol = 1, heights = c(1.3, 1))
+
+        # Patchwork layout (resizes correctly, no overlap)
+        (p_time / (p_acf | p_pacf)) +
+          patchwork::plot_layout(heights = c(1.3, 1))
       },
       
       
       
-      # "Time + ACF+PACF" = {
-      #   forecast::ggtsdisplay(
-      #     ts_obj,
-      #     main = "Diagnostics (Time, ACF, PACF)",
-      #     xlab = p$x_label, ylab = "Transformed value"
-      #   )
-      # },
-      
       "Periodogram" = {
         xx <- as.numeric(stats::na.omit(ts_obj))
-        validate(need(length(xx) > 5, "More data needed for periodogram."))
-        sp <- stats::spec.pgram(xx, detrend = TRUE, taper = 0.1, plot = FALSE)
-        d  <- data.frame(freq = sp$freq, spec = sp$spec)
+        validate(need(length(xx) >= 8, "Need at least 8 observations for a periodogram."))
+        
+        # use your UI taper slider if it exists; otherwise 0.1
+        taper <- suppressWarnings(as.numeric(input$stp_spec_taper %||% 0.1))
+        if (!is.finite(taper)) taper <- 0.1
+        
+        sp <- tryCatch(
+          stats::spec.pgram(xx, detrend = TRUE, taper = taper, plot = FALSE),
+          error = function(e) e
+        )
+        validate(need(!inherits(sp, "error"), paste("spec.pgram failed:", sp$message)))
+        
+        d <- data.frame(freq = sp$freq, spec = as.numeric(sp$spec))
+        d <- d[is.finite(d$freq) & is.finite(d$spec), , drop = FALSE]
+        validate(need(nrow(d) > 1, "Periodogram returned no finite values (check data/transform)."))
+        
         ggplot2::ggplot(d, ggplot2::aes(freq, spec)) +
-          ggplot2::geom_line() +
-          ggplot2::labs(title = "Periodogram", x = "Frequency", y = "Spectral density")
+          ggplot2::geom_line(linewidth = 1, colour = input$ts_line_color %||% "#2C7FB8") +
+          ggplot2::labs(title = "Periodogram", x = "Frequency", y = "Spectral density") +
+          ggplot2::scale_x_continuous()
       }
     )
     
-    # apply theme (for ggplot outputs)
+    # apply theme (for plain ggplot outputs only)
     if (inherits(plt, "ggplot")) {
       plt <- add_theme(plt)
     }
@@ -4453,70 +14350,14 @@ server <- function(input, output, session) {
   
   
   
-  # # --- UI wrapper so the plot can size dynamically (same style as your other UI wrappers)
-  # output$tsPlot_Choice_UI <- renderUI({
-  #   plotOutput(
-  #     "tsPlot_Choice",
-  #     width  = getPlotDim(input$plot_width  %||% 800),
-  #     height = getPlotDim(input$plot_height %||% 500)
-  #   )
-  # })
-  # 
-  # # --- Color picker UI (used in this tab’s sidebar)
-  # output$ts_color_ui <- renderUI({
-  #   tagList(
-  #     tags$input(type = "color", id = "ts_line_color", value = "#2C7FB8"),
-  #     tags$label("Series color", style = "color: #2C7FB8;"),
-  #     br(), br(),
-  #     tags$script(HTML("
-  #     $(document).ready(function() {
-  #       var el = document.getElementById('ts_line_color');
-  #       if (el) Shiny.setInputValue('ts_line_color', el.value);
-  #       $(document).on('input', '#ts_line_color', function() {
-  #         Shiny.setInputValue(this.id, this.value);
-  #       });
-  #     });
-  #   "))
-  #   )
-  # })
-  # 
-  # # --- Main time plot of the transformed series (uses myData_Choice())
-  # output$tsPlot_Choice <- renderPlot({
-  #   req(myData_Choice())
-  #   p <- prepared()  # for axis label (date vs index)
-  #   
-  #   forecast::autoplot(
-  #     myData_Choice(),
-  #     size   = 1,
-  #     colour = input$ts_line_color %||% "#2C7FB8"
-  #   ) +
-  #     ggplot2::labs(
-  #       title = "Transformed series",
-  #       x = p$x_label,
-  #       y = "Transformed value"
-  #     ) +
-  #     ggplot2::theme_minimal() +
-  #     ggplot2::theme(
-  #       axis.text  = ggplot2::element_text(size = input$tickSize),
-  #       axis.title = ggplot2::element_text(size = input$tickSize + 2)
-  #     )
-  # }, res = 96)
-  
-  
-  
-  
-  
-  
   
   
   # ====================================================================
   # ====================================================================
   # ====================================================================
   
-  
-  
-  
-  # ---- UI wrapper (dynamic size) ----
+
+    # ---- UI wrapper (dynamic size) ----
   output$difference2ACFPACF_UI <- renderUI({
     plotOutput(
       "difference2ACFPACF",
@@ -4526,30 +14367,63 @@ server <- function(input, output, session) {
   })
   
   # ---- Combined ACF + PACF (stacked) ----
+  
+  
+  plot_pylike_corr <- function(x, type = c("acf", "pacf"), lag.max = 50, tickSize = 11) {
+    type <- match.arg(type)
+    x <- as.numeric(na.omit(x))
+    n <- length(x)
+    stopifnot(n > 3)
+    
+    # compute acf/pacf without plotting
+    obj <- if (type == "acf") stats::acf(x, lag.max = lag.max, plot = FALSE)
+    else               stats::pacf(x, lag.max = lag.max, plot = FALSE)
+    
+    vals <- as.numeric(obj$acf)
+    lags <- as.numeric(obj$lag)
+    
+    # statsmodels-style: usually start at lag 1 for ACF
+    if (type == "acf") {
+      keep <- lags > 0
+      lags <- lags[keep]
+      vals <- vals[keep]
+    }
+    
+    df <- data.frame(lag = lags, val = vals)
+    
+    # common CI band (very similar visually to Python defaults)
+    ci <- 1.96 / sqrt(n)
+    
+    ggplot(df, aes(x = lag, y = val)) +
+      geom_hline(yintercept = 0, linewidth = 0.4) +
+      geom_ribbon(aes(ymin = -ci, ymax = ci), alpha = 0.2) +
+      geom_segment(aes(xend = lag, yend = 0), linewidth = 0.8) +
+      geom_point(size = 2) +
+      coord_cartesian(ylim = c(-1, 1)) +
+      labs(
+        title = if (type == "acf") "Autocorrelation" else "Partial Autocorrelation",
+        x = "Lag",
+        y = toupper(type)
+      ) +
+      theme_classic(base_size = tickSize) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        panel.border = element_rect(fill = NA, linewidth = 0.4)
+      )
+  }
+  
   output$difference2ACFPACF <- renderPlot({
     req(myData_Choice())
+    tick <- as.numeric(input$tickSize %||% 11)
     
-    p1 <- forecast::ggAcf(myData_Choice()) +
-      ggplot2::labs(title = "ACF") +
-      ggplot2::theme_minimal() +
-      ggplot2::theme(
-        axis.text  = ggplot2::element_text(size = input$tickSize),
-        axis.title = ggplot2::element_text(size = input$tickSize + 2),
-        plot.title = ggplot2::element_text(hjust = 0.5)
-      )
+    p1 <- plot_pylike_corr(myData_Choice(), "acf",  lag.max = 50, tickSize = tick) +
+      labs(title = "Autocorrelation of Sales")
     
-    p2 <- forecast::ggPacf(myData_Choice()) +
-      ggplot2::labs(title = "PACF") +
-      ggplot2::theme_minimal() +
-      ggplot2::theme(
-        axis.text  = ggplot2::element_text(size = input$tickSize),
-        axis.title = ggplot2::element_text(size = input$tickSize + 2),
-        plot.title = ggplot2::element_text(hjust = 0.5)
-      )
+    p2 <- plot_pylike_corr(myData_Choice(), "pacf", lag.max = 50, tickSize = tick) +
+      labs(title = "Partial Autocorrelation of Sales")
     
     gridExtra::grid.arrange(p1, p2, ncol = 1, top = "ACF & PACF of transformed series")
   }, res = 96)
-  
   
   
   
@@ -4997,2269 +14871,7 @@ server <- function(input, output, session) {
   })
   
   
-  
-  # output$teststationarited3St <- renderPrint({
-  #   # ---------- Helpers ----------
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
-  #   to_num_safe <- function(v, default = NA_real_) {
-  #     out <- suppressWarnings(as.numeric(v))
-  #     if (length(out) == 0 || all(is.na(out)) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   to_int_safe <- function(v, default = 0L) {
-  #     out <- suppressWarnings(as.integer(v))
-  #     if (length(out) == 0 || is.na(out[1]) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   safe_head_tail <- function(x, n = 5) {
-  #     x <- as.numeric(x); x <- x[is.finite(x)]
-  #     if (length(x) == 0) return(list(head = numeric(0), tail = numeric(0)))
-  #     list(head = head(x, n), tail = tail(x, n))
-  #   }
-  #   tau_row_for <- function(type_in) switch(type_in, "none"="tau1", "drift"="tau2", "trend"="tau3", "tau3")
-  #   cval_pick_safe <- function(cval_obj, row, col) {
-  #     if (is.null(cval_obj)) return(NA_real_)
-  #     ans <- NA_real_
-  #     if (is.matrix(cval_obj)) {
-  #       if (!missing(row) && !missing(col) && row %in% rownames(cval_obj) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[row, col]))
-  #       } else if (!missing(col) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, col]))
-  #       } else {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, 1]))
-  #       }
-  #     } else {
-  #       nm <- names(cval_obj)
-  #       if (!is.null(nm) && col %in% nm) ans <- suppressWarnings(as.numeric(cval_obj[[col]]))
-  #       if (!is.finite(ans) && length(cval_obj) >= 3) {
-  #         if (identical(col, "10pct")) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #         if (identical(col, "5pct"))  ans <- suppressWarnings(as.numeric(cval_obj[2]))
-  #         if (identical(col, "1pct"))  ans <- suppressWarnings(as.numeric(cval_obj[3]))
-  #       }
-  #       if (!is.finite(ans)) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #     }
-  #     ans
-  #   }
-  #   fmt_p   <- function(p) { if (!is.finite(p)) "NA" else if (p < .001) "<0.001" else sprintf("%.6f", p) }
-  #   fmt_num <- function(z, d=6) ifelse(is.finite(z), sprintf(paste0("%.", d ,"f"), z), "NA")
-  #   tick    <- function(ok) if (isTRUE(ok)) "[✓]" else "[X]"
-  #   warn    <- function(ok) if (isTRUE(ok)) "[✓]" else "[!]"
-  #   qmark   <- function(ok) if (isTRUE(ok)) "[✓]" else "[?]"
-  #   
-  #   # ---------- Inputs (from your UI) ----------
-  #   alt_in  <- input$alternd2St %||% input$alternSt   # "stationary", "explosive", "regression"
-  #   lag_in  <- input$LagOrderADFd2St %||% input$LagOrderADFSt
-  #   a_in    <- input$alphaSt2
-  #   type_in <- input$adfTypeSt2                        # "none", "drift", "trend"
-  #   
-  #   # Transformation flags (provenance only; we assume your upstream pipeline already applies them)
-  #   d_in   <- input$d_n  %||% NA
-  #   D_in   <- input$DS_n %||% NA
-  #   log_in <- input$check_box %||% FALSE
-  #   
-  #   # ---------- DATA = TRAINING-ONLY if available ----------
-  #   # Try to pull the training split; fallback to full series if helper not present
-  #   x_source <- NULL
-  #   if (exists("ts_train_test", mode = "function")) {
-  #     s <- tryCatch(ts_train_test(), error = function(e) NULL)
-  #     if (!is.null(s) && !is.null(s$ts_train)) x_source <- s$ts_train
-  #   }
-  #   if (is.null(x_source)) {
-  #     req(myData_Choice())
-  #     x_source <- myData_Choice()
-  #   }
-  #   
-  #   x_class <- paste(class(x_source), collapse = ", ")
-  #   x_freq  <- if (inherits(x_source, "ts")) tryCatch(stats::frequency(x_source), error = function(e) NA_integer_) else NA_integer_
-  #   na_before <- sum(is.na(x_source))
-  #   
-  #   # The actual sample that ALL tests use (training window, post any upstream transforms)
-  #   x_vec <- as.numeric(stats::na.omit(x_source))
-  #   N     <- length(x_vec)
-  #   
-  #   # ---------- Hyper-parameters ----------
-  #   k <- to_int_safe(lag_in, default = 0L); if (!is.finite(k) || k < 0) k <- 0L
-  #   alpha_raw <- as.character(a_in)
-  #   alpha_val <- to_num_safe(alpha_raw, default = 0.05)
-  #   alpha_col <- switch(alpha_raw, "0.01"="1pct", "0.05"="5pct", "0.1"="10pct", "0.10"="10pct",
-  #                       "1pct"="1pct", "5pct"="5pct", "10pct"="10pct", "5pct")
-  #   tau_row <- tau_row_for(type_in)
-  #   
-  #   # ---------- Sanity checks ----------
-  #   if (N < 5) {
-  #     cat("==========================================================================\n")
-  #     cat("                         ADF UNIT ROOT DIAGNOSTIC                         \n")
-  #     cat("==========================================================================\n")
-  #     cat("CRITICAL ERROR: Too few observations in TRAINING window (N < 5). Provide more data or reduce differencing.\n")
-  #     return(invisible(NULL))
-  #   }
-  #   if (!is.finite(stats::sd(x_vec)) || stats::sd(x_vec) == 0) {
-  #     cat("==========================================================================\n")
-  #     cat("                         ADF UNIT ROOT DIAGNOSTIC                         \n")
-  #     cat("==========================================================================\n")
-  #     cat("CRITICAL ERROR: Training series is constant/invalid (sd = 0 or NA). Check transforms.\n")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- Package check ----------
-  #   if (!requireNamespace("urca", quietly = TRUE) || !requireNamespace("tseries", quietly = TRUE)) {
-  #     cat("==========================================================================\n")
-  #     cat("                         ADF UNIT ROOT DIAGNOSTIC                         \n")
-  #     cat("==========================================================================\n")
-  #     cat("ERROR: Please install.packages(c('urca','tseries')) to run ADF/KPSS.\n")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- Common quantities ----------
-  #   m_mean <- mean(x_vec, na.rm = TRUE)
-  #   m_sd   <- stats::sd(x_vec, na.rm = TRUE)
-  #   lb_lag <- max(1L, min(10L, floor(N / 5)))
-  #   
-  #   # ---------- Core ADF (urca) for chosen type & k ----------
-  #   ur  <- tryCatch(urca::ur.df(x_vec, type = type_in, lags = k), error = function(e) NULL)
-  #   tau_obs  <- if (!is.null(ur)) suppressWarnings(as.numeric(ur@teststat[tau_row])) else NA_real_
-  #   if (!is.finite(tau_obs) && !is.null(ur)) tau_obs <- suppressWarnings(as.numeric(ur@teststat[1]))
-  #   tau_crit <- if (!is.null(ur)) cval_pick_safe(ur@cval, tau_row, alpha_col) else NA_real_
-  #   adf_ts   <- if (N > (k + 10)) tryCatch(tseries::adf.test(x_vec, alternative = alt_in, k = k),
-  #                                          error = function(e) NULL) else NULL
-  #   adf_p    <- if (!is.null(adf_ts)) to_num_safe(adf_ts$p.value) else NA_real_
-  #   lb_main  <- if (!is.null(ur)) stats::Box.test(ur@res, lag = lb_lag, type = "Ljung-Box") else NULL
-  #   lb_stat  <- if (!is.null(lb_main)) to_num_safe(lb_main$statistic) else NA_real_
-  #   lb_p     <- if (!is.null(lb_main)) to_num_safe(lb_main$p.value) else NA_real_
-  #   
-  #   # ---------- KPSS ----------
-  #   kpss_type <- if (type_in == "trend") "Trend" else "Level"
-  #   kpss_ts   <- tryCatch(tseries::kpss.test(x_vec, null = kpss_type), error = function(e) NULL)
-  #   kpss_p    <- if (!is.null(kpss_ts)) to_num_safe(kpss_ts$p.value) else NA_real_
-  #   kpss_uc   <- tryCatch(urca::ur.kpss(x_vec, type = if (type_in == "trend") "tau" else "mu"),
-  #                         error = function(e) NULL)
-  #   eta_obs_uc  <- if (!is.null(kpss_uc)) to_num_safe(kpss_uc@teststat) else NA_real_
-  #   eta_col     <- if (alpha_val <= 0.01) "1pct" else if (alpha_val <= 0.05) "5pct" else "10pct"
-  #   eta_crit_uc <- if (!is.null(kpss_uc)) cval_pick_safe(kpss_uc@cval, 1, eta_col) else NA_real_
-  #   kpss_by_p   <- is.finite(kpss_p)     && (kpss_p < alpha_val)
-  #   kpss_by_eta <- is.finite(eta_obs_uc) && is.finite(eta_crit_uc) && (eta_obs_uc > eta_crit_uc)
-  #   kpss_stationary <- !(kpss_by_p || kpss_by_eta)
-  #   
-  #   # ---------- Structural break (Pettitt) ----------
-  #   pett_U <- pett_p <- NA_real_; pett_cp <- NA_integer_
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     pet <- tryCatch(trend::pettitt.test(x_vec), error = function(e) NULL)
-  #     if (!is.null(pet)) {
-  #       pett_U <- to_num_safe(pet$statistic)
-  #       pett_p <- to_num_safe(pet$p.value)
-  #       pett_cp <- to_int_safe(pet$estimate[1], default = NA_integer_)
-  #       if (!is.finite(pett_cp)) pett_cp <- as.integer(floor(N/2))
-  #       if (pett_cp < 2L || pett_cp > (N - 2L)) pett_cp <- NA_integer_
-  #     }
-  #   }
-  #   
-  #   # ---------- KPSS by segments (if break usable) ----------
-  #   seg1_p <- seg2_p <- NA_real_
-  #   if (is.finite(pett_cp)) {
-  #     if (pett_cp >= 8 && (N - pett_cp) >= 8) {
-  #       seg1 <- tryCatch(tseries::kpss.test(x_vec[seq_len(pett_cp)], null = kpss_type), error = function(e) NULL)
-  #       seg2 <- tryCatch(tseries::kpss.test(x_vec[(pett_cp + 1L):N], null = kpss_type), error = function(e) NULL)
-  #       if (!is.null(seg1)) seg1_p <- to_num_safe(seg1$p.value)
-  #       if (!is.null(seg2)) seg2_p <- to_num_safe(seg2$p.value)
-  #     }
-  #   }
-  #   
-  #   # ---------- Phase 0: suggested k (LB scan on TRAINING window) ----------
-  #   k_grid <- 0L:min(12L, max(1L, floor(N/10)))
-  #   lbp_by_k <- rep(NA_real_, length(k_grid))
-  #   for (i in seq_along(k_grid)) {
-  #     kk <- k_grid[i]
-  #     ur_i <- tryCatch(urca::ur.df(x_vec, type = type_in, lags = kk), error = function(e) NULL)
-  #     lb_i <- if (!is.null(ur_i)) tryCatch(stats::Box.test(ur_i@res, lag = lb_lag, type = "Ljung-Box"), error = function(e) NULL) else NULL
-  #     lbp_by_k[i] <- if (!is.null(lb_i)) to_num_safe(lb_i$p.value) else NA_real_
-  #   }
-  #   k_suggest <- NA_integer_
-  #   idx_ok <- which(is.finite(lbp_by_k) & lbp_by_k > alpha_val)
-  #   if (length(idx_ok) > 0) k_suggest <- k_grid[min(idx_ok)] else k_suggest <- k
-  #   
-  #   # Spec sensitivity across types for k = selected and k = k_suggest
-  #   types <- c("none","drift","trend")
-  #   spec_line <- function(kk) {
-  #     for (tp in types) {
-  #       tau_row_tp <- tau_row_for(tp)
-  #       ur_tp <- tryCatch(urca::ur.df(x_vec, type = tp, lags = kk), error = function(e) NULL)
-  #       tau_tp  <- if (!is.null(ur_tp)) suppressWarnings(as.numeric(ur_tp@teststat[tau_row_tp])) else NA_real_
-  #       if (!is.finite(tau_tp) && !is.null(ur_tp)) tau_tp <- suppressWarnings(as.numeric(ur_tp@teststat[1]))
-  #       crit_tp <- if (!is.null(ur_tp)) cval_pick_safe(ur_tp@cval, tau_row_tp, alpha_col) else NA_real_
-  #       lb_tp   <- if (!is.null(ur_tp)) tryCatch(stats::Box.test(ur_tp@res, lag = lb_lag, type = "Ljung-Box"), error = function(e) NULL) else NULL
-  #       lbp_tp  <- if (!is.null(lb_tp)) to_num_safe(lb_tp$p.value) else NA_real_
-  #       adf_dec <- if (is.finite(tau_tp) && is.finite(crit_tp) && (tau_tp < crit_tp)) "ADF=STATIONARY" else "ADF=NON-STATIONARY"
-  #       cat(sprintf("     %s type=%-5s | tau=%s | crit=%s | %s | LB p=%s\n",
-  #                   tick(is.finite(lbp_tp) && lbp_tp > alpha_val),
-  #                   tp,
-  #                   fmt_num(tau_tp, 4),
-  #                   fmt_num(crit_tp, 4),
-  #                   adf_dec,
-  #                   fmt_num(lbp_tp, 4)))
-  #     }
-  #   }
-  #   
-  #   # ---------- Agreement ----------
-  #   adf_ok_vals <- is.finite(tau_obs) && is.finite(tau_crit)
-  #   adf_stationary <- adf_ok_vals && (tau_obs < tau_crit)
-  #   agreement <- (adf_stationary && kpss_stationary) || (!adf_stationary && !kpss_stationary)
-  #   
-  #   # ---------- HEADER ----------
-  #   cat("==========================================================================\n")
-  #   cat("                        ADF UNIT ROOT DIAGNOSTIC                          \n")
-  #   cat("==========================================================================\n")
-  #   cat(sprintf(" MODEL TYPE : %-10s | SAMPLE SIZE (N) : %s (TRAINING)\n", toupper(type_in), N))
-  #   cat(sprintf(" LAG ORDER  : %-10s | SIGNIFICANCE (α) : %s\n", k, fmt_num(alpha_val, 4)))
-  #   cat(sprintf(" MOMENTS    : Mean: %s | Std.Dev: %s\n",
-  #               fmt_num(m_mean, 4), fmt_num(m_sd, 4)))
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat(" TRANSFORMATION PROVENANCE (what ALL tests use):\n")
-  #   cat(sprintf(" [ ] Source object class           : %s\n", x_class))
-  #   cat(sprintf(" [ ] Frequency (if ts)             : %s\n", ifelse(is.finite(x_freq), x_freq, "NA")))
-  #   cat(sprintf(" [ ] NA count before na.omit       : %s\n", na_before))
-  #   cat(sprintf(" [ ] Transformation inputs (UI)    : log=%s | d=%s | D=%s\n",
-  #               ifelse(isTRUE(log_in),"ON","OFF"), as.character(d_in), as.character(D_in)))
-  #   ht <- safe_head_tail(x_vec, 5)
-  #   cat(sprintf(" [ ] First 5 values used in tests  : %s\n", paste(round(ht$head, 4), collapse = ", ")))
-  #   cat(sprintf(" [ ] Last  5 values used in tests  : %s\n\n", paste(round(ht$tail, 4), collapse = ", ")))
-  #   
-  #   # ---------- PHASE 0 ----------
-  #   cat("==========================================================================\n")
-  #   cat("PHASE 0: DECISION AID (Lag + Spec Sensitivity)\n")
-  #   cat("==========================================================================\n")
-  #   cat(sprintf(" • Ljung-Box reference lag used in scan : %d  ; (LB lag = min(10, floor(N/5))\n", lb_lag))
-  #   cat(sprintf(" [!] Suggested k* (scan)                : %s  (smallest k with Ljung-Box p-value > alpha (whiter residuals))\n",
-  #               ifelse(is.finite(k_suggest), k_suggest, "NA")))
-  #   if (is.finite(k_suggest) && k_suggest != k) {
-  #     cat(sprintf(" [!] You selected k=%d. Consider trying k=%d and re-running.\n", k, k_suggest))
-  #   } else {
-  #     cat(sprintf(" [✓] You selected k=%d. This already meets the LB>α rule-of-thumb.\n", k))
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat(" ADF SPEC SENSITIVITY (ur.df):\n")
-  #   cat("   (Prefer: LB ok + stable decision across types)\n")
-  #   cat(sprintf("  • k=%d\n", k)); spec_line(k)
-  #   if (is.finite(k_suggest) && k_suggest != k) {
-  #     cat(sprintf("  • k=%d\n", k_suggest)); spec_line(k_suggest)
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   # ---------- PHASE 1 ----------
-  #   cat("==========================================================================\n")
-  #   cat("PHASE 1: ADF UNIT ROOT TEST\n")
-  #   cat("==========================================================================\n")
-  #   cat(" • H0: The series has a Unit Root (Non-Stationary).\n")
-  #   cat(" • Ha: The series is Stationary (Mean Reverting).\n")
-  #   cat(sprintf(" -> CRITERIA: Reject H0 if Tau-Obs (%s) < Tau-Crit (%s)\n",
-  #               fmt_num(tau_obs, 4), fmt_num(tau_crit, 4)))
-  #   cat("\n RESULT:\n")
-  #   cat(sprintf("  - Tau Observed : %s \n", fmt_num(tau_obs, 6)))
-  #   cat(sprintf("  - Tau Critical : %s \n", fmt_num(tau_crit, 2)))
-  #   cat(sprintf("  - P-Value (Ref): %s \n", ifelse(is.finite(adf_p), fmt_p(adf_p), "NA")))
-  #   cat("\n DECISION:\n")
-  #   if (adf_ok_vals && adf_stationary) {
-  #     cat("  -> REJECT H0: Evidence suggests the series is STATIONARY (on training window).\n")
-  #   } else if (adf_ok_vals && !adf_stationary) {
-  #     cat("  -> FAIL TO REJECT H0: Evidence suggests the series is NON-STATIONARY (on training window).\n")
-  #   } else {
-  #     cat("  -> INCONCLUSIVE: Missing statistic/critical value; regression may be ill-conditioned.\n")
-  #   }
-  #   
-  #   # ---------- PHASE 2 ----------
-  #   cat("\n==========================================================================\n")
-  #   cat("PHASE 2: RESIDUAL DIAGNOSTICS (LJUNG-BOX)\n")
-  #   cat("==========================================================================\n")
-  #   cat(" • H0: Residuals are White Noise (No Autocorrelation).\n")
-  #   cat(" • Ha: Residuals are Correlated (Lags are insufficient).\n")
-  #   cat(sprintf(" -> CRITERIA: Reject H0 if P-Value (%s) < α (%s)\n", fmt_num(lb_p, 6), fmt_num(alpha_val, 4)))
-  #   cat("\n RESULT:\n")
-  #   cat(sprintf("  - LB Statistic : %s \n", fmt_num(lb_stat, 6)))
-  #   cat(sprintf("  - LB P-Value   : %s \n", fmt_num(lb_p, 6)))
-  #   cat(sprintf("  - LB Lag used  : %d \n", lb_lag))
-  #   cat("    it’s normal to choose LB lag by a rule-of-thumb (like min(10, floor(N/5)) \n")
-  #   cat("\n DECISION:\n")
-  #   if (is.finite(lb_p)) {
-  #     if (lb_p > alpha_val) cat("  -> FAIL TO REJECT H0: Residuals are White Noise. [ADF more reliable]\n")
-  #     else                  cat("  -> REJECT H0: Residual autocorrelation remains; increase k or difference.\n")
-  #   } else {
-  #     cat("  -> INCONCLUSIVE: Ljung–Box p-value is NA.\n")
-  #   }
-  #   
-  #   # ---------- PHASE 3A ----------
-  #   cat("\n==========================================================================\n")
-  #   cat("PHASE 3: KPSS + STRUCTURAL BREAK (Pettitt) + KPSS SEGMENTS\n")
-  #   cat("==========================================================================\n\n")
-  #   cat("PHASE 3A: KPSS (Stationarity Confirmation)\n")
-  #   cat(sprintf(" • H0: The series is Stationary around a %s.\n", if (kpss_type=="Trend") "Trend" else "Level"))
-  #   cat(" • Ha: The series is Non-Stationary.\n")
-  #   cat(sprintf(" • CRITERIA (p-value) : Reject H0 if p-value (%s) < α (%s)\n", 
-  #               ifelse(is.finite(kpss_p), fmt_num(kpss_p, 6), "NA"), fmt_num(alpha_val,4)))
-  #   cat(sprintf(" • CRITERIA (eta)     : Reject H0 if Eta-Obs (%s) > Eta-Crit (%s)  [urca]\n", 
-  #               fmt_num(eta_obs_uc, 6), fmt_num(eta_crit_uc, 6)))
-  #   cat("\n RESULT:\n")
-  #   cat(sprintf("  - Eta (Observed value) [urca]   : %s \n", fmt_num(eta_obs_uc, 5)))
-  #   cat(sprintf("  - Eta (Critical value) [urca]   : %s \n", fmt_num(eta_crit_uc, 3)))
-  #   cat(sprintf("  - p-value (one-tailed) [tseries]: %s \n", ifelse(is.finite(kpss_p), fmt_num(kpss_p, 6), "NA")))
-  #   cat(sprintf("  - Eta (Observed) [tseries, FYI] : %s \n", fmt_num(eta_obs_uc, 5)))
-  #   cat("\n DECISION:\n")
-  #   if (kpss_stationary) cat("  -> FAIL TO REJECT H0: Stationarity supported by KPSS.\n")
-  #   else                 cat("  -> REJECT H0: Non-stationarity indicated by KPSS.\n")
-  #   
-  #   # ---------- PHASE 3B ----------
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat("PHASE 3B: STRUCTURAL BREAK CHECK (Pettitt) + KPSS SEGMENT CHECK\n")
-  #   cat(" • Goal: Detect a single change-point (median shift) that can distort KPSS.\n")
-  #   cat(" • If a break exists, we re-run KPSS before/after the break.\n")
-  #   cat(sprintf(" • Pettitt p-value: %s | α: %s\n\n", ifelse(is.finite(pett_p), fmt_num(pett_p, 6), "NA"), fmt_num(alpha_val, 4)))
-  #   cat(" RESULT:\n")
-  #   cat(sprintf("  - Break index (estimate): %s \n", ifelse(is.finite(pett_cp), pett_cp, "NA")))
-  #   cat(sprintf("  - Pettitt statistic     : %s \n", fmt_num(pett_U, 0)))
-  #   cat(sprintf("  - Pettitt p-value       : %s \n", ifelse(is.finite(pett_p), fmt_num(pett_p, 6), "NA")))
-  #   cat("\n DECISION:\n")
-  #   if (is.finite(pett_p)) {
-  #     if (pett_p < alpha_val) cat("  -> REJECT H0: Break detected. Full-sample KPSS/ADF may be contaminated.\n")
-  #     else                    cat("  -> FAIL TO REJECT H0: No strong single break detected.\n")
-  #   } else {
-  #     cat("  -> INCONCLUSIVE: Pettitt p-value NA.\n")
-  #   }
-  #   
-  #   # ---------- PHASE 3C ----------
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat("PHASE 3C: KPSS RE-CHECK BY SEGMENTS\n")
-  #   cat("  • Segment 1 = [1 .. break]\n")
-  #   cat("  • Segment 2 = [break+1 .. N]\n")
-  #   cat(sprintf("  - KPSS p-value (Segment 1): %s\n", ifelse(is.finite(seg1_p), fmt_num(seg1_p, 6), "NA")))
-  #   cat(sprintf("  - KPSS p-value (Segment 2): %s\n", ifelse(is.finite(seg2_p), fmt_num(seg2_p, 6), "NA")))
-  #   cat("\n INTERPRETATION:\n")
-  #   if (is.finite(seg1_p) && is.finite(seg2_p)) {
-  #     if (seg1_p >= alpha_val && seg2_p >= alpha_val)
-  #       cat("  [✓] Both segments look stationary by KPSS.\n      -> Full-sample non-stationarity may be break-driven.\n")
-  #     else if (seg1_p < alpha_val && seg2_p < alpha_val)
-  #       cat("  [X] Both segments look non-stationary by KPSS.\n")
-  #     else
-  #       cat("  [?] Mixed evidence: one segment stationary, the other not.\n")
-  #   } else {
-  #     cat("  [?] Segment KPSS not available (short segments or missing package).\n")
-  #   }
-  #   
-  #   # ---------- PHASE 4: Final verdict & advice ----------
-  #   cat("\n==========================================================================\n")
-  #   cat("PHASE 4: FINAL ACADEMIC VERDICT & ADVICE\n")
-  #   cat("==========================================================================\n")
-  #   if (adf_stationary && kpss_stationary) {
-  #     cat(" [✓] VERDICT: CONVERGENT STATIONARITY (ADF & KPSS agree; residuals likely white).\n")
-  #     cat("     ADVICE: Proceed with SARIMA identification with d=0 (choose D via seasonality), then residual checks.\n")
-  #   } else if (!adf_stationary && !kpss_stationary) {
-  #     cat(" [X] VERDICT: CONVERGENT NON-STATIONARITY (ADF & KPSS agree).\n")
-  #     cat("     ADVICE: Difference the series (d=1). If seasonal (m≥2), consider D=1, then re-run tests.\n")
-  #   } else {
-  #     cat(" [?] VERDICT: CONFLICTING RESULTS (ADF vs KPSS).\n")
-  #     cat("     ADVICE: Near-unit-root, trend-vs-drift mismatch, or break contamination are common causes.\n")
-  #     cat("             Use PHASE 0 to pick k/type with LB ok and stable decisions; consider seasonal differencing and break handling.\n")
-  #   }
-  #   
-  #   # ---------- Technical appendix: ADF regression coefficients ----------
-  #   cat("\n TECHNICAL APPENDIX (ADF Regression Coefficients):\n")
-  #   if (!is.null(ur) && !is.null(ur@testreg)) {
-  #     cf <- tryCatch(coef(summary(ur@testreg)), error = function(e) NULL)
-  #     if (!is.null(cf)) {
-  #       printCoefmat(cf, digits = 7, signif.stars = FALSE, P.values = TRUE, has.Pvalue = TRUE)
-  #     } else {
-  #       cat("  (coefficients unavailable)\n")
-  #     }
-  #   } else {
-  #     cat("  (ADF regression unavailable)\n")
-  #   }
-  #   
-  #   # ---------- PHASE 5: Evidence snapshot & checklist ----------
-  #   cat("\n==========================================================================\n")
-  #   cat("PHASE 5: POST-SUMMARY (Academic-quality snapshot)\n")
-  #   cat("==========================================================================\n")
-  #   cat(" EVIDENCE SNAPSHOT (All key outcomes in one place):\n")
-  #   cat(sprintf(" [ ] N (effective sample size)              : %s\n", N))
-  #   cat(sprintf(" [ ] Model type (ADF)                       : %s  (tau row: %s)\n", tolower(type_in), tau_row))
-  #   cat(sprintf(" [ ] Lag order (k)                          : %s\n", k))
-  #   cat(sprintf(" [ ] Alpha (α)                              : %s\n", fmt_num(alpha_val, 4)))
-  #   cat(sprintf(" [ ] Tau-Observed (urca)                    : %s\n", fmt_num(tau_obs, 6)))
-  #   cat(sprintf(" [ ] Tau-Critical (urca, %s)                  : %s\n", alpha_col, fmt_num(tau_crit, 6)))
-  #   cat(sprintf(" [ ] ADF p-value (tseries reference)        : %s\n", ifelse(is.finite(adf_p), fmt_num(adf_p, 6), "NA")))
-  #   cat(sprintf(" [ ] Ljung-Box p-value (residuals)          : %s\n", fmt_num(lb_p, 6)))
-  #   cat(sprintf(" [ ] KPSS Eta observed (urca)               : %s\n", fmt_num(eta_obs_uc, 6)))
-  #   cat(sprintf(" [ ] KPSS Eta critical (urca, %s)             : %s\n", eta_col, fmt_num(eta_crit_uc, 6)))
-  #   cat(sprintf(" [ ] KPSS p-value (one-tailed, tseries)     : %s\n", ifelse(is.finite(kpss_p), fmt_num(kpss_p, 6), "NA")))
-  #   cat(sprintf(" [!] Suggested k* (scan)                     : %s\n", ifelse(is.finite(k_suggest), k_suggest, "NA")))
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat(" CHECKLIST (Academic-quality acceptance criteria):\n")
-  #   cat(sprintf(" [ ] Tests run on TRAINING window only            : %s YES\n", tick(TRUE)))
-  #   cat(sprintf(" [ ] Variance usable (sd>0)                       : %s SATISFIED\n", tick(TRUE)))
-  #   cat(sprintf(" [ ] Tau is finite and usable                     : %s %s\n", tick(is.finite(tau_obs)), ifelse(is.finite(tau_obs),"SATISFIED","CHECK")))
-  #   cat(sprintf(" [ ] Tau critical value extracted                 : %s %s\n", tick(is.finite(tau_crit)), ifelse(is.finite(tau_crit),"SATISFIED","CHECK")))
-  #   cat(sprintf(" [ ] Residuals pass Ljung-Box (white noise)       : %s %s\n", tick(is.finite(lb_p) && lb_p > alpha_val), ifelse(is.finite(lb_p) && lb_p > alpha_val,"SATISFIED","CHECK")))
-  #   cat(sprintf(" [ ] KPSS eta & critical are usable               : %s %s\n", tick(is.finite(eta_obs_uc) && is.finite(eta_crit_uc)), ifelse(is.finite(eta_obs_uc) && is.finite(eta_crit_uc),"SATISFIED","CHECK")))
-  #   cat(sprintf(" [ ] KPSS p-value is usable                       : %s %s\n", tick(is.finite(kpss_p)), ifelse(is.finite(kpss_p),"SATISFIED","CHECK")))
-  #   cat(sprintf(" [ ] Sample size adequacy                         : %s STRONG\n", tick(N >= 50)))
-  #   cat(sprintf(" [ ] Lag order reasonable relative to N           : %s %s\n", tick(k <= max(12L, floor(N/10))), ifelse(k <= max(12L, floor(N/10)),"OK","LARGE")))
-  #   cat(sprintf(" [ ] Seasonal differencing indicated (UI D>0)      : %s %s\n", warn(isTRUE(to_int_safe(D_in,0L) > 0)), ifelse(isTRUE(to_int_safe(D_in,0L) > 0),"YES","NO / UNKNOWN")))
-  #   cat(sprintf(" [ ] ADF alternative mode (Stationary/Explosive)   : %s\n", paste0(ifelse(is.null(alt_in),"NA",alt_in))))
-  #   cat(sprintf(" [ ] ADF & KPSS agreement                          : %s %s\n",
-  #               qmark(agreement), ifelse(agreement,"AGREEMENT","CONFLICT")))
-  #   cat("     [?] NOTE: conflicts are common with near-unit-root series, trend vs drift mismatch,\n")
-  #   cat("         structural breaks (Pettitt), or missing seasonal differencing.\n")
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat(" STRUCTURAL BREAK SUMMARY (Pettitt):\n")
-  #   cat(sprintf(" [ ] Pettitt p-value : %s  (Reject H0 if < α)\n", ifelse(is.finite(pett_p), fmt_num(pett_p, 6), "NA")))
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat("==========================================================================\n")
-  #   cat(" ACTIONABLE NEXT STEPS (What to do now):\n")
-  #   cat("==========================================================================\n")
-  #   cat(sprintf(" %s [1] RESIDUAL AUTOCORRELATION CHECK\n", tick(is.finite(lb_p) && lb_p > alpha_val)))
-  #   cat("     • Ljung-Box is acceptable → ADF regression is less likely biased.\n")
-  #   cat(" [?] [2] RESOLVE ADF vs KPSS CONFLICT\n")
-  #   cat("     • Use PHASE 0 'ADF SPEC SENSITIVITY' to pick the type with LB ok and stable decision.\n")
-  #   cat("     • Try ADF model type variants: none / drift / trend (match KPSS Level vs Trend).\n")
-  #   cat("     • If Pettitt indicates a break: split sample and re-test.\n")
-  #   cat("     • If series is seasonal: test after seasonal differencing (D=1) + maybe log.\n")
-  #   cat("     • Consider variance stabilization: log or Box-Cox (if positive data).\n")
-  #   cat(" [!] [3] SEASONALITY SANITY (especially for AirPassengers-like series)\n")
-  #   if (is.finite(x_freq) && x_freq >= 2) {
-  #     cat(sprintf("     • Detected frequency=%d → seasonality is plausible.\n", x_freq))
-  #   } else {
-  #     cat("     • Frequency unknown → inspect ACF/PACF for seasonal spikes.\n")
-  #   }
-  #   cat(" [✓] [4] EXPLOSIVE MODE NOTE\n")
-  #   cat(sprintf("     • %s\n", ifelse(identical(alt_in,"explosive"),
-  #                                     "Explosive alternative was requested; interpret ADF accordingly.",
-  #                                     "Not in explosive mode → standard stationarity workflow applies.")))
-  #   cat("\n PRACTICAL MODELING PATH (for your Shiny workflow):\n")
-  #   if (!adf_stationary || !kpss_stationary) {
-  #     cat(" [X] Apply differencing (d and/or D) → re-run ADF/KPSS → then identify ARMA.\n")
-  #   } else {
-  #     cat(" [✓] Keep d=0 (and decide D via seasonality) → SARIMA identification and residual diagnostics.\n")
-  #   }
-  #   cat("--------------------------------------------------------------------------\n")
-  # })
-  
-  
-  
-  
-
-  
-  # output$teststationarited3St <- renderPrint({
-  #   # ---------- Helpers ----------
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
-  #   to_num_safe <- function(v, default = NA_real_) {
-  #     out <- suppressWarnings(as.numeric(v))
-  #     if (length(out) == 0 || all(is.na(out)) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   to_int_safe <- function(v, default = 0L) {
-  #     out <- suppressWarnings(as.integer(v))
-  #     if (length(out) == 0 || is.na(out[1]) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   safe_head_tail <- function(x, n = 5) {
-  #     x <- as.numeric(x); x <- x[is.finite(x)]
-  #     if (length(x) == 0) return(list(head = numeric(0), tail = numeric(0)))
-  #     list(head = head(x, n), tail = tail(x, n))
-  #   }
-  #   tau_row_for <- function(type_in) switch(type_in, "none"="tau1", "drift"="tau2", "trend"="tau3", "tau3")
-  #   title <- function(txt) cat(sprintf("\n%s\n", txt))
-  #   bullet <- function(txt) cat(sprintf(" • %s\n", txt))
-  #   line <- function(k, v) cat(sprintf("   - %-22s %s\n", paste0(k, ":"), v))
-  #   
-  #   # Critical value extractor (robust to naming)
-  #   cval_pick_safe <- function(cval_obj, row, col) {
-  #     if (is.null(cval_obj)) return(NA_real_)
-  #     ans <- NA_real_
-  #     if (is.matrix(cval_obj)) {
-  #       if (!missing(row) && !missing(col) && row %in% rownames(cval_obj) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[row, col]))
-  #       } else if (!missing(col) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, col]))
-  #       } else {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, 1]))
-  #       }
-  #     } else {
-  #       nm <- names(cval_obj)
-  #       if (!is.null(nm) && col %in% nm) ans <- suppressWarnings(as.numeric(cval_obj[[col]]))
-  #       if (!is.finite(ans) && length(cval_obj) >= 3) {
-  #         if (identical(col, "10pct")) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #         if (identical(col, "5pct"))  ans <- suppressWarnings(as.numeric(cval_obj[2]))
-  #         if (identical(col, "1pct"))  ans <- suppressWarnings(as.numeric(cval_obj[3]))
-  #       }
-  #       if (!is.finite(ans)) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #     }
-  #     ans
-  #   }
-  #   
-  #   # APA helpers
-  #   fmt_p <- function(p) {
-  #     if (!is.finite(p)) return("p = NA")
-  #     if (p < .001) "p < .001" else paste0("p = ", sub("^0\\.", ".", sprintf("%.3f", p)))
-  #   }
-  #   apa_line_adf  <- function(tau, p, k, N, type)
-  #     paste0("According to the ADF test (", type, ", k = ", k, ", N = ", N, "), the observed statistic was τ = ",
-  #            sprintf("%.3f", tau), " with ", fmt_p(p), ".")
-  #   apa_line_pp   <- function(stat, p)
-  #     paste0("According to the Phillips–Perron test, the observed statistic was Z_α = ",
-  #            ifelse(is.finite(stat), sprintf("%.3f", stat), "NA"), " with ", fmt_p(p), ".")
-  #   apa_line_dfgls<- function(stat, crit)
-  #     paste0("The DF-GLS statistic was ", ifelse(is.finite(stat), sprintf("%.3f", stat), "NA"),
-  #            if (is.finite(crit)) paste0(", compared to a 5% critical value of ", sprintf("%.3f", crit), ".") else ".")
-  #   apa_line_kpss <- function(eta, p, mode)
-  #     paste0("According to the KPSS test (", mode, "), the observed statistic was η = ",
-  #            sprintf("%.3f", eta), " with ", fmt_p(p), ".")
-  #   apa_line_lb   <- function(stat, p, L)
-  #     paste0("Using a Ljung–Box test at lag ", L, ", the statistic was Q = ",
-  #            ifelse(is.finite(stat), sprintf("%.3f", stat), "NA"), " with ", fmt_p(p), ".")
-  #   apa_line_pett <- function(U, p)
-  #     paste0("The Pettitt test yielded U = ", ifelse(is.finite(U), sprintf("%.3f", U), "NA"),
-  #            " with ", fmt_p(p), ".")
-  #   apa_line_jb   <- function(stat, p)
-  #     paste0("The Jarque–Bera normality test returned JB = ",
-  #            ifelse(is.finite(stat), sprintf("%.3f", stat), "NA"), " with ", fmt_p(p), ".")
-  #   apa_line_arch <- function(stat, p, L)
-  #     paste0("The ARCH LM test (lags = ", L, ") returned LM = ",
-  #            ifelse(is.finite(stat), sprintf("%.3f", stat), "NA"), " with ", fmt_p(p), ".")
-  #   
-  #   # ---------- Inputs (from your UI) ----------
-  #   alt_in  <- input$alternd2St %||% input$alternSt       # "stationary", "explosive", "regression" (ADF/PP)
-  #   lag_in  <- input$LagOrderADFd2St %||% input$LagOrderADFSt
-  #   a_in    <- input$alphaSt2
-  #   type_in <- input$adfTypeSt2                            # "none", "drift", "trend"
-  #   
-  #   # Transformation flags (provenance)
-  #   d_in   <- input$d_n  %||% NA
-  #   D_in   <- input$DS_n %||% NA
-  #   log_in <- input$check_box %||% FALSE
-  #   
-  #   # ---------- Data ----------
-  #   req(myData_Choice())
-  #   x_raw <- myData_Choice()
-  #   na_before <- sum(is.na(x_raw))
-  #   x_class <- paste(class(x_raw), collapse = ", ")
-  #   x_freq  <- if (inherits(x_raw, "ts")) tryCatch(stats::frequency(x_raw), error = function(e) NA_integer_) else NA_integer_
-  #   x <- as.numeric(stats::na.omit(x_raw))
-  #   N <- length(x)
-  #   
-  #   # ---------- Hyper-parameters ----------
-  #   k <- to_int_safe(lag_in, default = 0L); if (!is.finite(k) || k < 0) k <- 0L
-  #   alpha_raw <- as.character(a_in)
-  #   alpha_val <- to_num_safe(alpha_raw, default = 0.05)
-  #   alpha_col <- switch(alpha_raw, "0.01"="1pct", "0.05"="5pct", "0.1"="10pct", "0.10"="10pct",
-  #                       "1pct"="1pct", "5pct"="5pct", "10pct"="10pct", "5pct")
-  #   tau_row <- tau_row_for(type_in)
-  #   seasonality_resolved <- isTRUE(to_int_safe(D_in, 0L) > 0L)
-  #   
-  #   # ---------- Sanity checks ----------
-  #   if (N < 5) { title("Critical error"); bullet("Too few observations (N < 5). Provide more data."); return(invisible(NULL)) }
-  #   if (!is.finite(stats::sd(x)) || stats::sd(x) == 0) {
-  #     title("Critical error"); bullet("Series is constant/invalid (sd = 0 or NA). Check transforms."); return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- Package check ----------
-  #   if (!requireNamespace("urca", quietly = TRUE) || !requireNamespace("tseries", quietly = TRUE)) {
-  #     title("Missing packages")
-  #     bullet("Please install.packages(c('urca','tseries')) to run ADF/KPSS/PP.")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- ADF (urca + tseries p-value) ----------
-  #   ur  <- tryCatch(urca::ur.df(x, type = type_in, lags = k), error = function(e) NULL)
-  #   tau_obs  <- if (!is.null(ur)) suppressWarnings(as.numeric(ur@teststat[tau_row])) else NA_real_
-  #   if (!is.finite(tau_obs) && !is.null(ur)) tau_obs <- suppressWarnings(as.numeric(ur@teststat[1]))
-  #   tau_crit <- if (!is.null(ur)) cval_pick_safe(ur@cval, tau_row, alpha_col) else NA_real_
-  #   
-  #   adf_ts <- if (N > (k + 10)) tryCatch(tseries::adf.test(x, alternative = alt_in, k = k), error = function(e) NULL) else NULL
-  #   adf_p  <- if (!is.null(adf_ts)) to_num_safe(adf_ts$p.value) else NA_real_
-  #   
-  #   # ---------- Phillips–Perron (robust to serial corr.) ----------
-  #   alt_pp <- if (alt_in %in% c("stationary","explosive")) alt_in else "stationary"
-  #   pp_res <- tryCatch(tseries::pp.test(x, alternative = alt_pp), error = function(e) NULL)
-  #   pp_stat<- if (!is.null(pp_res)) to_num_safe(pp_res$statistic[1]) else NA_real_
-  #   pp_p   <- if (!is.null(pp_res)) to_num_safe(pp_res$p.value) else NA_real_
-  #   
-  #   # ---------- DF-GLS / ERS (more power) ----------
-  #   ers_res <- tryCatch(urca::ur.ers(x, type = "DF-GLS", model = if (type_in == "trend") "trend" else "constant",
-  #                                    lag.max = max(k, 1L)), error = function(e) NULL)
-  #   ers_stat <- if (!is.null(ers_res)) to_num_safe(ers_res@teststat) else NA_real_
-  #   ers_crit5<- if (!is.null(ers_res)) cval_pick_safe(ers_res@cval, 1, "5pct") else NA_real_
-  #   ers_stationary <- is.finite(ers_stat) && is.finite(ers_crit5) && (ers_stat < ers_crit5)
-  #   
-  #   # ---------- Ljung–Box on ADF residuals ----------
-  #   lb_lag <- max(1L, min(10L, floor(N / 5)))
-  #   lb     <- if (!is.null(ur)) stats::Box.test(ur@res, lag = lb_lag, type = "Ljung-Box") else NULL
-  #   lb_stat<- if (!is.null(lb)) to_num_safe(lb$statistic) else NA_real_
-  #   lb_p   <- if (!is.null(lb)) to_num_safe(lb$p.value) else NA_real_
-  #   
-  #   # ---------- KPSS ----------
-  #   kpss_type <- if (type_in == "trend") "Trend" else "Level"
-  #   kpss_ts   <- tryCatch(tseries::kpss.test(x, null = kpss_type), error = function(e) NULL)
-  #   kpss_p    <- if (!is.null(kpss_ts)) to_num_safe(kpss_ts$p.value) else NA_real_
-  #   
-  #   kpss_uc   <- tryCatch(urca::ur.kpss(x, type = if (type_in == "trend") "tau" else "mu"), error = function(e) NULL)
-  #   eta_obs_uc  <- if (!is.null(kpss_uc)) to_num_safe(kpss_uc@teststat) else NA_real_
-  #   eta_col     <- if (alpha_val <= 0.01) "1pct" else if (alpha_val <= 0.05) "5pct" else "10pct"
-  #   eta_crit_uc <- if (!is.null(kpss_uc)) cval_pick_safe(kpss_uc@cval, 1, eta_col) else NA_real_
-  #   
-  #   # ---------- Pettitt (optional structural break) ----------
-  #   pett_U <- pett_p <- NA_real_
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     pet <- tryCatch(trend::pettitt.test(x), error = function(e) NULL)
-  #     if (!is.null(pet)) { pett_U <- to_num_safe(pet$statistic); pett_p <- to_num_safe(pet$p.value) }
-  #   }
-  #   
-  #   # ---------- Seasonal ACF summary (for SARIMA students) ----------
-  #   seasonal_summary <- NULL
-  #   if (is.finite(x_freq) && x_freq >= 2) {
-  #     ac <- tryCatch(stats::acf(x, lag.max = min(2L * x_freq, max(10L, x_freq)), plot = FALSE), error = function(e) NULL)
-  #     if (!is.null(ac) && length(ac$acf) > 1) {
-  #       # acf includes lag 0; build a small summary
-  #       lags <- as.integer(round(ac$lag * x_freq))  # convert fractional lags if ts
-  #       vals <- as.numeric(ac$acf)
-  #       idx  <- lags >= 1
-  #       lags <- lags[idx]; vals <- vals[idx]
-  #       seas_lags <- lags[lags %in% c(x_freq, 2L * x_freq)]
-  #       seas_vals <- vals[lags %in% c(x_freq, 2L * x_freq)]
-  #       thr <- 1.96 / sqrt(N)
-  #       seasonal_summary <- list(threshold = thr,
-  #                                s = x_freq,
-  #                                pairs = if (length(seas_lags) > 0) data.frame(lag = seas_lags, acf = round(seas_vals, 3)) else NULL,
-  #                                top = { o <- order(-abs(vals)); head(data.frame(lag = lags[o], acf = round(vals[o], 3)), 5) })
-  #     }
-  #   }
-  #   
-  #   # ---------- Optional: recommended differencing (forecast) ----------
-  #   nd <- nsd <- NA_integer_
-  #   if (requireNamespace("forecast", quietly = TRUE)) {
-  #     nd  <- tryCatch(forecast::ndiffs(x, alpha = alpha_val, test = "kpss"), error = function(e) NA_integer_)
-  #     nsd <- if (is.finite(x_freq) && x_freq >= 2)
-  #       tryCatch(forecast::nsdiffs(x, m = x_freq, test = "ch"), error = function(e) NA_integer_) else NA_integer_
-  #   }
-  #   
-  #   # ---------- Optional: residual distribution/variance checks ----------
-  #   jb_stat <- jb_p <- NA_real_
-  #   arch_stat <- arch_p <- NA_real_
-  #   if (is.finite(lb_p)) { # only if we ran an ADF regression and got residuals whiteness test
-  #     # Use the same residuals (ur@res) for these checks if available
-  #     if (!is.null(ur)) {
-  #       # Normality of the series (simple) — many syllabi still show JB on raw data
-  #       jbr <- tryCatch(tseries::jarque.bera.test(x), error = function(e) NULL)
-  #       if (!is.null(jbr)) { jb_stat <- to_num_safe(jbr$statistic[1]); jb_p <- to_num_safe(jbr$p.value) }
-  #       # ARCH LM on series (pedagogical; strictly, residuals from a fitted model are better)
-  #       if (requireNamespace("FinTS", quietly = TRUE)) {
-  #         ar <- tryCatch(FinTS::ArchTest(x, lags = lb_lag), error = function(e) NULL)
-  #         if (!is.null(ar)) { arch_stat <- to_num_safe(ar$statistic[1]); arch_p <- to_num_safe(ar$p.value) }
-  #       }
-  #     }
-  #   }
-  #   
-  #   # ---------- Decisions ----------
-  #   adf_ok_vals <- is.finite(tau_obs) && is.finite(tau_crit)
-  #   adf_stationary <- adf_ok_vals && (tau_obs < tau_crit)
-  #   
-  #   kpss_by_p   <- is.finite(kpss_p)     && (kpss_p < alpha_val)
-  #   kpss_by_eta <- is.finite(eta_obs_uc) && is.finite(eta_crit_uc) && (eta_obs_uc > eta_crit_uc)
-  #   kpss_stationary <- !(kpss_by_p || kpss_by_eta)
-  #   
-  #   agreement <- (adf_stationary && kpss_stationary) || (!adf_stationary && !kpss_stationary)
-  #   lb_pass   <- is.finite(lb_p) && (lb_p > alpha_val)
-  #   
-  #   # ---------- CHECKLIST ----------
-  #   title("Checklist")
-  #   line("ADF decision", if (adf_ok_vals && adf_stationary) "STATIONARY" else "NON-STATIONARY")
-  #   line("KPSS decision", if (kpss_stationary) "STATIONARY" else "NON-STATIONARY")
-  #   line("ADF vs KPSS", if (agreement) "AGREEMENT" else "CONFLICT")
-  #   line("Residual whiteness (LB)", if (lb_pass) "PASS" else if (is.finite(lb_p)) "FAIL" else "NA")
-  #   line("Seasonal differencing in UI (D>0)", if (seasonality_resolved) "YES" else "NO/UNKNOWN")
-  #   
-  #   # ---------- SPECIFICATION & PROVENANCE ----------
-  #   title("Specification & provenance")
-  #   line("Model type (ADF)", toupper(type_in))
-  #   line("Lag k", k)
-  #   line("Alpha (α)", alpha_raw)
-  #   line("Series class", x_class)
-  #   line("Frequency (m)", ifelse(is.finite(x_freq), x_freq, "NA"))
-  #   line("NA before omit", na_before)
-  #   ht <- safe_head_tail(x, 5)
-  #   line("Transforms", paste0("log=", ifelse(isTRUE(log_in), "ON", "OFF"),
-  #                             ", d=", as.character(d_in), ", D=", as.character(D_in)))
-  #   line("First 5 used", paste(round(ht$head, 4), collapse = ", "))
-  #   line("Last 5 used",  paste(round(ht$tail, 4), collapse = ", "))
-  #   
-  #   # ---------- PHASE 1: ADF ----------
-  #   title("ADF: Augmented Dickey–Fuller")
-  #   bullet("Purpose: Detect a nonseasonal unit root (random-walk behavior). This helps decide if nonseasonal differencing (d) is required.")
-  #   bullet("Hypotheses:")
-  #   bullet("  H0 — The series has a unit root (non-stationary).")
-  #   bullet("  Ha — The series is stationary under the chosen deterministic terms.")
-  #   bullet(sprintf("Decision rule: at α = %s, reject H0 if τ_obs < τ_crit.", alpha_raw))
-  #   bullet(sprintf("Statistics: τ_obs = %.6f; τ_crit(%s) = %.6f; p(ref, tseries) = %s",
-  #                  tau_obs, alpha_col, tau_crit,
-  #                  if (is.finite(adf_p)) format.pval(adf_p, digits = 4) else "NA"))
-  #   cat(" ", apa_line_adf(tau_obs, adf_p, k, N, type_in), "\n", sep = "")
-  #   if (adf_ok_vals && adf_stationary) {
-  #     bullet(sprintf("Decision: REJECT H0 (stationary) because τ_obs (%.6f) < τ_crit(%s) (%.6f).", tau_obs, alpha_col, tau_crit))
-  #   } else if (adf_ok_vals && !adf_stationary) {
-  #     bullet(sprintf("Decision: FAIL TO REJECT H0 (non-stationary) because τ_obs (%.6f) ≥ τ_crit(%s) (%.6f).", tau_obs, alpha_col, tau_crit))
-  #   } else {
-  #     bullet("Decision: INCONCLUSIVE — missing statistic/critical value (often due to large k vs N or constant series).")
-  #   }
-  #   
-  #   # ---------- PHASE 1b: Phillips–Perron ----------
-  #   title("Phillips–Perron (complement to ADF)")
-  #   bullet("Purpose: Same null as ADF but corrects for serial correlation and heteroskedasticity in the errors via nonparametric adjustments.")
-  #   bullet("Hypotheses: H0 — unit root; Ha — stationary (same as ADF).")
-  #   bullet(sprintf("Statistics: Z_α = %s; p = %s",
-  #                  ifelse(is.finite(pp_stat), sprintf("%.6f", pp_stat), "NA"),
-  #                  if (is.finite(pp_p)) format.pval(pp_p, digits = 4) else "NA"))
-  #   cat(" ", apa_line_pp(pp_stat, pp_p), "\n", sep = "")
-  #   if (is.finite(pp_p)) {
-  #     bullet(if (pp_p < alpha_val) "Decision: REJECT H0 — PP supports stationarity."
-  #            else "Decision: FAIL TO REJECT H0 — PP supports a unit root.")
-  #   } else bullet("Decision: INCONCLUSIVE — PP p-value not available.")
-  #   
-  #   # ---------- PHASE 1c: DF-GLS / ERS ----------
-  #   title("DF-GLS (ERS) — higher power near unit roots")
-  #   bullet("Purpose: A more powerful unit-root test obtained by GLS detrending before the ADF regression.")
-  #   bullet(sprintf("Statistic: DF-GLS = %s; 5%% critical ≈ %s",
-  #                  ifelse(is.finite(ers_stat), sprintf("%.6f", ers_stat), "NA"),
-  #                  ifelse(is.finite(ers_crit5), sprintf("%.6f", ers_crit5), "NA")))
-  #   cat(" ", apa_line_dfgls(ers_stat, ers_crit5), "\n", sep = "")
-  #   if (is.finite(ers_stat) && is.finite(ers_crit5)) {
-  #     bullet(if (ers_stationary) "Decision: REJECT H0 — DF-GLS indicates stationarity."
-  #            else "Decision: FAIL TO REJECT H0 — DF-GLS indicates a unit root.")
-  #   }
-  #   
-  #   # ---------- PHASE 2: Residual whiteness (LB) ----------
-  #   title("Residual whiteness (Ljung–Box)")
-  #   bullet("Purpose: Check that ADF regression residuals behave like white noise (helps validate the regression).")
-  #   bullet("Hypotheses: H0 — residuals are white noise; Ha — residuals are autocorrelated.")
-  #   bullet(sprintf("Statistics: lag = %d; Q = %s; p = %s",
-  #                  lb_lag,
-  #                  ifelse(is.finite(lb_stat), sprintf("%.6f", lb_stat), "NA"),
-  #                  if (is.finite(lb_p)) format.pval(lb_p, digits = 4) else "NA"))
-  #   cat(" ", apa_line_lb(lb_stat, lb_p, lb_lag), "\n", sep = "")
-  #   if (is.finite(lb_p)) {
-  #     bullet(if (lb_p > alpha_val) "Decision: FAIL TO REJECT H0 — residuals look white (favorable)."
-  #            else "Decision: REJECT H0 — residual autocorrelation remains; increase k or difference.")
-  #   } else bullet("Decision: INCONCLUSIVE — Ljung–Box p-value is NA.")
-  #   
-  #   # ---------- PHASE 3: KPSS ----------
-  #   title("KPSS — confirm stationarity (opposite null)")
-  #   bullet(sprintf("Purpose: Cross-check stationarity; H0 — stationary around a %s; Ha — non-stationary.",
-  #                  if (kpss_type == "Trend") "trend" else "level"))
-  #   bullet(sprintf("Statistics: η_obs = %.6f; η_crit(%s) = %.6f; p = %s",
-  #                  eta_obs_uc, eta_col, eta_crit_uc,
-  #                  if (is.finite(kpss_p)) format.pval(kpss_p, digits = 4) else "NA"))
-  #   cat(" ", apa_line_kpss(eta_obs_uc, kpss_p, if (kpss_type == "Trend") "Trend" else "Level"), "\n", sep = "")
-  #   bullet(if ( (is.finite(kpss_p) && kpss_p >= alpha_val) ||
-  #               (is.finite(eta_obs_uc) && is.finite(eta_crit_uc) && eta_obs_uc <= eta_crit_uc)) {
-  #     "Decision: FAIL TO REJECT H0 — stationarity supported."
-  #   } else {
-  #     "Decision: REJECT H0 — non-stationarity indicated."
-  #   })
-  #   
-  #   # ---------- PHASE 4: Structural break (Pettitt) ----------
-  #   title("Structural break (Pettitt)")
-  #   bullet("Purpose: Single change-point can distort unit-root tests and suggest higher differencing than needed.")
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     bullet(sprintf("Statistics: U = %s; p = %s",
-  #                    ifelse(is.finite(pett_U), sprintf("%.6f", pett_U), "NA"),
-  #                    if (is.finite(pett_p)) format.pval(pett_p, digits = 4) else "NA"))
-  #     cat(" ", apa_line_pett(pett_U, pett_p), "\n", sep = "")
-  #     if (is.finite(pett_p)) {
-  #       bullet(if (pett_p < alpha_val) "Decision: REJECT H0 — evidence of a structural break; consider segment-wise testing."
-  #              else "Decision: FAIL TO REJECT H0 — no strong single break detected.")
-  #     } else bullet("Decision: INCONCLUSIVE — Pettitt p-value not available.")
-  #   } else bullet("Package 'trend' not installed — Pettitt skipped. (install.packages('trend'))")
-  #   
-  #   # ---------- SARIMA-oriented helpers ----------
-  #   title("SARIMA helpers for students")
-  #   if (is.finite(x_freq) && x_freq >= 2 && !is.null(seasonal_summary)) {
-  #     bullet(sprintf("Seasonal ACF (m = %d). 95%% no-corr threshold ≈ ±%.3f.", seasonal_summary$s, seasonal_summary$threshold))
-  #     if (!is.null(seasonal_summary$pairs) && nrow(seasonal_summary$pairs) > 0) {
-  #       for (i in seq_len(nrow(seasonal_summary$pairs))) {
-  #         bullet(sprintf("ACF at lag %d: %.3f", seasonal_summary$pairs$lag[i], seasonal_summary$pairs$acf[i]))
-  #       }
-  #     }
-  #     bullet("Largest absolute autocorrelations (first five):")
-  #     if (!is.null(seasonal_summary$top)) {
-  #       apply(seasonal_summary$top, 1, function(r) bullet(sprintf("lag %s: %s", r[1], r[2])))
-  #     }
-  #   } else {
-  #     bullet("Seasonal ACF: frequency not available or < 2.")
-  #   }
-  #   
-  #   if (requireNamespace("forecast", quietly = TRUE)) {
-  #     bullet(sprintf("Recommended nonseasonal differencing d (forecast::ndiffs) = %s", ifelse(is.finite(nd), nd, "NA")))
-  #     if (is.finite(x_freq) && x_freq >= 2)
-  #       bullet(sprintf("Recommended seasonal differencing D (forecast::nsdiffs) = %s", ifelse(is.finite(nsd), nsd, "NA")))
-  #   } else {
-  #     bullet("Install 'forecast' to see recommended d and D via (n)sdiffs.")
-  #   }
-  #   
-  #   # ---------- Distribution/variance checks (pedagogical) ----------
-  #   title("Distribution & variance checks (pedagogical)")
-  #   bullet("Purpose: These do not decide differencing, but help explain residual diagnostics students will use after fitting SARIMA.")
-  #   bullet(sprintf("Jarque–Bera normality: %s", if (is.finite(jb_stat)) apa_line_jb(jb_stat, jb_p) else "not available"))
-  #   if (requireNamespace("FinTS", quietly = TRUE))
-  #     bullet(sprintf("ARCH LM (volatility clustering): %s",
-  #                    if (is.finite(arch_stat)) apa_line_arch(arch_stat, arch_p, lb_lag) else "not available"))
-  #   else bullet("Install 'FinTS' to run an ARCH LM test (volatility).")
-  #   
-  #   # ---------- Final academic advice ----------
-  #   title("Final academic advice")
-  #   if (adf_stationary && kpss_stationary && lb_pass) {
-  #     bullet("Convergent evidence of stationarity with white residuals. For SARIMA, set d = 0 (and consider D based on seasonality) and proceed to ACF/PACF model identification.")
-  #   } else if (!adf_stationary && !kpss_stationary) {
-  #     bullet("Both ADF and KPSS indicate non-stationarity. Difference the series (try d = 1); if m ≥ 2 and seasonal ACF is strong at lag m, consider D = 1. Re-check tests before fitting SARIMA.")
-  #   } else {
-  #     bullet("ADF and KPSS conflict. Try: (i) a different ADF deterministic term (none/drift/trend), (ii) addressing seasonality (D = 1), (iii) checking for breaks (Pettitt) and re-testing, (iv) DF-GLS/PP for robustness.")
-  #   }
-  #   
-  #   # ---------- Snapshot ----------
-  #   title("Snapshot")
-  #   line("N", N)
-  #   line("type", type_in)
-  #   line("k", k)
-  #   line("α", alpha_raw)
-  #   line("freq (m)", ifelse(is.finite(x_freq), x_freq, "NA"))
-  #   line("log", ifelse(isTRUE(log_in), "ON", "OFF"))
-  #   line("d (UI)", as.character(d_in))
-  #   line("D (UI)", as.character(D_in))
-  #   line("ADF", sprintf("τ=%.4f, τ_crit(%s)=%.4f, %s", tau_obs, alpha_col, tau_crit, fmt_p(adf_p)))
-  #   line("PP",  sprintf("%s, %s",
-  #                       ifelse(is.finite(pp_stat), paste0("Z_α=", sprintf('%.4f', pp_stat)), "Z_α=NA"),
-  #                       fmt_p(pp_p)))
-  #   line("DF-GLS", if (is.finite(ers_stat)) sprintf("stat=%.4f; 5%% crit=%s", ers_stat,
-  #                                                   ifelse(is.finite(ers_crit5), sprintf('%.4f', ers_crit5), "NA")) else "NA")
-  #   line("KPSS", sprintf("η=%.4f, η_crit(%s)=%.4f, %s", eta_obs_uc, eta_col, eta_crit_uc, fmt_p(kpss_p)))
-  #   line("LB", sprintf("%s (lag %d)", fmt_p(lb_p), lb_lag))
-  #   if (requireNamespace("trend", quietly = TRUE)) line("Pettitt", fmt_p(pett_p))
-  #   if (requireNamespace("forecast", quietly = TRUE)) {
-  #     line("ndiffs (d)", ifelse(is.finite(nd), nd, "NA"))
-  #     if (is.finite(x_freq) && x_freq >= 2) line("nsdiffs (D)", ifelse(is.finite(nsd), nsd, "NA"))
-  #   }
-  #   
-  #   # ---------- Learning notes (concise) ----------
-  #   title("Learning notes")
-  #   bullet("Why multiple tests? ADF can lose power with autocorrelated errors; PP adjusts for this; DF-GLS gains power near a unit root; KPSS flips the null to guard against Type II errors.")
-  #   bullet("Seasonal structure: large ACF at lag m (and possibly 2m) suggests seasonal AR or seasonal differencing; compare ACF/PACF patterns after differencing.")
-  #   bullet("Breaks: a single level/trend shift can mimic a unit root. Always inspect plots and consider break tests before differencing too aggressively.")
-  #   bullet("After differencing: fit candidate SARIMA(p,d,q)(P,D,Q)[m], then check residuals with Ljung–Box, normality, and (optionally) ARCH LM; compare models by AIC/AICc/BIC.")
-  #   
-  # })
-  
-  
-  
-  
-  # output$teststationarited3St <- renderPrint({
-  #   # ---------- Helpers ----------
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
-  #   to_num_safe <- function(v, default = NA_real_) {
-  #     out <- suppressWarnings(as.numeric(v))
-  #     if (length(out) == 0 || all(is.na(out)) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   to_int_safe <- function(v, default = 0L) {
-  #     out <- suppressWarnings(as.integer(v))
-  #     if (length(out) == 0 || is.na(out[1]) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   safe_head_tail <- function(x, n = 5) {
-  #     x <- as.numeric(x); x <- x[is.finite(x)]
-  #     if (length(x) == 0) return(list(head = numeric(0), tail = numeric(0)))
-  #     list(head = head(x, n), tail = tail(x, n))
-  #   }
-  #   tau_row_for <- function(type_in) switch(type_in, "none"="tau1", "drift"="tau2", "trend"="tau3", "tau3")
-  #   
-  #   # --- Pretty printers ---
-  #   hr <- function() cat(paste0(strrep("=", 74), "\n"))
-  #   subhr <- function() cat(paste0(strrep("-", 74), "\n"))
-  #   h <- function(title) { hr(); cat(" ", title, "\n"); hr() }
-  #   sec <- function(title) { subhr(); cat(" ", title, "\n"); subhr() }
-  #   blt <- function(text) cat(sprintf("   • %s\n", text))
-  #   kv  <- function(key, val) cat(sprintf("   - %-20s: %s\n", key, val))
-  #   
-  #   # Critical value extractor for urca objects (robust to naming)
-  #   cval_pick_safe <- function(cval_obj, row, col) {
-  #     if (is.null(cval_obj)) return(NA_real_)
-  #     ans <- NA_real_
-  #     if (is.matrix(cval_obj)) {
-  #       if (!missing(row) && !missing(col) && row %in% rownames(cval_obj) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[row, col]))
-  #       } else if (!missing(col) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, col]))
-  #       } else {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, 1]))
-  #       }
-  #     } else {
-  #       nm <- names(cval_obj)
-  #       if (!is.null(nm) && col %in% nm) ans <- suppressWarnings(as.numeric(cval_obj[[col]]))
-  #       if (!is.finite(ans) && length(cval_obj) >= 3) {
-  #         if (identical(col, "10pct")) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #         if (identical(col, "5pct"))  ans <- suppressWarnings(as.numeric(cval_obj[2]))
-  #         if (identical(col, "1pct"))  ans <- suppressWarnings(as.numeric(cval_obj[3]))
-  #       }
-  #       if (!is.finite(ans)) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #     }
-  #     ans
-  #   }
-  #   
-  #   # APA helpers
-  #   fmt_p <- function(p) {
-  #     if (!is.finite(p)) return("p = NA")
-  #     if (p < .001) "p < .001" else paste0("p = ", sub("^0\\.", ".", sprintf("%.3f", p)))
-  #   }
-  #   apa_line_adf <- function(tau, p, k, N, type) {
-  #     paste0("According to the ADF test (", type, ", k = ", k, ", N = ", N, "), the observed statistic was τ = ",
-  #            sprintf("%.3f", tau), " with ", fmt_p(p), ".")
-  #   }
-  #   apa_line_kpss <- function(eta, p, mode) {
-  #     paste0("According to the KPSS test (", mode, "), the observed statistic was η = ",
-  #            sprintf("%.3f", eta), " with ", fmt_p(p), ".")
-  #   }
-  #   apa_line_lb <- function(stat, p, L) {
-  #     paste0("Using a Ljung–Box test at lag ", L, ", the statistic was Q = ",
-  #            ifelse(is.finite(stat), sprintf("%.3f", stat), "NA"), " with ", fmt_p(p), ".")
-  #   }
-  #   apa_line_pettitt <- function(U, p) {
-  #     paste0("The Pettitt test yielded U = ", ifelse(is.finite(U), sprintf("%.3f", U), "NA"),
-  #            " with ", fmt_p(p), ".")
-  #   }
-  #   
-  #   # ---------- Inputs (from your UI) ----------
-  #   alt_in  <- input$alternd2St %||% input$alternSt       # "stationary", "explosive", "regression"
-  #   lag_in  <- input$LagOrderADFd2St %||% input$LagOrderADFSt
-  #   a_in    <- input$alphaSt2
-  #   type_in <- input$adfTypeSt2                            # "none", "drift", "trend"
-  #   
-  #   # Transformation flags (for provenance only; actual transform is in myData_Choice())
-  #   d_in   <- input$d_n  %||% NA
-  #   D_in   <- input$DS_n %||% NA
-  #   log_in <- input$check_box %||% FALSE
-  #   
-  #   # ---------- Data ----------
-  #   req(myData_Choice())
-  #   x_raw <- myData_Choice()            # already transformed upstream in your app
-  #   na_before <- sum(is.na(x_raw))
-  #   x_class <- paste(class(x_raw), collapse = ", ")
-  #   x_freq  <- if (inherits(x_raw, "ts")) tryCatch(stats::frequency(x_raw), error = function(e) NA_integer_) else NA_integer_
-  #   x <- as.numeric(stats::na.omit(x_raw))
-  #   N <- length(x)
-  #   
-  #   # ---------- Hyper-parameters ----------
-  #   k <- to_int_safe(lag_in, default = 0L)
-  #   if (!is.finite(k) || k < 0) k <- 0L
-  #   alpha_raw <- as.character(a_in)
-  #   alpha_val <- to_num_safe(alpha_raw, default = 0.05)
-  #   alpha_col <- switch(alpha_raw, "0.01"="1pct", "0.05"="5pct", "0.1"="10pct", "0.10"="10pct",
-  #                       "1pct"="1pct", "5pct"="5pct", "10pct"="10pct", "5pct")
-  #   tau_row <- tau_row_for(type_in)
-  #   seasonality_resolved <- isTRUE(to_int_safe(D_in, 0L) > 0L)
-  #   
-  #   # ---------- Sanity checks ----------
-  #   if (N < 5) {
-  #     h("CRITICAL ERROR")
-  #     blt("Too few observations (N < 5). Provide more data.")
-  #     return(invisible(NULL))
-  #   }
-  #   if (!is.finite(stats::sd(x)) || stats::sd(x) == 0) {
-  #     h("CRITICAL ERROR")
-  #     blt("Series is constant/invalid (sd = 0 or NA). Check transforms.")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- Packages ----------
-  #   if (!requireNamespace("urca", quietly = TRUE) || !requireNamespace("tseries", quietly = TRUE)) {
-  #     h("MISSING PACKAGES")
-  #     blt("Please install.packages(c('urca','tseries')) to run ADF/KPSS.")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- ADF (urca + tseries p-value) ----------
-  #   ur  <- tryCatch(urca::ur.df(x, type = type_in, lags = k), error = function(e) NULL)
-  #   tau_obs  <- if (!is.null(ur)) suppressWarnings(as.numeric(ur@teststat[tau_row])) else NA_real_
-  #   if (!is.finite(tau_obs) && !is.null(ur)) tau_obs <- suppressWarnings(as.numeric(ur@teststat[1]))
-  #   tau_crit <- if (!is.null(ur)) cval_pick_safe(ur@cval, tau_row, alpha_col) else NA_real_
-  #   
-  #   adf_ts <- if (N > (k + 10)) tryCatch(tseries::adf.test(x, alternative = alt_in, k = k),
-  #                                        error = function(e) NULL) else NULL
-  #   adf_p  <- if (!is.null(adf_ts)) to_num_safe(adf_ts$p.value) else NA_real_
-  #   
-  #   # ---------- Ljung–Box on ADF residuals ----------
-  #   lb_lag <- max(1L, min(10L, floor(N / 5)))
-  #   lb     <- if (!is.null(ur)) stats::Box.test(ur@res, lag = lb_lag, type = "Ljung-Box") else NULL
-  #   lb_stat<- if (!is.null(lb)) to_num_safe(lb$statistic) else NA_real_
-  #   lb_p   <- if (!is.null(lb)) to_num_safe(lb$p.value) else NA_real_
-  #   
-  #   # ---------- KPSS (tseries + urca) ----------
-  #   kpss_type <- if (type_in == "trend") "Trend" else "Level"
-  #   kpss_ts   <- tryCatch(tseries::kpss.test(x, null = kpss_type), error = function(e) NULL)
-  #   kpss_p    <- if (!is.null(kpss_ts)) to_num_safe(kpss_ts$p.value) else NA_real_
-  #   
-  #   kpss_uc   <- tryCatch(urca::ur.kpss(x, type = if (type_in == "trend") "tau" else "mu"),
-  #                         error = function(e) NULL)
-  #   eta_obs_uc  <- if (!is.null(kpss_uc)) to_num_safe(kpss_uc@teststat) else NA_real_
-  #   eta_col     <- if (alpha_val <= 0.01) "1pct" else if (alpha_val <= 0.05) "5pct" else "10pct"
-  #   eta_crit_uc <- if (!is.null(kpss_uc)) cval_pick_safe(kpss_uc@cval, 1, eta_col) else NA_real_
-  #   
-  #   # ---------- Pettitt (optional) ----------
-  #   pett_U <- pett_p <- NA_real_
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     pet <- tryCatch(trend::pettitt.test(x), error = function(e) NULL)
-  #     if (!is.null(pet)) {
-  #       pett_U <- to_num_safe(pet$statistic); pett_p <- to_num_safe(pet$p.value)
-  #     }
-  #   }
-  #   
-  #   # ---------- Decisions ----------
-  #   adf_ok_vals <- is.finite(tau_obs) && is.finite(tau_crit)
-  #   adf_stationary <- adf_ok_vals && (tau_obs < tau_crit)
-  #   
-  #   kpss_by_p   <- is.finite(kpss_p)     && (kpss_p < alpha_val)
-  #   kpss_by_eta <- is.finite(eta_obs_uc) && is.finite(eta_crit_uc) && (eta_obs_uc > eta_crit_uc)
-  #   kpss_stationary <- !(kpss_by_p || kpss_by_eta)
-  #   
-  #   agreement <- (adf_stationary && kpss_stationary) || (!adf_stationary && !kpss_stationary)
-  #   lb_pass   <- is.finite(lb_p) && (lb_p > alpha_val)
-  #   
-  #   # ---------- CHECKLIST ----------
-  #   h("CHECKLIST")
-  #   kv("ADF decision",        if (adf_ok_vals && adf_stationary) "[✓] STATIONARY" else "[X] NON-STATIONARY")
-  #   kv("KPSS decision",       if (kpss_stationary) "[✓] STATIONARY" else "[X] NON-STATIONARY")
-  #   kv("ADF vs KPSS",         if (agreement) "[✓] AGREEMENT" else "[?] CONFLICT")
-  #   kv("Residual whiteness",  if (lb_pass) "[✓] PASS" else if (is.finite(lb_p)) "[X] FAIL" else "[?] NA")
-  #   kv("Seasonal D>0 (UI)",   if (seasonality_resolved) "[✓] YES" else "[!] NO / UNKNOWN")
-  #   kv("Pettitt available",   if (requireNamespace("trend", quietly = TRUE)) "[✓] YES" else "[!] NO")
-  #   
-  #   # ---------- SPECIFICATION & PROVENANCE ----------
-  #   h("SPECIFICATION & PROVENANCE")
-  #   kv("Model type (ADF)", toupper(type_in))
-  #   kv("Lag k", k)
-  #   kv("Alpha (α)", alpha_raw)
-  #   kv("Series class", x_class)
-  #   kv("Frequency", ifelse(is.finite(x_freq), x_freq, "NA"))
-  #   kv("NA before omit", na_before)
-  #   kv("Transforms (UI)", paste0("log=", ifelse(isTRUE(log_in), "ON", "OFF"),
-  #                                ", d=", as.character(d_in),
-  #                                ", D=", as.character(D_in)))
-  #   ht <- safe_head_tail(x, 5)
-  #   kv("First 5 used", paste(round(ht$head, 4), collapse = ", "))
-  #   kv("Last 5 used",  paste(round(ht$tail, 4), collapse = ", "))
-  #   
-  #   # ---------- PHASE 1: ADF ----------
-  #   h("PHASE 1 — AUGMENTED DICKEY–FULLER (ADF)")
-  #   sec("Purpose")
-  #   blt("Detect a nonseasonal unit root (random-walk behavior).")
-  #   
-  #   sec("Hypotheses")
-  #   blt("H0: The series has a unit root (non-stationary).")
-  #   blt("Ha: The series is stationary under the chosen deterministic terms.")
-  #   
-  #   sec("Decision rule")
-  #   blt(sprintf("At α = %s, reject H0 if τ_obs < τ_crit.", alpha_raw))
-  #   
-  #   sec("Statistics")
-  #   blt(sprintf("τ_obs = %.6f", tau_obs))
-  #   blt(sprintf("τ_crit(%s) = %.6f", alpha_col, tau_crit))
-  #   blt(sprintf("Reference p-value (tseries) = %s", if (is.finite(adf_p)) format.pval(adf_p, digits = 4) else "NA"))
-  #   
-  #   sec("Decision (APA)")
-  #   cat(" ", apa_line_adf(tau_obs, adf_p, k, N, type_in), "\n", sep = "")
-  #   if (adf_ok_vals && adf_stationary) {
-  #     blt(sprintf("Decision: REJECT H0 (stationary) because τ_obs (%.6f) < τ_crit(%s) (%.6f).",
-  #                 tau_obs, alpha_col, tau_crit))
-  #   } else if (adf_ok_vals && !adf_stationary) {
-  #     blt(sprintf("Decision: FAIL TO REJECT H0 (non-stationary) because τ_obs (%.6f) ≥ τ_crit(%s) (%.6f).",
-  #                 tau_obs, alpha_col, tau_crit))
-  #   } else {
-  #     blt("Decision: INCONCLUSIVE — missing statistic/critical value.")
-  #   }
-  #   
-  #   # ---------- PHASE 2: Residual whiteness (LB) ----------
-  #   h("PHASE 2 — RESIDUAL WHITENESS (LJUNG–BOX)")
-  #   sec("Hypotheses")
-  #   blt("H0: ADF residuals are white noise (no autocorrelation).")
-  #   blt("Ha: ADF residuals are autocorrelated.")
-  #   
-  #   sec("Statistics")
-  #   blt(sprintf("Lag (L) = %d", lb_lag))
-  #   blt(sprintf("Q = %s", ifelse(is.finite(lb_stat), sprintf("%.6f", lb_stat), "NA")))
-  #   blt(sprintf("p-value = %s", if (is.finite(lb_p)) format.pval(lb_p, digits = 4) else "NA"))
-  #   
-  #   sec("Decision (APA)")
-  #   cat(" ", apa_line_lb(lb_stat, lb_p, lb_lag), "\n", sep = "")
-  #   if (is.finite(lb_p)) {
-  #     if (lb_p > alpha_val) {
-  #       blt("Decision: FAIL TO REJECT H0 → residuals are consistent with white noise (favorable).")
-  #     } else {
-  #       blt("Decision: REJECT H0 → residual autocorrelation remains (unfavorable).")
-  #     }
-  #   } else {
-  #     blt("Decision: INCONCLUSIVE — Ljung–Box p-value is NA.")
-  #   }
-  #   
-  #   # ---------- PHASE 3: KPSS ----------
-  #   h("PHASE 3 — KPSS (STATIONARITY CONFIRMATION)")
-  #   sec("Hypotheses")
-  #   blt(sprintf("H0: Series is stationary around a %s.", if (kpss_type == "Trend") "trend" else "level"))
-  #   blt("Ha: Series is non-stationary.")
-  #   
-  #   sec("Decision rule")
-  #   blt(sprintf("At α = %s, reject H0 if p < α (tseries) OR if η_obs > η_crit (urca).", alpha_raw))
-  #   
-  #   sec("Statistics")
-  #   blt(sprintf("η_obs (urca) = %.6f", eta_obs_uc))
-  #   blt(sprintf("η_crit(%s) = %.6f", eta_col, eta_crit_uc))
-  #   blt(sprintf("p-value (tseries) = %s", if (is.finite(kpss_p)) format.pval(kpss_p, digits = 4) else "NA"))
-  #   
-  #   sec("Decision (APA)")
-  #   cat(" ", apa_line_kpss(eta_obs_uc, kpss_p, if (kpss_type == "Trend") "Trend" else "Level"), "\n", sep = "")
-  #   if (kpss_stationary) {
-  #     blt("Decision: FAIL TO REJECT H0 — stationarity supported.")
-  #   } else {
-  #     blt("Decision: REJECT H0 — non-stationarity indicated.")
-  #   }
-  #   
-  #   # ---------- PHASE 4: Pettitt (optional) ----------
-  #   h("PHASE 4 — STRUCTURAL BREAK (Pettitt)")
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     sec("Hypotheses")
-  #     blt("H0: No change-point in location.")
-  #     blt("Ha: A single change-point is present.")
-  #     
-  #     sec("Statistics")
-  #     blt(sprintf("U = %s", ifelse(is.finite(pett_U), sprintf("%.6f", pett_U), "NA")))
-  #     blt(sprintf("p-value = %s", if (is.finite(pett_p)) format.pval(pett_p, digits = 4) else "NA"))
-  #     
-  #     sec("Decision (APA)")
-  #     cat(" ", apa_line_pettitt(pett_U, pett_p), "\n", sep = "")
-  #     if (is.finite(pett_p)) {
-  #       if (pett_p < alpha_val) {
-  #         blt("Decision: REJECT H0 — evidence of a structural break; consider segment-wise testing.")
-  #       } else {
-  #         blt("Decision: FAIL TO REJECT H0 — no strong single break detected.")
-  #       }
-  #     } else {
-  #       blt("Decision: INCONCLUSIVE — Pettitt p-value is NA.")
-  #     }
-  #   } else {
-  #     blt("Package 'trend' not installed — Pettitt test skipped. (install.packages('trend'))")
-  #   }
-  #   
-  #   # ---------- FINAL ACADEMIC ADVICE ----------
-  #   h("FINAL ACADEMIC ADVICE")
-  #   if (adf_stationary && kpss_stationary && lb_pass) {
-  #     blt("Convergent evidence of stationarity (ADF & KPSS) with white residuals — proceed with ARMA/ARIMA on current series (d = 0).")
-  #   } else if (!adf_stationary && !kpss_stationary) {
-  #     blt("Both ADF and KPSS indicate non-stationarity — difference (d = 1); if seasonal, consider D = 1; then re-test.")
-  #   } else {
-  #     blt("ADF and KPSS conflict — try a different ADF type (none/drift/trend), resolve seasonality (D = 1), check for breaks, or stabilize variance (log/Box–Cox).")
-  #   }
-  #   
-  #   # ---------- ACTIONABLE NEXT STEPS ----------
-  #   h("ACTIONABLE NEXT STEPS")
-  #   if (is.finite(lb_p) && lb_p <= alpha_val) {
-  #     blt("Increase ADF lag k gradually until Ljung–Box p > α, or add differencing to reduce autocorrelation.")
-  #   } else if (!is.finite(lb_p)) {
-  #     blt("Ljung–Box p is NA — try a smaller k and ensure enough observations after transformations.")
-  #   } else {
-  #     blt("Residuals look white at current k — no immediate action needed.")
-  #   }
-  #   if (!adf_stationary || !kpss_stationary) {
-  #     blt("For monthly multiplicative seasonality: try log + diff(1) + seasonal diff(12), then re-test ADF/KPSS.")
-  #   } else {
-  #     blt("Proceed to ARMA/ARIMA identification and compare by information criteria.")
-  #   }
-  #   if (requireNamespace("trend", quietly = TRUE) && is.finite(pett_p) && pett_p < alpha_val) {
-  #     blt("Break detected by Pettitt — split at the change-point and re-run KPSS/ADF on segments.")
-  #   } else {
-  #     blt("If plots suggest shifts, consider a structural-break check (Perron, Bai–Perron) in addition to Pettitt.")
-  #   }
-  #   
-  #   # ---------- SNAPSHOT ----------
-  #   h("SNAPSHOT")
-  #   kv("N", N)
-  #   kv("type", type_in)
-  #   kv("k", k)
-  #   kv("α", alpha_raw)
-  #   kv("freq", ifelse(is.finite(x_freq), x_freq, "NA"))
-  #   kv("log", ifelse(isTRUE(log_in), "ON", "OFF"))
-  #   kv("d", as.character(d_in))
-  #   kv("D", as.character(D_in))
-  #   kv("ADF", sprintf("τ=%.4f, τ_crit(%s)=%.4f, %s", tau_obs, alpha_col, tau_crit, fmt_p(adf_p)))
-  #   kv("KPSS", sprintf("η=%.4f, η_crit(%s)=%.4f, %s", eta_obs_uc, eta_col, eta_crit_uc, fmt_p(kpss_p)))
-  #   kv("LB", sprintf("%s (lag %d)", fmt_p(lb_p), lb_lag))
-  #   if (requireNamespace("trend", quietly = TRUE)) kv("Pettitt", fmt_p(pett_p))
-  #   hr()
-  # })
-  
-  
-  
-  
-  # output$teststationarited3St <- renderPrint({
-  #   # ---------- Helpers ----------
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
-  #   to_num_safe <- function(v, default = NA_real_) {
-  #     out <- suppressWarnings(as.numeric(v))
-  #     if (length(out) == 0 || all(is.na(out)) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   to_int_safe <- function(v, default = 0L) {
-  #     out <- suppressWarnings(as.integer(v))
-  #     if (length(out) == 0 || is.na(out[1]) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   safe_head_tail <- function(x, n = 5) {
-  #     x <- as.numeric(x); x <- x[is.finite(x)]
-  #     if (length(x) == 0) return(list(head = numeric(0), tail = numeric(0)))
-  #     list(head = head(x, n), tail = tail(x, n))
-  #   }
-  #   tau_row_for <- function(type_in) switch(type_in, "none" = "tau1", "drift" = "tau2", "trend" = "tau3", "tau3")
-  #   # Critical value extractor for urca objects (robust to naming)
-  #   cval_pick_safe <- function(cval_obj, row, col) {
-  #     if (is.null(cval_obj)) return(NA_real_)
-  #     ans <- NA_real_
-  #     if (is.matrix(cval_obj)) {
-  #       if (!missing(row) && !missing(col) && row %in% rownames(cval_obj) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[row, col]))
-  #       } else if (!missing(col) && col %in% colnames(cval_obj)) {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, col]))
-  #       } else {
-  #         ans <- suppressWarnings(as.numeric(cval_obj[1, 1]))
-  #       }
-  #     } else {
-  #       nm <- names(cval_obj)
-  #       if (!is.null(nm) && col %in% nm) ans <- suppressWarnings(as.numeric(cval_obj[[col]]))
-  #       if (!is.finite(ans) && length(cval_obj) >= 3) {
-  #         if (identical(col, "10pct")) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #         if (identical(col, "5pct"))  ans <- suppressWarnings(as.numeric(cval_obj[2]))
-  #         if (identical(col, "1pct"))  ans <- suppressWarnings(as.numeric(cval_obj[3]))
-  #       }
-  #       if (!is.finite(ans)) ans <- suppressWarnings(as.numeric(cval_obj[1]))
-  #     }
-  #     ans
-  #   }
-  #   # APA helpers
-  #   fmt_p <- function(p) {
-  #     if (!is.finite(p)) return("p = NA")
-  #     if (p < .001) "p < .001" else paste0("p = ", sub("^0\\.", ".", sprintf("%.3f", p)))
-  #   }
-  #   apa_line_adf <- function(tau, p, k, N, type) {
-  #     paste0("ADF (", type, ", k = ", k, ", N = ", N, "): τ = ", sprintf("%.3f", tau), ", ", fmt_p(p), ".")
-  #   }
-  #   apa_line_kpss <- function(eta, p, mode) {
-  #     paste0("KPSS (", mode, "): η = ", sprintf("%.3f", eta), ", ", fmt_p(p), ".")
-  #   }
-  #   apa_line_lb <- function(stat, p, L) {
-  #     paste0("Ljung–Box (lag = ", L, "): Q = ", ifelse(is.finite(stat), sprintf("%.3f", stat), "NA"), ", ", fmt_p(p), ".")
-  #   }
-  #   apa_line_pettitt <- function(U, p) {
-  #     paste0("Pettitt: U = ", ifelse(is.finite(U), sprintf("%.3f", U), "NA"), ", ", fmt_p(p), ".")
-  #   }
-  #   
-  #   # ---------- Inputs (from your UI) ----------
-  #   alt_in  <- input$alternd2St %||% input$alternSt       # "stationary", "explosive", "regression"
-  #   lag_in  <- input$LagOrderADFd2St %||% input$LagOrderADFSt
-  #   a_in    <- input$alphaSt2
-  #   type_in <- input$adfTypeSt2                            # "none", "drift", "trend"
-  #   
-  #   # Transformation flags (for provenance only; actual transform is in myData_Choice())
-  #   d_in   <- input$d_n  %||% NA
-  #   D_in   <- input$DS_n %||% NA
-  #   log_in <- input$check_box %||% FALSE
-  #   
-  #   # ---------- Data ----------
-  #   req(myData_Choice())
-  #   x_raw <- myData_Choice()            # already transformed upstream in your app
-  #   na_before <- sum(is.na(x_raw))
-  #   x_class <- paste(class(x_raw), collapse = ", ")
-  #   x_freq  <- if (inherits(x_raw, "ts")) tryCatch(stats::frequency(x_raw), error = function(e) NA_integer_) else NA_integer_
-  #   x <- as.numeric(stats::na.omit(x_raw))
-  #   N <- length(x)
-  #   
-  #   # ---------- Hyper-parameters ----------
-  #   k <- to_int_safe(lag_in, default = 0L)
-  #   if (!is.finite(k) || k < 0) k <- 0L
-  #   alpha_raw <- as.character(a_in)
-  #   alpha_val <- to_num_safe(alpha_raw, default = 0.05)
-  #   alpha_col <- switch(alpha_raw, "0.01" = "1pct", "0.05" = "5pct", "0.1" = "10pct", "0.10" = "10pct",
-  #                       "1pct" = "1pct", "5pct" = "5pct", "10pct" = "10pct", "5pct")
-  #   tau_row <- tau_row_for(type_in)
-  #   seasonality_resolved <- isTRUE(to_int_safe(D_in, 0L) > 0L)
-  #   
-  #   # ---------- Sanity checks ----------
-  #   if (N < 5) {
-  #     cat("==========================================================================\n")
-  #     cat("CRITICAL ERROR: Too few observations (N < 5). Provide more data.\n")
-  #     cat("==========================================================================\n"); return(invisible(NULL))
-  #   }
-  #   if (!is.finite(stats::sd(x)) || stats::sd(x) == 0) {
-  #     cat("==========================================================================\n")
-  #     cat("CRITICAL ERROR: Series is constant/invalid (sd = 0 or NA). Check transforms.\n")
-  #     cat("==========================================================================\n"); return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- Packages ----------
-  #   if (!requireNamespace("urca", quietly = TRUE) || !requireNamespace("tseries", quietly = TRUE)) {
-  #     cat("==========================================================================\n")
-  #     cat("ERROR: Please install.packages(c('urca','tseries')) to run ADF/KPSS.\n")
-  #     cat("==========================================================================\n"); return(invisible(NULL))
-  #   }
-  #   
-  #   # ---------- ADF (urca + tseries p-value) ----------
-  #   ur  <- tryCatch(urca::ur.df(x, type = type_in, lags = k), error = function(e) NULL)
-  #   tau_obs  <- if (!is.null(ur)) suppressWarnings(as.numeric(ur@teststat[tau_row])) else NA_real_
-  #   if (!is.finite(tau_obs) && !is.null(ur)) tau_obs <- suppressWarnings(as.numeric(ur@teststat[1]))
-  #   tau_crit <- if (!is.null(ur)) cval_pick_safe(ur@cval, tau_row, alpha_col) else NA_real_
-  #   
-  #   adf_ts <- if (N > (k + 10)) tryCatch(tseries::adf.test(x, alternative = alt_in, k = k),
-  #                                        error = function(e) NULL) else NULL
-  #   adf_p  <- if (!is.null(adf_ts)) to_num_safe(adf_ts$p.value) else NA_real_
-  #   
-  #   # ---------- Ljung–Box on ADF residuals ----------
-  #   lb_lag <- max(1L, min(10L, floor(N / 5)))
-  #   lb     <- if (!is.null(ur)) stats::Box.test(ur@res, lag = lb_lag, type = "Ljung-Box") else NULL
-  #   lb_stat<- if (!is.null(lb)) to_num_safe(lb$statistic) else NA_real_
-  #   lb_p   <- if (!is.null(lb)) to_num_safe(lb$p.value) else NA_real_
-  #   
-  #   # ---------- KPSS (tseries + urca) ----------
-  #   kpss_type <- if (type_in == "trend") "Trend" else "Level"
-  #   kpss_ts   <- tryCatch(tseries::kpss.test(x, null = kpss_type), error = function(e) NULL)
-  #   kpss_p    <- if (!is.null(kpss_ts)) to_num_safe(kpss_ts$p.value) else NA_real_
-  #   
-  #   kpss_uc   <- tryCatch(urca::ur.kpss(x, type = if (type_in == "trend") "tau" else "mu"),
-  #                         error = function(e) NULL)
-  #   eta_obs_uc  <- if (!is.null(kpss_uc)) to_num_safe(kpss_uc@teststat) else NA_real_
-  #   eta_col     <- if (alpha_val <= 0.01) "1pct" else if (alpha_val <= 0.05) "5pct" else "10pct"
-  #   eta_crit_uc <- if (!is.null(kpss_uc)) cval_pick_safe(kpss_uc@cval, 1, eta_col) else NA_real_
-  #   
-  #   # ---------- Pettitt (optional) ----------
-  #   pett_U <- pett_p <- NA_real_
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     pet <- tryCatch(trend::pettitt.test(x), error = function(e) NULL)
-  #     if (!is.null(pet)) {
-  #       pett_U <- to_num_safe(pet$statistic); pett_p <- to_num_safe(pet$p.value)
-  #     }
-  #   }
-  #   
-  #   # ---------- Decisions ----------
-  #   # ADF decision (left-tail): reject H0 if tau_obs < tau_crit
-  #   adf_ok_vals <- is.finite(tau_obs) && is.finite(tau_crit)
-  #   adf_stationary <- adf_ok_vals && (tau_obs < tau_crit)
-  #   
-  #   # KPSS decision (H0 = stationary): reject H0 if p < alpha OR eta_obs > eta_crit
-  #   kpss_by_p   <- is.finite(kpss_p)    && (kpss_p < alpha_val)
-  #   kpss_by_eta <- is.finite(eta_obs_uc) && is.finite(eta_crit_uc) && (eta_obs_uc > eta_crit_uc)
-  #   kpss_stationary <- !(kpss_by_p || kpss_by_eta)
-  #   
-  #   agreement <- (adf_stationary && kpss_stationary) || (!adf_stationary && !kpss_stationary)
-  #   lb_pass   <- is.finite(lb_p) && (lb_p > alpha_val)
-  #   
-  #   # ---------- PRINT: CHECKLIST first ----------
-  #   cat("==========================================================================\n")
-  #   cat(" CHECKLIST\n")
-  #   cat("==========================================================================\n")
-  #   cat(sprintf(" [ ] ADF decision (reject unit root => stationary) : %s\n",
-  #               if (adf_ok_vals && adf_stationary) "[✓] STATIONARY" else "[X] NON-STATIONARY"))
-  #   cat(sprintf(" [ ] KPSS decision (fail reject => stationary)     : %s\n",
-  #               if (kpss_stationary) "[✓] STATIONARY" else "[X] NON-STATIONARY"))
-  #   cat(sprintf(" [ ] ADF vs KPSS agreement                         : %s\n",
-  #               if (agreement) "[✓] AGREEMENT" else "[?] CONFLICT"))
-  #   cat(sprintf(" [ ] Residual whiteness (LB (Ljung–Box) p>α)       : %s\n",
-  #               if (lb_pass) "[✓] PASS" else if (is.finite(lb_p)) "[X] FAIL" else "[?] NA"))
-  #   cat(sprintf(" [ ] Seasonal differencing indicated (UI D>0)      : %s\n",
-  #               if (seasonality_resolved) "[✓] YES" else "[!] NO / UNKNOWN"))
-  #   cat(sprintf(" [ ] Pettitt break check available                 : %s\n\n",
-  #               if (requireNamespace("trend", quietly = TRUE)) "[✓] YES" else "[!] NO"))
-  #   
-  #   # ---------- SPECIFICATION & PROVENANCE ----------
-  #   cat("SPECIFICATION & PROVENANCE\n")
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat(sprintf(" Model type (ADF): %s | Lag k: %d | α: %s\n", toupper(type_in), k, alpha_raw))
-  #   cat(sprintf(" Series class: %s | frequency: %s | NA before omit: %d\n",
-  #               x_class, ifelse(is.finite(x_freq), x_freq, "NA"), na_before))
-  #   cat(sprintf(" Transform flags (UI): log=%s, d=%s, D=%s\n",
-  #               ifelse(isTRUE(log_in), "ON", "OFF"),
-  #               as.character(d_in), as.character(D_in)))
-  #   ht <- safe_head_tail(x, 5)
-  #   cat(sprintf(" First 5 values used: %s\n", paste(round(ht$head, 4), collapse = ", ")))
-  #   cat(sprintf(" Last  5 values used: %s\n\n", paste(round(ht$tail, 4), collapse = ", ")))
-  #   
-  #   # ---------- PHASE 1: ADF ----------
-  #   cat("==========================================================================\n")
-  #   cat(" PHASE 1 — AUGMENTED DICKEY–FULLER (ADF) TEST\n")
-  #   cat("==========================================================================\n")
-  #   cat(" Use case: detect a nonseasonal unit root (random walk behavior).\n")
-  #   cat(" H0 (unit root): the series is non-stationary.\n")
-  #   cat(" Ha (stationary): the series is stationary (mean-reverting) under the chosen deterministic terms.\n")
-  #   cat(sprintf(" Statistic: τ (tau). Decision rule at α=%s: Reject H0 if τ_obs < τ_crit.\n", alpha_raw))
-  #   cat(sprintf(" Observed: τ_obs = %.6f | Critical: τ_crit(%s) = %.6f | p(ref, tseries) = %s\n",
-  #               tau_obs, alpha_col, tau_crit, if (is.finite(adf_p)) format.pval(adf_p, digits = 4) else "NA"))
-  #   
-  #   if (adf_ok_vals && adf_stationary) {
-  #     cat(" Decision: REJECT H0 (stationary).\n")
-  #     cat(sprintf(" Justification: τ_obs (%.6f) is more negative than τ_crit(%s) (%.6f), providing evidence that the series is stationary under the %s specification.\n",
-  #                 tau_obs, alpha_col, tau_crit, type_in))
-  #   } else if (adf_ok_vals && !adf_stationary) {
-  #     cat(" Decision: FAIL TO REJECT H0 (non-stationary).\n")
-  #     cat(sprintf(" Justification: τ_obs (%.6f) is not more negative than τ_crit(%s) (%.6f), so we lack evidence to reject the unit-root null under the %s specification.\n",
-  #                 tau_obs, alpha_col, tau_crit, type_in))
-  #   } else {
-  #     cat(" Decision: INCONCLUSIVE (missing statistic/critical value).\n")
-  #     cat(" Justification: τ or τ_crit is NA/Inf; the regression could not produce valid inference (often due to k too large vs N, or constant series).\n")
-  #   }
-  #   cat(" APA: ", apa_line_adf(tau_obs, adf_p, k, N, type_in), "\n\n", sep = "")
-  #   
-  #   # ---------- PHASE 2: Residual diagnostics ----------
-  #   cat("==========================================================================\n")
-  #   cat(" PHASE 2 — RESIDUAL WHITENESS (LJUNG–BOX)\n")
-  #   cat("==========================================================================\n")
-  #   cat(" Use case: verify that the ADF regression residuals are approximately white noise.\n")
-  #   cat(" H0: residuals are white noise (no autocorrelation).  Ha: residuals are autocorrelated.\n")
-  #   cat(sprintf(" Observed: Q = %s | p-value = %s | lag = %d\n",
-  #               ifelse(is.finite(lb_stat), sprintf("%.6f", lb_stat), "NA"),
-  #               ifelse(is.finite(lb_p), format.pval(lb_p, digits = 4), "NA"),
-  #               lb_lag))
-  #   if (is.finite(lb_p)) {
-  #     if (lb_p > alpha_val) {
-  #       cat(" Decision: FAIL TO REJECT H0 → residuals are consistent with white noise (favorable).\n")
-  #       cat(" Justification: p-value exceeds α, indicating insufficient evidence of residual autocorrelation.\n")
-  #     } else {
-  #       cat(" Decision: REJECT H0 → residual autocorrelation remains (unfavorable).\n")
-  #       cat(" Justification: p-value below α suggests remaining autocorrelation; increase k or difference appropriately.\n")
-  #     }
-  #   } else {
-  #     cat(" Decision: INCONCLUSIVE (LB p-value NA). Consider smaller k or more data.\n")
-  #   }
-  #   cat(" APA: ", apa_line_lb(lb_stat, lb_p, lb_lag), "\n\n", sep = "")
-  #   
-  #   # ---------- PHASE 3: KPSS ----------
-  #   cat("==========================================================================\n")
-  #   cat(" PHASE 3 — KPSS TEST (STATIONARITY CONFIRMATION)\n")
-  #   cat("==========================================================================\n")
-  #   cat(" Use case: confirm stationarity (complements ADF with opposite null).\n")
-  #   cat(sprintf(" H0: series is stationary around a %s.  Ha: series is non-stationary.\n", if (kpss_type == "Trend") "trend" else "level"))
-  #   cat(sprintf(" Statistics: η (eta). Decision at α=%s: reject H0 if p < α (tseries) OR η_obs > η_crit (urca).\n", alpha_raw))
-  #   cat(sprintf(" Observed: η_obs (urca) = %.6f | η_crit(%s) = %.6f | p(tseries) = %s\n",
-  #               eta_obs_uc, eta_col, eta_crit_uc,
-  #               if (is.finite(kpss_p)) format.pval(kpss_p, digits = 4) else "NA"))
-  #   
-  #   if (kpss_stationary) {
-  #     cat(" Decision: FAIL TO REJECT H0 (stationarity supported).\n")
-  #     cat(" Justification: KPSS does not provide sufficient evidence against stationarity under the tested specification.\n")
-  #   } else {
-  #     cat(" Decision: REJECT H0 (non-stationary).\n")
-  #     if (is.finite(kpss_p) && kpss_p < alpha_val) {
-  #       cat(" Justification: The one-sided p-value is below α, indicating stationarity is unlikely.\n")
-  #     } else if (is.finite(eta_obs_uc) && is.finite(eta_crit_uc) && eta_obs_uc > eta_crit_uc) {
-  #       cat(" Justification: The observed η exceeds its critical value, indicating non-stationarity.\n")
-  #     } else {
-  #       cat(" Justification: KPSS indicates departure from stationarity via at least one decision criterion.\n")
-  #     }
-  #   }
-  #   cat(" APA: ", apa_line_kpss(eta_obs_uc, kpss_p, if (kpss_type == "Trend") "Trend" else "Level"), "\n\n", sep = "")
-  #   
-  #   # ---------- PHASE 4: Pettitt (optional) ----------
-  #   cat("==========================================================================\n")
-  #   cat(" PHASE 4 — STRUCTURAL BREAK (Pettitt)\n")
-  #   cat("==========================================================================\n")
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     cat(" Use case: detect a single change-point that can contaminate ADF/KPSS decisions.\n")
-  #     cat(sprintf(" Observed: U = %s | p-value = %s\n",
-  #                 ifelse(is.finite(pett_U), sprintf("%.6f", pett_U), "NA"),
-  #                 ifelse(is.finite(pett_p), format.pval(pett_p, digits = 4), "NA")))
-  #     if (is.finite(pett_p)) {
-  #       if (pett_p < alpha_val) {
-  #         cat(" Decision: REJECT H0 → evidence of a structural break; consider segment-wise testing.\n")
-  #       } else {
-  #         cat(" Decision: FAIL TO REJECT H0 → no strong single break detected.\n")
-  #       }
-  #     } else {
-  #       cat(" Decision: INCONCLUSIVE (Pettitt p-value NA).\n")
-  #     }
-  #     cat(" APA: ", apa_line_pettitt(pett_U, pett_p), "\n\n", sep = "")
-  #   } else {
-  #     cat(" Package 'trend' not installed — Pettitt test skipped. (install.packages('trend'))\n\n")
-  #   }
-  #   
-  #   # ---------- FINAL ACADEMIC ADVICE ----------
-  #   cat("==========================================================================\n")
-  #   cat(" FINAL ACADEMIC ADVICE\n")
-  #   cat("==========================================================================\n")
-  #   if (adf_stationary && kpss_stationary && lb_pass) {
-  #     cat(" The series exhibits convergent evidence of stationarity (ADF, KPSS) with white residuals.\n")
-  #     cat(" Proceed with ARMA/ARIMA identification on the current (transformed) series (d=0), and validate with residual diagnostics.\n\n")
-  #   } else if (!adf_stationary && !kpss_stationary) {
-  #     cat(" Both ADF and KPSS point to non-stationarity. Apply differencing (d=1) and, if seasonal, D=1.\n")
-  #     cat(" After transforming (e.g., log + diff(1) + seasonal diff), re-run diagnostics before modeling.\n\n")
-  #   } else {
-  #     cat(" ADF and KPSS are conflicting. This is common near a unit root or under mis-specified deterministic terms.\n")
-  #     cat(" Consider: (i) trying a different ADF type (none/drift/trend), (ii) resolving seasonality (D=1),\n")
-  #     cat(" (iii) checking for structural breaks (Pettitt) and testing segments, and (iv) variance stabilization (log/Box–Cox).\n\n")
-  #   }
-  #   
-  #   # ---------- ACTIONABLE NEXT STEPS ----------
-  #   cat("==========================================================================\n")
-  #   cat(" ACTIONABLE NEXT STEPS\n")
-  #   cat("==========================================================================\n")
-  #   if (is.finite(lb_p) && lb_p <= alpha_val) {
-  #     cat(" [1] Increase ADF lag k gradually until Ljung–Box p > α, or apply additional differencing to reduce autocorrelation.\n")
-  #   } else if (!is.finite(lb_p)) {
-  #     cat(" [1] Ljung–Box p is NA: try a smaller k and ensure enough observations after transformations.\n")
-  #   } else {
-  #     cat(" [1] Residuals are acceptably white at current k; no immediate action needed.\n")
-  #   }
-  #   if (!adf_stationary || !kpss_stationary) {
-  #     cat(" [2] For monthly data with multiplicative seasonality: try log + diff(1) + seasonal diff(12); then re-test ADF/KPSS.\n")
-  #   } else {
-  #     cat(" [2] Proceed to model identification (ARMA/ARIMA) and information-criteria comparison.\n")
-  #   }
-  #   if (requireNamespace("trend", quietly = TRUE) && is.finite(pett_p) && pett_p < alpha_val) {
-  #     cat(" [3] Break detected by Pettitt: split at the estimated change-point and re-run KPSS/ADF on each segment.\n")
-  #   } else {
-  #     cat(" [3] Consider a structural-break check (Pettitt) if plots suggest level shifts.\n")
-  #   }
-  #   cat("\n--------------------------------------------------------------------------\n")
-  #   cat(sprintf(" SNAPSHOT — N=%d | type=%s | k=%d | α=%s | freq=%s | log=%s | d=%s | D=%s\n",
-  #               N, type_in, k, alpha_raw, ifelse(is.finite(x_freq), x_freq, "NA"),
-  #               ifelse(isTRUE(log_in), "ON", "OFF"), as.character(d_in), as.character(D_in)))
-  #   cat(sprintf(" ADF: τ=%.4f, τ_crit(%s)=%.4f, %s\n", tau_obs, alpha_col, tau_crit, fmt_p(adf_p)))
-  #   cat(sprintf(" KPSS: η=%.4f, η_crit(%s)=%.4f, %s\n", eta_obs_uc, eta_col, eta_crit_uc, fmt_p(kpss_p)))
-  #   cat(sprintf(" LB: %s (lag %d)\n", fmt_p(lb_p), lb_lag))
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     cat(sprintf(" Pettitt: %s\n", fmt_p(pett_p)))
-  #   }
-  #   cat("==========================================================================\n")
-  # })
-  
-  
-  
-  
-  
-  # --- Replace existing output$teststationarited3St with this ---
-  # output$teststationarited3St <- renderPrint({
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
-  #   to_num_safe <- function(v, default = NA_real_) { out <- suppressWarnings(as.numeric(v)); if (length(out)==0 || all(is.na(out)) || !is.finite(out[1])) default else out[1] }
-  #   to_int_safe <- function(v, default = 0L) { out <- suppressWarnings(as.integer(v)); if (length(out)==0 || is.na(out[1]) || !is.finite(out[1])) default else out[1] }
-  #   safe_head_tail <- function(x, n = 5) { x <- as.numeric(x); x <- x[is.finite(x)]; if (!length(x)) return(list(head=numeric(0),tail=numeric(0))); list(head=head(x,n), tail=tail(x,n)) }
-  #   tau_row_for <- function(type_in) switch(type_in, "none"="tau1","drift"="tau2","trend"="tau3","tau3")
-  #   
-  #   # ---- Inputs (using your ids) ----
-  #   alt_in  <- input$alternd2St %||% input$alternSt
-  #   lag_in  <- input$LagOrderADFd2St %||% input$LagOrderADFSt
-  #   a_in    <- input$alphaSt2
-  #   type_in <- input$adfTypeSt2
-  #   
-  #   # (Only for reporting provenance)
-  #   d_in   <- input$d_n  %||% NA
-  #   D_in   <- input$DS_n %||% NA
-  #   log_in <- input$check_box %||% FALSE
-  #   
-  #   # ---- Data ----
-  #   req(myData_Choice())
-  #   x_raw <- myData_Choice()
-  #   na_before <- sum(is.na(x_raw))
-  #   x_class <- paste(class(x_raw), collapse = ", ")
-  #   x_freq  <- if (inherits(x_raw, "ts")) tryCatch(stats::frequency(x_raw), error = function(e) NA_integer_) else NA_integer_
-  #   x <- as.numeric(stats::na.omit(x_raw))
-  #   N <- length(x)
-  #   
-  #   # ---- Hyper-params ----
-  #   k <- to_int_safe(lag_in, default = 0L)
-  #   alpha_raw <- as.character(a_in)
-  #   alpha_val <- to_num_safe(alpha_raw, default = 0.05)
-  #   alpha_col <- switch(alpha_raw,
-  #                       "0.01"="1pct","0.05"="5pct","0.1"="10pct","0.10"="10pct",
-  #                       "1pct"="1pct","5pct"="5pct","10pct"="10pct","5pct")
-  #   tau_row <- tau_row_for(type_in)
-  #   seasonality_resolved <- to_int_safe(D_in,0L) > 0L
-  #   
-  #   # ---- Quick sanity ----
-  #   cat("==========================================================================\n")
-  #   cat("                        ADF UNIT ROOT DIAGNOSTIC                          \n")
-  #   cat("==========================================================================\n")
-  #   cat(sprintf(" MODEL TYPE : %-10s | SAMPLE SIZE (N) : %d\n", toupper(type_in), N))
-  #   cat(sprintf(" LAG ORDER  : %-10d | SIGNIFICANCE (α) : %s\n", k, alpha_raw))
-  #   cat(sprintf(" MOMENTS    : Mean: %.4f | Std.Dev: %.4f\n", mean(x), stats::sd(x)))
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat(" TRANSFORMATION PROVENANCE (common to ALL tests):\n")
-  #   cat(sprintf(" [ ] Source class: %s | Frequency: %s | NA before omit: %d\n",
-  #               x_class, ifelse(is.finite(x_freq), x_freq, NA), na_before))
-  #   cat(sprintf(" [ ] UI transforms: log=%s | d=%s | D=%s\n",
-  #               ifelse(isTRUE(log_in),"ON","OFF"), as.character(d_in), as.character(D_in)))
-  #   ht <- safe_head_tail(x,5)
-  #   cat(sprintf(" [ ] First 5 used: %s\n", paste(round(ht$head,4), collapse=", ")))
-  #   cat(sprintf(" [ ] Last  5 used: %s\n\n", paste(round(ht$tail,4), collapse=", ")))
-  #   
-  #   if (N < 5) { cat(" [!] Too few observations (N < 5). Abort.\n==========================================================================\n"); return(invisible(NULL)) }
-  #   if (!is.finite(stats::sd(x)) || stats::sd(x) == 0) { cat(" [!] Series constant/invalid (sd=0 or NA). Abort.\n==========================================================================\n"); return(invisible(NULL)) }
-  #   if (N <= (k + 10)) cat(" [!] WARNING: high lag vs sample; ADF may be weak. Consider smaller k.\n\n")
-  #   
-  #   # ---- Compute tests ----
-  #   suppressMessages({
-  #     need_urca   <- requireNamespace("urca", quietly = TRUE)
-  #     need_tseries<- requireNamespace("tseries", quietly = TRUE)
-  #   })
-  #   if (!need_urca || !need_tseries) {
-  #     cat(" [!] Please install.packages(c('urca','tseries')) to run ADF/KPSS.\n==========================================================================\n")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # Main ADF via urca (for tau + criticals)
-  #   ur  <- tryCatch(urca::ur.df(x, type = type_in, lags = k), error = function(e) NULL)
-  #   tau_obs  <- if (!is.null(ur)) suppressWarnings(as.numeric(ur@teststat[tau_row])) else NA_real_
-  #   if (!is.finite(tau_obs) && !is.null(ur)) tau_obs <- suppressWarnings(as.numeric(ur@teststat[1]))
-  #   tau_crit <- if (!is.null(ur)) suppressWarnings(as.numeric(ur@cval[tau_row, alpha_col])) else NA_real_
-  #   
-  #   # p-value ref from tseries (only if df ok)
-  #   adf_ts <- if (N > (k + 10)) tryCatch(tseries::adf.test(x, alternative = alt_in, k = k),
-  #                                        error = function(e) NULL) else NULL
-  #   
-  #   # Residual whiteness from ur.df regression
-  #   lb_lag <- max(1L, min(10L, floor(N/5)))
-  #   lb     <- if (!is.null(ur)) Box.test(ur@res, lag = lb_lag, type = "Ljung-Box") else NULL
-  #   
-  #   # KPSS (both flavors: tseries p and urca eta)
-  #   kpss_type <- if (type_in == "trend") "Trend" else "Level"
-  #   kpss_ts   <- tryCatch(tseries::kpss.test(x, null = kpss_type), error = function(e) NULL)
-  #   kpss_uc   <- tryCatch(urca::ur.kpss(x, type = if (type_in=="trend") "tau" else "mu"),
-  #                         error = function(e) NULL)
-  #   eta_obs_uc  <- if (!is.null(kpss_uc)) suppressWarnings(as.numeric(kpss_uc@teststat)) else NA_real_
-  #   eta_col     <- if (alpha_val <= .01) "1pct" else if (alpha_val <= .05) "5pct" else "10pct"
-  #   eta_crit_uc <- if (!is.null(kpss_uc)) {
-  #     cv <- kpss_uc@cval
-  #     if (is.matrix(cv) && eta_col %in% colnames(cv)) as.numeric(cv[1, eta_col]) else
-  #       if (!is.matrix(cv) && !is.null(names(cv)) && eta_col %in% names(cv)) as.numeric(cv[[eta_col]]) else NA_real_
-  #   } else NA_real_
-  #   
-  #   # ---- PHASE 1: ADF ----
-  #   cat("==========================================================================\n")
-  #   cat("PHASE 1: ADF (urca::ur.df + tseries::adf.test)\n")
-  #   cat("==========================================================================\n")
-  #   cat(sprintf(" Tau-Obs = %.4f | Tau-Crit(%s) = %.4f | p(ref) = %s\n",
-  #               tau_obs, alpha_col, tau_crit,
-  #               if (!is.null(adf_ts)) format.pval(adf_ts$p.value, digits = 4) else "NA"))
-  #   adf_stationary <- is.finite(tau_obs) && is.finite(tau_crit) && (tau_obs < tau_crit)
-  #   cat(" Decision: ", if (isTRUE(adf_stationary)) "REJECT H0 (stationary)\n" else "Fail to reject H0 (non-stationary)\n")
-  #   
-  #   # ---- PHASE 2: Residual whiteness ----
-  #   cat("\n==========================================================================\n")
-  #   cat("PHASE 2: Ljung–Box on ADF regression residuals\n")
-  #   cat("==========================================================================\n")
-  #   lb_p <- if (!is.null(lb)) suppressWarnings(as.numeric(lb$p.value)) else NA_real_
-  #   lb_st<- if (!is.null(lb)) suppressWarnings(as.numeric(lb$statistic)) else NA_real_
-  #   cat(sprintf(" LB lag=%d | LB stat=%.4f | LB p=%.4f  → %s\n",
-  #               lb_lag, ifelse(is.finite(lb_st), lb_st, NA), ifelse(is.finite(lb_p), lb_p, NA),
-  #               if (is.finite(lb_p) && lb_p > alpha_val) "white noise OK" else "autocorr remains"))
-  #   
-  #   # ---- PHASE 3: KPSS ----
-  #   cat("\n==========================================================================\n")
-  #   cat("PHASE 3: KPSS (tseries p + urca eta)\n")
-  #   cat("==========================================================================\n")
-  #   kpss_p <- if (!is.null(kpss_ts)) suppressWarnings(as.numeric(kpss_ts$p.value)) else NA_real_
-  #   cat(sprintf(" KPSS p (tseries) = %s | Eta(obs) (urca) = %.4f | Eta(crit %s) = %.4f\n",
-  #               if (is.finite(kpss_p)) format.pval(kpss_p, digits = 4) else "NA",
-  #               eta_obs_uc, eta_col, eta_crit_uc))
-  #   kpss_stationary <- !( (is.finite(kpss_p) && kpss_p < alpha_val) ||
-  #                           (is.finite(eta_obs_uc) && is.finite(eta_crit_uc) && eta_obs_uc > eta_crit_uc) )
-  #   cat(" Decision: ", if (kpss_stationary) "Fail to reject H0 (stationary)\n" else "REJECT H0 (non-stationary)\n")
-  #   
-  #   # ---- FINAL VERDICT ----
-  #   cat("\n==========================================================================\n")
-  #   cat("PHASE 4: FINAL VERDICT & ACTIONS\n")
-  #   cat("==========================================================================\n")
-  #   agree <- (adf_stationary && kpss_stationary) || (!adf_stationary && !kpss_stationary)
-  #   if (isTRUE(lb_p <= alpha_val)) cat(" [!] Residual autocorrelation → consider increasing k or differencing.\n")
-  #   if (adf_stationary && kpss_stationary) {
-  #     cat(" [✓] Strong evidence of STATIONARITY. Proceed with ARMA/ARIMA at d=0.\n")
-  #   } else if (!adf_stationary && !kpss_stationary) {
-  #     cat(" [X] Clear UNIT ROOT. Apply differencing (d=1) and/or seasonal differencing (D=1 if seasonal).\n")
-  #   } else {
-  #     cat(" [?] ADF vs KPSS conflict. Check trend spec (none/drift/trend), seasonality (D), and breaks.\n")
-  #   }
-  #   
-  #   # ---- Snapshot ----
-  #   cat("\n--------------------------------------------------------------------------\n")
-  #   cat("SNAPSHOT\n")
-  #   cat("--------------------------------------------------------------------------\n")
-  #   cat(sprintf(" N=%d | type=%s | k=%d | α=%s | freq=%s | log=%s | d=%s | D=%s\n",
-  #               N, type_in, k, alpha_raw, ifelse(is.finite(x_freq), x_freq, "NA"),
-  #               ifelse(isTRUE(log_in),"ON","OFF"), as.character(d_in), as.character(D_in)))
-  #   cat(sprintf(" ADF: tau=%.4f, crit(%s)=%.4f, p(ref)=%s\n",
-  #               tau_obs, alpha_col, tau_crit,
-  #               if (!is.null(adf_ts)) format.pval(adf_ts$p.value, digits = 4) else "NA"))
-  #   cat(sprintf(" LB:  p=%.4f (lag %d)\n", ifelse(is.finite(lb_p), lb_p, NA), lb_lag))
-  #   cat(sprintf(" KPSS: p=%.4f, eta(obs)=%.4f vs eta(crit %s)=%.4f\n",
-  #               ifelse(is.finite(kpss_p), kpss_p, NA), eta_obs_uc, eta_col, eta_crit_uc))
-  #   cat("==========================================================================\n")
-  # })
-  
-  
-  
-  # output$teststationarited3St <- renderPrint({
-  #   
-  #   # ============================================================================
-  #   # 0) SMALL HELPERS (safe input fallback + safe numeric)
-  #   # ============================================================================
-  #   `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0 && !all(is.na(a))) a else b
-  #   to_num_safe <- function(v, default = NA_real_) {
-  #     out <- suppressWarnings(as.numeric(v))
-  #     if (length(out) == 0 || all(is.na(out)) || !is.finite(out[1])) default else out[1]
-  #   }
-  #   
-  #   # ============================================================================
-  #   # 1) INPUT COLLECTION (supports either naming convention in your UI)
-  #   #    - This prevents "silent req stops" if your UI ids differ.
-  #   # ============================================================================
-  #   alt_in  <- input$alternd2St %||% input$alternSt
-  #   lag_in  <- input$LagOrderADFd2St %||% input$LagOrderADFSt
-  #   a_in    <- input$alphaSt2
-  #   type_in <- input$adfTypeSt2
-  #   
-  #   # Required data
-  #   req(myData_Choice())
-  #   
-  #   # Required inputs (validated safely)
-  #   if (is.null(alt_in) || is.null(lag_in) || is.null(a_in) || is.null(type_in)) {
-  #     cat("==========================================================================\n")
-  #     cat("                STATE-OF-THE-ART ADF UNIT ROOT DIAGNOSTIC                 \n")
-  #     cat("==========================================================================\n")
-  #     cat(" [!] INPUT ERROR: One or more inputs are NULL.\n")
-  #     cat("     This usually means a UI/server ID mismatch.\n")
-  #     cat("     Needed inputs (either naming is OK):\n")
-  #     cat("       - alternative : input$alternd2St OR input$alternSt\n")
-  #     cat("       - lag         : input$LagOrderADFd2St OR input$LagOrderADFSt\n")
-  #     cat("       - alpha       : input$alphaSt2\n")
-  #     cat("       - adf type    : input$adfTypeSt2\n")
-  #     cat("==========================================================================\n")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # ============================================================================
-  #   # 2) DATA PREP
-  #   # ============================================================================
-  #   x <- as.numeric(stats::na.omit(myData_Choice()))
-  #   valid_N <- length(x)
-  #   
-  #   # lag (k) must be integer >= 0
-  #   k <- suppressWarnings(as.integer(lag_in))
-  #   if (length(k) == 0 || is.na(k) || k < 0) k <- 0L
-  #   
-  #   # alpha mapping (robust)
-  #   alpha_raw <- as.character(a_in)
-  #   alpha_val <- to_num_safe(alpha_raw, default = 0.05)
-  #   
-  #   alpha_col <- switch(alpha_raw,
-  #                       "0.01" = "1pct",
-  #                       "0.05" = "5pct",
-  #                       "0.1"  = "10pct"
-  #   )
-  #   
-  #   # tau row mapping
-  #   tau_row <- switch(type_in,
-  #                     "none"  = "tau1",
-  #                     "drift" = "tau2",
-  #                     "trend" = "tau3",
-  #                     "tau3"
-  #   )
-  #   
-  #   # ============================================================================
-  #   # SECTION 1: DATA CONTEXT & SPECIFICATION
-  #   # ============================================================================
-  #   cat("==========================================================================\n")
-  #   cat("                        ADF UNIT ROOT DIAGNOSTIC                          \n")
-  #   cat("==========================================================================\n")
-  #   cat(sprintf(" MODEL TYPE : %-10s | SAMPLE SIZE (N) : %d\n", toupper(type_in), valid_N))
-  #   cat(sprintf(" LAG ORDER  : %-10d | SIGNIFICANCE (α) : %s\n", k, alpha_raw))
-  #   cat(sprintf(" MOMENTS    : Mean: %.4f | Std.Dev: %.4f\n", mean(x), stats::sd(x)))
-  #   # cat("--------------------------------------------------------------------------\n")
-  #   cat("\n")
-  #   # Basic sanity
-  #   if (valid_N < 5) {
-  #     cat(" [!] CRITICAL ERROR: Too few observations (N < 5).\n")
-  #     cat("     DIRECTIVE: Provide more data points.\n")
-  #     cat("==========================================================================\n")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   if (!is.finite(stats::sd(x)) || stats::sd(x) == 0) {
-  #     cat(" [!] CRITICAL ERROR: Series is constant or invalid (sd = 0 / NA).\n")
-  #     cat("     DIRECTIVE: Check transformation (log/diff) or data quality.\n")
-  #     cat("==========================================================================\n")
-  #     return(invisible(NULL))
-  #   }
-  #   
-  #   # Degrees of Freedom Safety Check (conservative)
-  #   if (valid_N <= (k + 10)) {
-  #     cat(" [!] WARNING: Sample size is small relative to selected lag.\n")
-  #     cat("     This can break tseries::adf.test and weaken inference.\n")
-  #     cat("     DIRECTIVE: Decrease Lag (k) or increase data points.\n")
-  #     # cat("--------------------------------------------------------------------------\n")
-  #     cat("\n")
-  #   }
-  #   
-  #   # ============================================================================
-  #   # 3) PREDECLARE OBJECTS (prevents crashes in post-summary)
-  #   # ============================================================================
-  #   res_urca <- NULL
-  #   
-  #   tau_obs  <- NA_real_
-  #   tau_crit <- NA_real_
-  #   
-  #   res_tseries <- list(p.value = NA_real_)
-  #   lb_test     <- list(statistic = NA_real_, p.value = NA_real_)
-  #   kpss_type   <- if (type_in == "trend") "Trend" else "Level"
-  #   res_kpss    <- list(statistic = NA_real_, p.value = NA_real_)
-  #   
-  #   is_stationary   <- FALSE
-  #   kpss_stationary <- FALSE
-  #   
-  #   # Pettitt placeholders (ONLY — Buishand removed)
-  #   pettitt_res <- list(statistic = NA_real_, p.value = NA_real_, estimate = NULL)
-  #   
-  #   # ============================================================================
-  #   # 4) COMPUTATIONS (tryCatch keeps UI alive, cats remain)
-  #   # ============================================================================
-  #   tryCatch({
-  #     
-  #     # --- Package checks (explicit + friendly) ---
-  #     if (!requireNamespace("urca", quietly = TRUE)) {
-  #       stop("Package 'urca' is not installed. ACTION: install.packages('urca')")
-  #     }
-  #     if (!requireNamespace("tseries", quietly = TRUE)) {
-  #       stop("Package 'tseries' is not installed. ACTION: install.packages('tseries')")
-  #     }
-  #     
-  #     # ==========================================================================
-  #     # PRIMARY TEST: ADF via urca::ur.df
-  #     # ==========================================================================
-  #     res_urca <- urca::ur.df(x, type = type_in, lags = k)
-  #     
-  #     # Tau statistic: extract by mapped row safely
-  #     tau_obs <- suppressWarnings(as.numeric(res_urca@teststat[tau_row]))
-  #     if (!is.finite(tau_obs)) {
-  #       # fallback attempt (some objects behave differently in edge cases)
-  #       tau_obs_fallback <- suppressWarnings(as.numeric(res_urca@teststat[1]))
-  #       if (is.finite(tau_obs_fallback)) tau_obs <- tau_obs_fallback
-  #     }
-  #     
-  #     # Critical value
-  #     tau_crit <- suppressWarnings(as.numeric(res_urca@cval[tau_row, alpha_col]))
-  #     
-  #     # Secondary ADF (p-value reference) — only if feasible
-  #     if (valid_N > (k + 10)) {
-  #       res_tseries <- tseries::adf.test(x, alternative = alt_in, k = k)
-  #     } else {
-  #       res_tseries <- list(p.value = NA_real_)
-  #     }
-  #     
-  #     # ==========================================================================
-  #     # QUALITY CHECK: Ljung-Box on ur.df residuals
-  #     # ==========================================================================
-  #     lb_lag <- max(1L, min(10L, floor(valid_N / 5)))
-  #     lb_test <- Box.test(res_urca@res, lag = lb_lag, type = "Ljung-Box")
-  #     
-  #     # ==========================================================================
-  #     # CONFIRMATORY: KPSS (H0 = stationary)
-  #     # ==========================================================================
-  #     kpss_type <- if (type_in == "trend") "Trend" else "Level"
-  #     res_kpss  <- tseries::kpss.test(x, null = kpss_type)
-  #     
-  #     # ==========================================================================
-  #     # SAFE FLAGS (avoid NA inside if-conditions)
-  #     # ==========================================================================
-  #     tau_ok  <- is.finite(tau_obs) && is.finite(tau_crit)
-  #     lb_ok   <- is.finite(to_num_safe(lb_test$p.value))
-  #     kpss_ok <- is.finite(to_num_safe(res_kpss$p.value))
-  #     
-  #     is_stationary <- isTRUE(tau_ok) && (tau_obs < tau_crit)
-  #     
-  #     if (kpss_ok && (to_num_safe(res_kpss$p.value) > alpha_val)) {
-  #       kpss_stationary <- TRUE
-  #     } else {
-  #       kpss_stationary <- FALSE
-  #     }
-  #     
-  #     lb_white_safe <- lb_ok && (to_num_safe(lb_test$p.value) > alpha_val)
-  #     
-  #     # ==========================================================================
-  #     # SECTION 2: PRIMARY TEST - AUGMENTED DICKEY-FULLER (ADF)
-  #     # ==========================================================================
-  #     cat("==========================================================================\n")
-  #     cat("PHASE 1: ADF UNIT ROOT TEST\n")
-  #     cat("==========================================================================\n")
-  #     
-  #     cat(" • H0: The series has a Unit Root (Non-Stationary).\n")
-  #     cat(" • Ha: The series is Stationary (Mean Reverting).\n")
-  #     cat(sprintf(" -> CRITERIA: Reject H0 if Tau-Obs (%.4f) < Tau-Crit (%.4f)\n",
-  #                 tau_obs, tau_crit))
-  #     
-  #     cat("\n RESULT:\n")
-  #     cat(paste("  - Tau Observed :", round(tau_obs, 4), "\n"))
-  #     cat(paste("  - Tau Critical :", round(tau_crit, 4), "\n"))
-  #     cat(paste("  - P-Value (Ref):", round(to_num_safe(res_tseries$p.value), 4), "\n"))
-  #     
-  #     cat("\n DECISION:\n")
-  #     if (isTRUE(tau_ok) && isTRUE(is_stationary)) {
-  #       cat("  -> REJECT H0: Evidence suggests the series is STATIONARY.\n")
-  #     } else if (isTRUE(tau_ok) && !isTRUE(is_stationary)) {
-  #       cat("  -> FAIL TO REJECT H0: Evidence suggests the series is NON-STATIONARY.\n")
-  #     } else {
-  #       cat("  -> [!] WARNING: Tau/Critical value is NA/Inf. ADF inference is not valid.\n")
-  #     }
-  #     # cat("--------------------------------------------------------------------------\n")
-  #     cat("\n")
-  #     
-  #     # ==========================================================================
-  #     # SECTION 3: QUALITY CHECK - LJUNG-BOX TEST
-  #     # ==========================================================================
-  #     cat("==========================================================================\n")
-  #     cat("PHASE 2: RESIDUAL DIAGNOSTICS (LJUNG-BOX)\n")
-  #     cat("==========================================================================\n")
-  #     
-  #     cat(" • H0: Residuals are White Noise (No Autocorrelation).\n")
-  #     cat(" • Ha: Residuals are Correlated (Lags are insufficient).\n")
-  #     cat(sprintf(" -> CRITERIA: Reject H0 if P-Value (%.4f) < α (%.2f)\n",
-  #                 to_num_safe(lb_test$p.value), alpha_val))
-  #     
-  #     cat("\n RESULT:\n")
-  #     cat(paste("  - LB Statistic :", round(to_num_safe(lb_test$statistic), 4), "\n"))
-  #     cat(paste("  - LB P-Value   :", round(to_num_safe(lb_test$p.value), 4), "\n"))
-  #     
-  #     cat("\n DECISION:\n")
-  #     if (isTRUE(lb_white_safe)) {
-  #       cat("  -> FAIL TO REJECT H0: Residuals are White Noise. [ADF VALID]\n")
-  #     } else if (isTRUE(lb_ok)) {
-  #       cat("  -> REJECT H0: Residuals are Correlated. [ADF BIASED]\n")
-  #     } else {
-  #       cat("  -> [!] WARNING: Ljung-Box P-Value is NA/Inf. Residual diagnosis failed.\n")
-  #     }
-  #     # cat("--------------------------------------------------------------------------\n")
-  #     cat("\n")
-  #     
-  #     
-  #     
-  #     # ==========================================================================
-  #     # PHASE 3: KPSS + STRUCTURAL BREAK CHECK (Pettitt) + Segment KPSS
-  #     # ==========================================================================
-  #     
-  #     cat("==========================================================================\n")
-  #     cat("PHASE 3: CONFIRMATORY ANALYSIS (KPSS)+ STRUCTURAL BREAK CHECK (Pettitt) + Segment KPSS\n")
-  #     cat("==========================================================================\n\n")
-  #     cat("PHASE 3A: CONFIRMATORY ANALYSIS (KPSS)\n")
-  #     cat(paste(" • H0: The series is Stationary around a", kpss_type, ".\n"))
-  #     cat(" • Ha: The series is Non-Stationary (Unit Root).\n")
-  #     cat(sprintf(" • CRITERIA: Reject H0 if P-Value (%.4f) < α (%.2f)\n",
-  #                 to_num_safe(res_kpss$p.value), alpha_val))
-  #     
-  #     cat("\n RESULT:\n")
-  #     cat(paste("  - KPSS P-Value :", round(to_num_safe(res_kpss$p.value), 4), "\n"))
-  #     
-  #     cat("\n DECISION:\n")
-  #     if (isTRUE(kpss_ok) && isTRUE(kpss_stationary)) {
-  #       cat("  -> FAIL TO REJECT H0: The series is STATIONARY. [KPSS]\n")
-  #     } else if (isTRUE(kpss_ok) && !isTRUE(kpss_stationary)) {
-  #       cat("  -> REJECT H0: The series is NON-STATIONARY. [KPSS]\n")
-  #     } else {
-  #       cat("  -> [!] WARNING: KPSS P-Value is NA/Inf. KPSS inference is not valid.\n")
-  #     }
-  #     cat("--------------------------------------------------------------------------\n")
-  #     
-  #     # ==========================================================================
-  #     # PHASE 3B: STRUCTURAL BREAK CHECK (Pettitt) + KPSS re-check by segments
-  #     # ==========================================================================
-  #     cat("PHASE 3B: STRUCTURAL BREAK CHECK (Pettitt) + KPSS SEGMENT CHECK\n")
-  #     cat(" • Goal: Detect a single change-point (shift) that can contaminate KPSS.\n")
-  #     cat(" • If a break exists, we re-run KPSS before/after the break.\n")
-  #     
-  #     pettitt_break <- FALSE
-  #     break_idx <- NA_integer_
-  #     
-  #     if (requireNamespace("trend", quietly = TRUE)) {
-  #       
-  #       # Pettitt safely (never kill the rest of the report)
-  #       tryCatch({
-  #         pettitt_res <- trend::pettitt.test(x)
-  #       }, error = function(e) {
-  #         pettitt_res <- list(statistic = NA_real_, p.value = NA_real_, estimate = NULL)
-  #         cat(" [!] WARNING: Pettitt test failed.\n")
-  #         cat("     ERROR: ", e$message, "\n", sep = "")
-  #       })
-  #       
-  #       pett_p <- to_num_safe(pettitt_res$p.value)
-  #       cat(sprintf(" • Pettitt P-Value: %.6f | α: %.4f\n", pett_p, alpha_val))
-  #       
-  #       # estimate is often the location (index)
-  #       if (!is.null(pettitt_res$estimate) && is.finite(as.numeric(pettitt_res$estimate))) {
-  #         break_idx <- as.integer(as.numeric(pettitt_res$estimate))
-  #       }
-  #       
-  #       pettitt_break <- is.finite(pett_p) && (pett_p < alpha_val) && is.finite(break_idx)
-  #       
-  #       cat("\n RESULT:\n")
-  #       cat(paste("  - Break index (estimate):", ifelse(is.finite(break_idx), break_idx, "NA"), "\n"))
-  #       cat(paste("  - Pettitt p-value       :", round(pett_p, 6), "\n"))
-  #       
-  #       cat("\n DECISION:\n")
-  #       if (pettitt_break) {
-  #         cat("  -> REJECT H0: Break detected. KPSS may be distorted on full sample.\n")
-  #       } else {
-  #         cat("  -> FAIL TO REJECT H0: No strong evidence of a single break.\n")
-  #       }
-  #       
-  #       # ------------------------------------------------------------
-  #       # Segment KPSS (only if break is detected and segments are big enough)
-  #       # ------------------------------------------------------------
-  #       if (pettitt_break) {
-  #         
-  #         # Split around break_idx
-  #         x1 <- x[1:break_idx]
-  #         x2 <- x[(break_idx + 1):valid_N]
-  #         
-  #         cat("--------------------------------------------------------------------------\n")
-  #         
-  #         cat("PHASE 3C: KPSS RE-CHECK BY SEGMENTS:\n")
-  #         
-  #         cat("  • Segment 1 = [1 .. break]\n")
-  #         cat("  • Segment 2 = [break+1 .. N]\n")
-  #         
-  #         # Minimum length guard (KPSS needs enough points)
-  #         min_seg <- 12L
-  #         if (length(x1) < min_seg || length(x2) < min_seg) {
-  #           cat("  [!] WARNING: One segment is too short for reliable KPSS.\n")
-  #           cat(sprintf("     Segment lengths: n1=%d, n2=%d (min recommended=%d)\n",
-  #                       length(x1), length(x2), min_seg))
-  #         } else {
-  #           
-  #           # Run KPSS on each segment safely
-  #           kpss1 <- tryCatch(tseries::kpss.test(x1, null = kpss_type),
-  #                             error = function(e) list(p.value = NA_real_))
-  #           kpss2 <- tryCatch(tseries::kpss.test(x2, null = kpss_type),
-  #                             error = function(e) list(p.value = NA_real_))
-  #           
-  #           p1 <- to_num_safe(kpss1$p.value)
-  #           p2 <- to_num_safe(kpss2$p.value)
-  #           
-  #           cat(sprintf("  - KPSS p-value (Segment 1): %.6f\n", p1))
-  #           cat(sprintf("  - KPSS p-value (Segment 2): %.6f\n", p2))
-  #           
-  #           # Interpret segment KPSS
-  #           s1_stat <- is.finite(p1) && (p1 > alpha_val)
-  #           s2_stat <- is.finite(p2) && (p2 > alpha_val)
-  #           
-  #           cat("\n INTERPRETATION:\n")
-  #           if (s1_stat && s2_stat) {
-  #             cat("  [✓] Both segments look stationary by KPSS.\n")
-  #             cat("      -> Full-sample KPSS non-stationarity may be break-driven.\n")
-  #           } else if (!s1_stat && !s2_stat) {
-  #             cat("  [X] Both segments look non-stationary by KPSS.\n")
-  #             cat("      -> Non-stationarity is not only due to a break.\n")
-  #           } else {
-  #             cat("  [?] Mixed: one segment stationary, the other not.\n")
-  #             cat("      -> Consider regime modeling or re-check transformation.\n")
-  #           }
-  #         }
-  #       }
-  #       
-  #     } else {
-  #       cat(" [!] WARNING: Package 'trend' not installed → Pettitt break check skipped.\n")
-  #       cat("     ACTION: install.packages('trend')\n")
-  #     }
-  #     
-  #     
-  #     
-  #     # cat("--------------------------------------------------------------------------\n")
-  #     
-  #     
-  #     
-  #     
-  #     # ==========================================================================
-  #     # SECTION 5: FINAL VERDICT & STUDENT DIRECTIVES
-  #     # ==========================================================================
-  #     cat("==========================================================================\n")
-  #     cat("PHASE 4: FINAL ACADEMIC VERDICT & ADVICE\n")
-  #     cat("==========================================================================\n")
-  #     
-  #     
-  #     if (isTRUE(lb_ok) && !isTRUE(lb_white_safe)) {
-  #       cat(" [!] WARNING: Your ADF 'Tau' statistic is technically biased.\n")
-  #       cat("     ADVICE: Increase 'Lag Order' until Ljung-Box P-Value > α.\n\n")
-  #     }
-  #     
-  #     if (isTRUE(is_stationary) && isTRUE(kpss_stationary)) {
-  #       cat(" [✓] VERDICT: STRONG STATIONARITY confirmed by both ADF and KPSS.\n")
-  #       cat("     ACTION: Proceed to ARMA/ARIMA modeling with d=0.\n")
-  #     } else if (isTRUE(!is_stationary) && isTRUE(!kpss_stationary)) {
-  #       cat(" [X] VERDICT: CLEAR UNIT ROOT. Both tests confirm Non-Stationarity.\n")
-  #       cat("     ACTION: Apply differencing (d=1) to stabilize the mean.\n")
-  #     } else {
-  #       cat(" [?] VERDICT: CONFLICTING RESULTS (ADF vs KPSS).\n")
-  #       cat("     ADVICE: The series may be highly persistent or trend-stationary.\n")
-  #       cat("     Double-check plots for breaks or changing variance.\n")
-  #     }
-  #     
-  #     cat("\n TECHNICAL APPENDIX (ADF Regression Coefficients):\n")
-  #     if (!is.null(res_urca)) {
-  #       print(stats::coef(res_urca@testreg))
-  #     } else {
-  #       cat("  [!] Not available (ur.df did not run).\n")
-  #     }
-  #     
-  #   }, error = function(e) {
-  #     cat(" EXECUTION ERROR: ", e$message, "\n")
-  #   })
-  #   
-  #   # cat("--------------------------------------------------------------------------\n")
-  #   cat("\n")
-  #   
-  #   # ============================================================================
-  #   # 5) POST-SUMMARY (always runs; safe against NA objects)
-  #   # ============================================================================
-  #   cat("==========================================================================\n")
-  #   cat("PHASE 5: POST-SUMMARY (Academic-quality snapshot)\n")
-  #   cat("==========================================================================\n")
-  #   
-  #   cat(" EVIDENCE SNAPSHOT (All key outcomes in one place):\n")
-  #   cat(sprintf(" [ ] N (effective sample size)        : %d\n", valid_N))
-  #   cat(sprintf(" [ ] Model type (ADF)                 : %s  (tau row: %s)\n", type_in, tau_row))
-  #   cat(sprintf(" [ ] Lag order (k)                    : %d\n", k))
-  #   cat(sprintf(" [ ] Alpha (α)                        : %.4f\n", alpha_val))
-  #   cat(sprintf(" [ ] Tau-Observed (urca)              : %.6f\n", tau_obs))
-  #   cat(sprintf(" [ ] Tau-Critical (urca, %s)          : %.6f\n", alpha_col, tau_crit))
-  #   cat(sprintf(" [ ] ADF p-value (tseries reference)  : %.6f\n", to_num_safe(res_tseries$p.value)))
-  #   cat(sprintf(" [ ] Ljung-Box p-value (residuals)    : %.6f\n", to_num_safe(lb_test$p.value)))
-  #   cat(sprintf(" [ ] KPSS p-value (%s null)           : %.6f\n", kpss_type, to_num_safe(res_kpss$p.value)))
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   cat(" CHECKLIST (Academic-quality acceptance criteria):\n")
-  #   cat(sprintf(" [ ] Tau is finite and usable                 : %s\n",
-  #               ifelse(is.finite(tau_obs), "[✓] SATISFIED", "[!] NOT SATISFIED")))
-  #   if (!is.finite(tau_obs)) {
-  #     cat("     [!] DANGER: Tau is NA/Inf → ADF inference cannot be trusted.\n")
-  #     cat("     [!] Likely causes: constant/near-constant series, k too high,\n")
-  #     cat("         wrong extraction index, too small effective N.\n")
-  #   }
-  #   
-  #   cat(sprintf(" [ ] Tau critical value extracted             : %s\n",
-  #               ifelse(is.finite(tau_crit), "[✓] SATISFIED", "[!] NOT SATISFIED")))
-  #   if (!is.finite(tau_crit)) {
-  #     cat("     [!] DANGER: Critical value missing → alpha/type mapping issue.\n")
-  #     cat("     [!] ACTION: verify alpha_col and tau_row exist in urca cval table.\n")
-  #   }
-  #   
-  #   lb_p <- to_num_safe(lb_test$p.value)
-  #   cat(sprintf(" [ ] Residuals pass Ljung-Box (white noise)   : %s\n",
-  #               ifelse(is.finite(lb_p) && lb_p > alpha_val, "[✓] SATISFIED", "[X] NOT SATISFIED")))
-  #   if (is.finite(lb_p) && lb_p <= alpha_val) {
-  #     cat("     [!] WARNING: residual autocorrelation detected.\n")
-  #     cat("     [!] Interpretation: ADF may be biased (insufficient k).\n")
-  #     cat("     [!] Suggested fix: increase k cautiously OR re-check transformation.\n")
-  #   }
-  #   
-  #   cat(sprintf(" [ ] Sample size adequacy                     : %s\n",
-  #               ifelse(valid_N >= 30, "[✓] STRONG", ifelse(valid_N >= 15, "[?] BORDERLINE", "[X] WEAK"))))
-  #   if (valid_N < 15) {
-  #     cat("     [!] WARNING: very low power. ADF/KPSS decisions may be unstable.\n")
-  #     cat("     [!] Advice: combine with plots (time plot + ACF/PACF) and be conservative.\n")
-  #   }
-  #   
-  #   
-  #   
-  #   #  lag sanity
-  #   cat(sprintf(" [ ] Lag order reasonable relative to N       : %s\n",
-  #               ifelse(valid_N > (k + 5), "[✓] OK", "[!] TOO HIGH / RISKY")))
-  #   if (valid_N <= (k + 5)) {
-  #     cat("     [!] DANGER: k too high for N → regression can break or give NA stats.\n")
-  #     cat("     [!] ACTION: reduce k immediately.\n")
-  #   }
-  #   
-  #   
-  #   #  cross-test agreement (ADF vs KPSS)
-  #   agreement_safe <- (isTRUE(is_stationary) && isTRUE(kpss_stationary)) ||
-  #     (isTRUE(!is_stationary) && isTRUE(!kpss_stationary))
-  #   
-  #   cat(sprintf(" [ ] ADF & KPSS agreement                      : %s\n",
-  #               ifelse(agreement_safe, "[✓] AGREEMENT", "[?] CONFLICT")))
-  #   
-  #   if (!agreement_safe) {
-  #     cat("     [?] NOTE: conflict can happen for near-unit-root series, structural breaks,\n")
-  #     cat("         or when model type (none/drift/trend) is mis-specified.\n")
-  #   }
-  #   
-  #   
-  #   # Structural break summary (Pettitt only)
-  #   if (requireNamespace("trend", quietly = TRUE)) {
-  #     cat("--------------------------------------------------------------------------\n")
-  #     cat(" STRUCTURAL BREAK SUMMARY (Pettitt):\n")
-  #     cat(sprintf(" [ ] Pettitt p-value   : %.6f  (Reject H0 if < α)\n", to_num_safe(pettitt_res$p.value)))
-  #     
-  #     pett_break2 <- is.finite(to_num_safe(pettitt_res$p.value)) &&
-  #       (to_num_safe(pettitt_res$p.value) < alpha_val)
-  #     
-  #     cat("\n INTERPRETATION:\n")
-  #     if (pett_break2) {
-  #       cat(" [!] WARNING: Evidence of a break detected (Pettitt).\n")
-  #       cat("     ADVICE: Consider split-sample testing or break-aware modeling.\n")
-  #       cat("     NOTE: Breaks can cause ADF/KPSS instability or conflicts.\n")
-  #     } else {
-  #       cat(" [✓] No strong evidence of a major break at α (Pettitt).\n")
-  #       cat("     ADVICE: Stationarity conclusions are less likely to be break-contaminated.\n")
-  #     }
-  #   } else {
-  #     cat("--------------------------------------------------------------------------\n")
-  #     cat(" STRUCTURAL BREAK SUMMARY (Pettitt):\n")
-  #     cat(" [!] WARNING: Package 'trend' is not installed. Pettitt summary unavailable.\n")
-  #     cat("     ACTION: install.packages('trend')\n")
-  #   }
-  #   
-  #   cat("--------------------------------------------------------------------------\n")
-  #   
-  #   if (isTRUE(is_stationary) && isTRUE(kpss_stationary)) {
-  #     cat(" [✓] VERDICT: CONSISTENT STATIONARITY. Both tests agree the series is I(0).\n")
-  #     cat(" ADVICE: You may proceed to model identification using the original series.\n")
-  #   } else if (isTRUE(!is_stationary) && isTRUE(!kpss_stationary)) {
-  #     cat(" [X] VERDICT: CONSISTENT UNIT ROOT. Both tests confirm Non-Stationarity.\n")
-  #     cat(" ADVICE: Apply First Differencing (d=1) to achieve stationarity.\n")
-  #   } else {
-  #     cat(" [?] VERDICT: CONFLICTING RESULTS. One test suggests a Unit Root while the other doesn't.\n")
-  #     cat(" ADVICE: This often happens with near-integrated or break-contaminated series. \n")
-  #     cat("         Use differencing for safety.\n")
-  #   }
-  #   
-  #   cat("\n ACTIONABLE NEXT STEPS (What to do now):\n")
-  #   
-  #   if (!is.finite(tau_obs) || !is.finite(tau_crit)) {
-  #     cat(" [!] PRIORITY 1: Fix the ADF computation first.\n")
-  #     cat("     • Reduce k, verify variance is not zero, and confirm urca outputs.\n")
-  #     cat("     • If Tau remains NA, your series may be too short after transformation.\n")
-  #   } else {
-  #     cat(" [✓] PRIORITY 1: Tau and critical values are usable.\n")
-  #   }
-  #   
-  #   if (is.finite(lb_p) && lb_p <= alpha_val) {
-  #     cat(" [X] PRIORITY 2: Residual autocorrelation detected.\n")
-  #     cat("     • Increase the Lag k (carefully) OR re-check transformation (d/D/log).\n")
-  #   } else {
-  #     cat(" [✓] PRIORITY 2: Residual whiteness acceptable → ADF inference more reliable.\n")
-  #   }
-  #   
-  #   if (!agreement_safe) {
-  #     cat(" [?] PRIORITY 3: Resolve ADF vs KPSS conflict.\n")
-  #     cat("     • Try alternative model types (none/drift/trend).\n")
-  #     cat("     • Consider break-aware modeling if Pettitt flags a break.\n")
-  #     cat("     • Use visual diagnostics + conservative differencing.\n")
-  #   } else {
-  #     cat(" [✓] PRIORITY 3: Tests agree → proceed with confidence.\n")
-  #   }
-  #   
-  #   cat("\n PRACTICAL MODELING PATH (for your Shiny workflow):\n")
-  #   if (isTRUE(is_stationary) && is.finite(lb_p) && (lb_p > alpha_val)) {
-  #     cat(" [✓] Use ARMA identification on current series → fit → residual analysis.\n")
-  #   } else if (!isTRUE(is_stationary)) {
-  #     cat(" [X] Apply differencing (d and/or D) → re-run ADF/KPSS → then identify ARMA.\n")
-  #   } else {
-  #     cat(" [?] Mixed evidence: consider differencing for safety and validate visually.\n")
-  #   }
-  #   
-  #   cat("--------------------------------------------------------------------------\n\n")
-  # })
-  
-  
+ 
   
   
   
@@ -7916,7 +15528,7 @@ server <- function(input, output, session) {
   # ---- Roadmap Detailed & teaching notes ----
   
   
-  output$roadmap_Detailed_ui <- renderUI({
+  output$roadmap_Detailed_Ang_ui <- renderUI({
     tags$div(
       style = "background:#f7f7f7;padding:14px;border-radius:8px;",
       
@@ -8382,6 +15994,3564 @@ server <- function(input, output, session) {
       
     )
   })
+  
+  
+  
+  
+  output$roadmap_Detailed_Fr_ui <- renderUI({
+    tags$div(
+      style = "background:#f7f7f7;padding:14px;border-radius:8px;",
+      
+      tags$hr(),
+      
+      tags$p(
+        "Ci-dessous, une ",
+        tags$b("feuille de route pratique de modélisation SARIMA"),
+        "."
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[0] - Préparer le terrain : définir le problème de modélisation"),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$ul(
+        tags$li("Définir la ", tags$b("série réponse"), " (y_t) (ce que l’on prévoit)."),
+        tags$li("Définir l’", tags$b("indice temporel"), " (quotidien/hebdomadaire/mensuel) et vérifier qu’il est cohérent."),
+        tags$li(
+          "Définir la ", tags$b("tâche de prévision"), " :",
+          tags$ul(
+            tags$li("horizon (ex. : 12 mois à l’avance),"),
+            tags$li("schéma d’évaluation (origine glissante / rolling-origin ou simple découpage apprentissage/test),"),
+            tags$li("métrique de perte (MAE/RMSE/MAPE/sMAPE).")
+          )
+        ),
+        tags$li(
+          "Décider si l’on modélise en :",
+          tags$ul(
+            tags$li(tags$b("niveaux"), " (données brutes),"),
+            tags$li(tags$b("log-niveaux"), " (fréquent si la variance augmente avec le niveau),"),
+            tags$li("espace transformé ", tags$b("Box–Cox"), " (plus général).")
+          )
+        )
+      ),
+      
+      tags$h5("Ce qu’ils écrivent (papier)"),
+      tags$p(
+        tags$b("Méthodes (Données & Objectif). "),
+        "« Nous avons modélisé la série temporelle univariée (y_t) observée à une fréquence [mensuelle] de [début] à [fin] (n=...). ",
+        "L’objectif était de prévoir à un horizon de (h=...) pas. La performance du modèle a été évaluée à l’aide de [métrique(s)] selon un protocole ",
+        "[apprentissage/test ou origine glissante]. »"
+      ),
+      
+      tags$h5("Pièges"),
+      tags$ul(
+        tags$li("SARIMA suppose un ", tags$b("espacement régulier"), " ; des timestamps irréguliers doivent être corrigés avant toute chose."),
+        tags$li("SARIMA modélise ", tags$b("une seule série"), " (sans prédicteurs). Avec des variables explicatives, on parle plutôt de SARIMAX.")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[1] - Décrire les données : taille d’échantillon, valeurs manquantes, statistiques descriptives"),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$ol(
+        tags$li(
+          "Rapporter :",
+          tags$ul(
+            tags$li("taille d’échantillon (n),"),
+            tags$li("dates de début/fin,"),
+            tags$li("fréquence,"),
+            tags$li("nombre/pourcentage de valeurs manquantes.")
+          )
+        ),
+        tags$li(
+          "Gérer le manque :",
+          tags$ul(
+            tags$li("S’il est rare et aléatoire : imputer (interpolation linéaire, interpolation saisonnière)."),
+            tags$li("S’il est important : reconsidérer la série, la fréquence ou la source de données.")
+          )
+        ),
+        tags$li(
+          "Statistiques descriptives :",
+          tags$ul(
+            tags$li("moyenne, médiane, écart-type, min/max,"),
+            tags$li("éventuellement asymétrie (skewness) / kurtosis,"),
+            tags$li("et résumés saisonniers (ex. : moyenne par mois).")
+          )
+        )
+      ),
+      
+      tags$h5("Ce qu’ils écrivent (style APA)"),
+      tags$p(
+        tags$b("Résultats (Description des données). "),
+        "« La série contient (n=...) observations couvrant [dates] à une fréquence [fréquence]. ",
+        "Les valeurs manquantes représentaient (...%) des observations (k=... points). Les observations manquantes ont été traitées par ",
+        "[méthode], choisie car [raison]. La distribution de (y_t) présentait une moyenne de (...) (ET=(...)), une médiane (...), ",
+        "et un intervalle ([...,...]). »"
+      ),
+      
+      tags$h5("Pièges"),
+      tags$ul(
+        tags$li("Ne pas imputer « silencieusement » — ", tags$b("toujours justifier"), "."),
+        tags$li("Si une transformation logarithmique est appliquée, décrire aussi les statistiques de la série transformée.")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[2] - Explorer visuellement : tendance/saisonnalité/valeurs aberrantes ; rapporter les observations"),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$p("Produire des graphiques et les commenter :"),
+      tags$ul(
+        tags$li(tags$b("Courbe"), " de (y_t)."),
+        tags$li(tags$b("Graphique saisonnier"), " (ex. : lignes par mois de l’année)."),
+        tags$li(tags$b("Boîte à moustaches par saison"), " (mois/trimestre/semaine)."),
+        tags$li(
+          tags$b("Détection d’outliers"), " :",
+          tags$ul(
+            tags$li("z-scores, règle IQR, ou méthodes robustes,"),
+            tags$li("mais aussi le contexte (fêtes, changements de politique, erreurs de mesure).")
+          )
+        )
+      ),
+      
+      tags$h5("Ce qu’ils écrivent"),
+      tags$p(
+        tags$b("Résultats (Analyse exploratoire). "),
+        "« L’inspection visuelle a indiqué une tendance [haussière/baissière] et des fluctuations saisonnières récurrentes de période (s=...). ",
+        "La variabilité semblait [constante/augmenter avec le niveau], suggérant [aucune transformation / une transformation logarithmique]. ",
+        "Plusieurs valeurs potentiellement aberrantes ont été observées autour de [dates], probablement liées à [contexte], et ont été ",
+        "[conservées/ajustées] car [raison]. »"
+      ),
+      
+      tags$h5("Pièges"),
+      tags$ul(
+        tags$li("Les outliers ne sont pas automatiquement « mauvais » : ils peuvent correspondre à des événements réels que la prévision doit respecter."),
+        tags$li("Si la variance augmente avec le niveau, SARIMA se comporte souvent mieux après une transformation ", tags$b("log"), " ou ", tags$b("Box–Cox"), ".")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[3] - Décomposer : justifier additif vs multiplicatif ; utiliser STL si robustesse nécessaire"),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$p("Réaliser une décomposition pour séparer :"),
+      tags$ul(
+        tags$li("tendance,"),
+        tags$li("saisonnalité,"),
+        tags$li("reste (bruit).")
+      ),
+      
+      tags$p(tags$b("Choisir la forme du modèle :")),
+      tags$ul(
+        tags$li(tags$b("Additive :"), " (y_t = T_t + S_t + e_t). À utiliser lorsque l’amplitude saisonnière est à peu près constante."),
+        tags$li(tags$b("Multiplicative :"), " (y_t = T_t × S_t × e_t). À utiliser lorsque l’amplitude saisonnière augmente avec le niveau (souvent résolu par log → additif en espace log).")
+      ),
+      
+      tags$p(tags$b("Utiliser la décomposition STL lorsque :")),
+      tags$ul(
+        tags$li("la saisonnalité évolue lentement au fil du temps,"),
+        tags$li("on souhaite une robustesse aux outliers.")
+      ),
+      
+      tags$h5("Ce qu’ils écrivent"),
+      tags$p(
+        tags$b("Méthodes (Décomposition). "),
+        "« Nous avons évalué une structure additive versus multiplicative en examinant si l’amplitude saisonnière évoluait avec le niveau de la série. ",
+        "Comme [la variation saisonnière était approximativement constante / augmentait avec le niveau], nous avons utilisé [un modèle additif / une transformation logarithmique] ",
+        "et décomposé la série via [décomposition classique / STL]. STL a été retenue pour sa robustesse aux valeurs aberrantes et sa flexibilité ",
+        "dans la modélisation d’une saisonnalité évolutive. »"
+      ),
+      
+      tags$h5("Pièges"),
+      tags$ul(
+        tags$li("« Saison multiplicative » et « transformation log » sont pratiquement meilleurs amis."),
+        tags$li("La décomposition STL est descriptive ; l’estimation SARIMA nécessite toujours des vérifications de stationnarité.")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[4] - Vérifier la stationnarité : ADF/KPSS/PP ; justifier la différenciation (d et D)"),
+      tags$p("SARIMA requiert la stationnarité ", tags$b("après différenciation"), "."),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$ol(
+        tags$li("Définir la période saisonnière (s) (ex. : 12 pour des données mensuelles, 7 pour des données quotidiennes avec saisonnalité hebdomadaire)."),
+        tags$li(
+          "Tester la stationnarité sur :",
+          tags$ul(
+            tags$li("la série originale,"),
+            tags$li("après ", tags$b("différenciation ordinaire"), " ((1-B)^d),"),
+            tags$li("après ", tags$b("différenciation saisonnière"), " ((1-B^s)^D),"),
+            tags$li("et parfois après les deux.")
+          )
+        )
+      ),
+      
+      tags$h5("Tests de stationnarité : rôle, H0/Ha, et conclusion"),
+      tags$ul(
+        tags$li(
+          tags$b("Test ADF (Augmented Dickey–Fuller)"),
+          tags$ul(
+            tags$li(tags$b("Rôle :"), " tester si la série se comporte comme si elle avait une ", tags$b("racine unitaire"),
+                    " (tendance stochastique), impliquant la non-stationnarité ; le test estime une régression où des différences retardées sont ajoutées pour gérer l’autocorrélation."),
+            tags$li(tags$b("H0 :"), " la série a une racine unitaire (non-stationnaire ; les chocs ont des effets permanents)."),
+            tags$li(tags$b("Ha :"), " la série n’a pas de racine unitaire (stationnaire autour d’une moyenne ou autour d’une tendance déterministe, selon la spécification ADF)."),
+            tags$li(tags$b("Phrase-type de conclusion :"), " « Le test ADF a donné p = [p-value] ; ainsi, au seuil α = [alpha], nous ",
+                    tags$b("[rejetons / ne rejetons pas]"), " H0 (racine unitaire). Cela implique que la série est ",
+                    tags$b("[stationnaire / non-stationnaire]"), " selon l’ADF ; nous ",
+                    tags$b("[n’avons pas appliqué de différenciation supplémentaire / avons appliqué]"), " une différenciation ordinaire [d=…] et/ou saisonnière [D=…] afin d’obtenir une série approximativement stationnaire adaptée à l’estimation SARIMA. »")
+          )
+        ),
+        tags$li(
+          tags$b("Test KPSS (Kwiatkowski–Phillips–Schmidt–Shin)"),
+          tags$ul(
+            tags$li(tags$b("Rôle :"), " tester la stationnarité en examinant si la somme cumulée des résidus (d’une régression de niveau ou de tendance) est trop importante ; c’est un complément à l’ADF en inversant l’hypothèse nulle."),
+            tags$li(tags$b("H0 :"), " la série est stationnaire (stationnaire en niveau, ou stationnaire en tendance si une tendance est incluse)."),
+            tags$li(tags$b("Ha :"), " la série est non-stationnaire (contient une racine unitaire ou viole la stationnarité)."),
+            tags$li(tags$b("Phrase-type de conclusion :"), " « Le test KPSS a donné p = [p-value] ; au seuil α = [alpha], nous ",
+                    tags$b("[rejetons / ne rejetons pas]"), " H0 de stationnarité. Cela indique que la série est ",
+                    tags$b("[non stationnaire / compatible avec la stationnarité]"), " au sens KPSS ; cela ",
+                    tags$b("[soutient l’application / ne nécessite pas]"), " d’une différenciation additionnelle. Nous avons donc retenu [d=…] et [D=…] puis revérifié la stationnarité sur la série transformée. »")
+          )
+        ),
+        tags$li(
+          tags$b("Test PP (Phillips–Perron)"),
+          tags$ul(
+            tags$li(tags$b("Rôle :"), " tester une racine unitaire comme l’ADF, mais en utilisant une correction non paramétrique de l’autocorrélation et de l’hétéroscédasticité (au lieu d’ajouter de nombreux retards)."),
+            tags$li(tags$b("H0 :"), " la série a une racine unitaire (non-stationnaire)."),
+            tags$li(tags$b("Ha :"), " la série n’a pas de racine unitaire (stationnaire)."),
+            tags$li(tags$b("Phrase-type de conclusion :"), " « Le test PP a donné p = [p-value] ; ainsi, au seuil α = [alpha], nous ",
+                    tags$b("[rejetons / ne rejetons pas]"), " H0 de racine unitaire. Interprété avec l’ADF et le KPSS, cela suggère que la série est ",
+                    tags$b("[stationnaire / non-stationnaire]"), " après application de [d=…] différenciations ordinaires et [D=…] différenciations saisonnières ; cela soutient l’usage d’un SARIMA sur la série différenciée. »")
+          )
+        )
+      ),
+      
+      tags$p(tags$b("Interpréter ADF/KPSS/PP ensemble (logique à écrire).")),
+      tags$ul(
+        tags$li(tags$b("Accord idéal :"), " ADF/PP rejettent la racine unitaire (p petit) et KPSS ne rejette pas la stationnarité (p grand) → forte évidence de stationnarité."),
+        tags$li(tags$b("Non-stationnarité claire :"), " ADF/PP ne rejettent pas la racine unitaire (p grand) et KPSS rejette la stationnarité (p petit) → forte évidence qu’une différenciation est nécessaire."),
+        tags$li(tags$b("Conflits :"), " lorsque les tests divergent, s’appuyer sur l’ensemble des preuves : graphiques + comportement de l’ACF + résultats après différenciation, et indiquer que la conclusion repose sur la convergence des indices plutôt que sur une seule p-value.")
+      ),
+      
+      tags$p(tags$b("Logique de différenciation :")),
+      tags$ul(
+        tags$li("Choisir ", tags$b("d"), " pour éliminer la tendance / racine unitaire."),
+        tags$li("Choisir ", tags$b("D"), " pour éliminer la racine unitaire saisonnière."),
+        tags$li("S’arrêter dès que la stationnarité est raisonnable ; éviter la sur-différenciation.")
+      ),
+      
+      tags$h5("Ce qu’ils écrivent"),
+      tags$p(
+        tags$b("Méthodes (Stationnarité et différenciation). "),
+        "« La stationnarité a été évaluée à l’aide des tests ADF, KPSS et PP afin de trianguler l’évidence, ces tests ayant des hypothèses nulles différentes. ",
+        "Sur la base des résultats combinés et des diagnostics visuels, nous avons retenu [d=...] différenciations ordinaires et [D=...] différenciations saisonnières avec une période saisonnière (s=...). ",
+        "Ce choix visait à supprimer [tendance/racine unitaire saisonnière] tout en évitant la sur-différenciation ; la stationnarité a ensuite été réévaluée sur la série transformée avant d’ajuster les modèles SARIMA. »"
+      ),
+      
+      tags$h5("Pièges (classiques)"),
+      tags$ul(
+        tags$li(
+          tags$b("Sur-différenciation"),
+          " provoque :",
+          tags$ul(
+            tags$li("forte autocorrélation négative au retard 1,"),
+            tags$li("variance gonflée,"),
+            tags$li("prévisions plus instables.")
+          )
+        ),
+        tags$li("En pratique, D vaut souvent ", tags$b("0 ou 1"), ". Si (D=2) est nécessaire, la série est atypique ou la période saisonnière est mal spécifiée.")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[5] - Ajuster un modèle de référence : Auto-ARIMA pour obtenir un bon point de départ SARIMA"),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$ul(
+        tags$li("Utiliser une procédure ", tags$b("auto-ARIMA"), " (AICc ou similaire) pour proposer : ((p,d,q)(P,D,Q)_s)."),
+        tags$li(
+          "Documenter :",
+          tags$ul(
+            tags$li("les transformations utilisées,"),
+            tags$li("les contraintes (max p/q, etc.),"),
+            tags$li("si une recherche stepwise a été utilisée.")
+          )
+        ),
+        tags$li(tags$b("Important :"), " Auto-ARIMA donne une base solide, pas une vérité gravée dans le marbre.")
+      ),
+      
+      tags$h5("Ce qu’ils écrivent"),
+      tags$p(
+        tags$b("Méthodes (Modèle de référence). "),
+        "« Un modèle SARIMA de référence a été sélectionné via une procédure automatisée basée sur un critère d’information (minimisation de l’AICc) parmi des ordres candidats ((p,q,P,Q)) ",
+        "sous contraintes [bornes]. La spécification retenue était SARIMA((p,d,q)(P,D,Q)_s), utilisée comme modèle de référence pour des ajustements ultérieurs guidés par la théorie. »"
+      ),
+      
+      tags$h5("Pièges"),
+      tags$ul(
+        tags$li("Auto-ARIMA peut sélectionner des modèles statistiquement corrects mais ", tags$b("difficiles à interpréter"), " ou légèrement instables."),
+        tags$li("Si l’objectif est la prévision, il est acceptable de préférer des modèles ", tags$b("plus simples"), " à précision comparable.")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[6] - Ajuster un modèle guidé par la théorie : SARIMA manuel via ACF/PACF + tests"),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$p("À partir de la série différenciée (après choix de (d, D)) :"),
+      tags$ol(
+        tags$li("Tracer ", tags$b("ACF/PACF"), "."),
+        tags$li(
+          "Proposer des structures candidates :",
+          tags$ul(
+            tags$li(
+              "Non saisonnier :",
+              tags$ul(
+                tags$li("AR(p) : la PACF se coupe autour de p ; l’ACF décroît."),
+                tags$li("MA(q) : l’ACF se coupe autour de q ; la PACF décroît.")
+              )
+            ),
+            tags$li(
+              "Saisonnier :",
+              tags$ul(
+                tags$li("AR saisonnier (P) : pics PACF aux retards (s, 2s, ...)."),
+                tags$li("MA saisonnier (Q) : pics ACF aux retards (s, 2s, ...).")
+              )
+            )
+          )
+        ),
+        tags$li("Ajuster un ", tags$b("petit ensemble"), " de candidats plausibles (ex. : 3–8 modèles)."),
+        tags$li(
+          "Comparer via :",
+          tags$ul(
+            tags$li("AICc/BIC,"),
+            tags$li("significativité des paramètres (avec prudence),"),
+            tags$li("stabilité / inversibilité.")
+          )
+        )
+      ),
+      
+      tags$h5("Ce qu’ils écrivent"),
+      tags$p(
+        tags$b("Méthodes (Construction guidée par la théorie). "),
+        "« Les structures SARIMA candidates ont été proposées d’après le comportement ACF/PACF de la série différenciée. Des pics aux retards [lags] suggéraient des composantes non saisonnières [AR/MA], ",
+        "tandis que des autocorrélations aux multiples de (s) indiquaient des termes saisonniers [AR/MA]. Plusieurs modèles ont été ajustés et comparés via [AICc/BIC], la sélection finale tenant compte de la parcimonie et de l’adéquation diagnostique. »"
+      ),
+      
+      tags$h5("Pièges"),
+      tags$ul(
+        tags$li("Les heuristiques ACF/PACF sont des ", tags$b("guides"), ", pas des commandements."),
+        tags$li("Éviter de brute-forcer 200 modèles puis d’appeler ça « théorie ». Préférer un ", tags$b("petit ensemble raisonné"), ".")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[7] - Diagnostiquer & comparer : tests des résidus + précision de prévision ; choisir le modèle final"),
+      
+      tags$h5("Ce que les étudiants font"),
+      tags$p(tags$b("Diagnostics des résidus (indispensable) :")),
+      tags$ul(
+        tags$li("Courbe des résidus (doit ressembler à du bruit)."),
+        tags$li("ACF des résidus (pas de gros pics)."),
+        tags$li(tags$b("Test de Ljung–Box"), " pour l’autocorrélation des résidus."),
+        tags$li("Vérification de normalité (QQ-plot ; Shapiro-Wilk est trop sensible pour grands n)."),
+        tags$li("Vérifier l’hétéroscédasticité (variance changeante).")
+      ),
+      
+      tags$p(tags$b("Évaluation de la prévision (indispensable) :")),
+      tags$ul(
+        tags$li("Échantillon test ou validation croisée rolling."),
+        tags$li("Métriques : MAE/RMSE ; MAPE seulement si la série n’est jamais proche de zéro."),
+        tags$li(
+          "Comparer :",
+          tags$ul(
+            tags$li("baseline auto-ARIMA,"),
+            tags$li("candidats SARIMA manuels,"),
+            tags$li("éventuellement un benchmark simple (naïf saisonnier).")
+          )
+        )
+      ),
+      
+      tags$p(tags$b("Règle de choix (saine) :")),
+      tags$ul(
+        tags$li("Doit passer les diagnostics de façon raisonnable."),
+        tags$li("Doit battre le benchmark naïf."),
+        tags$li("Préférer le modèle le plus simple si la précision est quasi identique.")
+      ),
+      
+      tags$h5("Ce qu’ils écrivent"),
+      tags$p(
+        tags$b("Résultats (Diagnostics et performance). "),
+        "« Les diagnostics des résidus indiquaient un comportement proche du bruit blanc : les autocorrélations résiduelles étaient faibles et le test de Ljung–Box était [non significatif/significatif] au seuil (α=...). ",
+        "La performance de prévision sur la fenêtre d’évaluation donnait MAE=(...) et RMSE=(...), surpassant les modèles de référence et de benchmark. Sur la base de l’adéquation diagnostique et de la performance prédictive, le modèle final retenu était SARIMA((p,d,q)(P,D,Q)_s). »"
+      ),
+      
+      tags$h5("Pièges"),
+      tags$ul(
+        tags$li("Un modèle avec un excellent AIC mais des résidus autocorrélés te ", tags$i("raconte une belle histoire"), " — mais fausse."),
+        tags$li("Des résidus non normaux peuvent encore donner de bonnes prévisions ; le problème majeur est l’", tags$b("autocorrélation"), " résiduelle.")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("[8] - Rédiger le rapport : paragraphes APA à chaque étape ; assembler Méthodes/Résultats"),
+      
+      tags$h5("Ce que les étudiants font (checklist d’assemblage)"),
+      tags$p(tags$b("Section Méthodes")),
+      tags$ul(
+        tags$li("Données (source, fréquence, traitement du manque, transformation)."),
+        tags$li("Approche exploratoire (graphiques, décomposition)."),
+        tags$li("Tests de stationnarité et choix de différenciation."),
+        tags$li("Baseline (paramètres auto-ARIMA)."),
+        tags$li("Justification de la sélection manuelle (ACF/PACF + candidats)."),
+        tags$li("Diagnostics et protocole d’évaluation.")
+      ),
+      
+      tags$p(tags$b("Section Résultats")),
+      tags$ul(
+        tags$li("Résumé des données + observations visuelles clés."),
+        tags$li("Résultats de décomposition (tendance/saisonnalité)."),
+        tags$li("Résultats des tests de stationnarité et choix (d, D)."),
+        tags$li("Paramètres du modèle final."),
+        tags$li("Diagnostics et métriques de précision."),
+        tags$li("Graphique de prévision + tableau d’erreurs.")
+      ),
+      
+      tags$h5("Guidance (structure APA)"),
+      tags$ul(
+        tags$li("Pour chaque sous-section : ", tags$b("Ce qu’on a fait → Pourquoi → Ce qu’on a observé → Conclusion"), "."),
+        tags$li("Passé pour Méthodes ; passé orienté résultats pour Résultats."),
+        tags$li("Écrire les maths avec parcimonie ; donner la spécification complète du modèle une seule fois, clairement.")
+      ),
+      
+      tags$hr(),
+      
+      tags$h4("Un « pack livrable » propre que les étudiants doivent rendre"),
+      tags$ul(
+        tags$li(
+          "Un notebook/script qui :",
+          tags$ul(
+            tags$li("charge les données,"),
+            tags$li("traite les valeurs manquantes,"),
+            tags$li("réalise l’EDA (graphiques),"),
+            tags$li("décomposition,"),
+            tags$li("tests de stationnarité,"),
+            tags$li("baseline auto-ARIMA,"),
+            tags$li("candidats manuels,"),
+            tags$li("diagnostics,"),
+            tags$li("évaluation,"),
+            tags$li("prévision finale.")
+          )
+        ),
+        tags$li(
+          "Un court rapport avec :",
+          tags$ul(
+            tags$li("Méthodes + Résultats alignés aux étapes 1–7,"),
+            tags$li("figures : courbe temporelle, décomposition, ACF/PACF, ACF des résidus, graphique de prévision,"),
+            tags$li("tableau comparatif des modèles candidats (AICc + métriques).")
+          )
+        )
+      ),
+      
+      tags$hr()
+    )
+  })
+  
+  
+  
+  
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  
+
+  
+  
+  
+  
+  # =========================
+  # 8 — GARCH (NEW SERVER LOGIC)
+  # Requires: rugarch
+  # =========================
+  
+  # Teaching notes for the tab
+  output$garch_notes <- renderUI({
+    note_box(list(
+      "Use GARCH when the residual variance changes over time (volatility clustering).",
+      "Model the mean (ARMA) and the conditional variance (GARCH family).",
+      "If you model log-returns, interpret forecasts as return forecasts and sigma as volatility."
+    ))
+  })
+  
+  output$garch_what_to_do <- renderUI({
+    tags$div(
+      style = "background:#eef5ff;padding:10px;border-radius:6px;margin-bottom:10px;",
+      tags$b("What to do:"),
+      tags$ul(
+        tags$li("Choose whether to model levels or log-returns (returns usually preferred)."),
+        tags$li("Pick a variance model (sGARCH is the baseline; gjrGARCH/eGARCH capture asymmetry)."),
+        tags$li("Check diagnostics: standardized residuals should look like white noise; squared residuals should also be clean."),
+        tags$li("If residuals are heavy-tailed, switch Normal → Student-t or skewed t."),
+        tags$li("Compare models by AIC/BIC and out-of-sample accuracy (if you have a test set).")
+      )
+    )
+  })
+  
+  # ---- Helper: safe pkg check (you already have has_pkg() globally)
+  need_pkg <- function(pkg) {
+    validate(need(has_pkg(pkg), paste0("Please install package '", pkg, "' (install.packages('", pkg, "')) to use this tab.")))
+  }
+  
+  # ---- Helper: accuracy metrics (same spirit as your existing accuracy_table)
+  garch_accuracy <- function(actual, forecast) {
+    a <- as.numeric(actual)
+    f <- as.numeric(forecast)
+    e <- a - f
+    rmse <- sqrt(mean(e^2, na.rm = TRUE))
+    mae  <- mean(abs(e), na.rm = TRUE)
+    mape <- mean(abs(e / a), na.rm = TRUE)
+    smape <- mean(2 * abs(e) / (abs(a) + abs(f)), na.rm = TRUE)
+    
+    data.frame(
+      Metric = c("RMSE", "MAE", "MAPE", "sMAPE"),
+      Value = c(rmse, mae, mape, smape),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  # ---- Helper: make the modeling series from prepared()/ts split
+  garch_series <- reactive({
+    req(prepared())
+    df <- prepared()$df
+    
+    # try to use your existing train/test logic if present
+    train_n <- NULL
+    test_n  <- 0L
+    
+    if (exists("ts_train_test", mode = "function")) {
+      s <- tryCatch(ts_train_test(), error = function(e) NULL)
+      if (!is.null(s) && !is.null(s$train_n)) {
+        train_n <- s$train_n
+        # preferred modeling target (in your app you use y_trans for modeling)
+        y_full <- df$y_trans
+        if (isTRUE(input$garch_series_type == "logret")) {
+          y_full <- as.numeric(y_full)
+          y_full <- y_full[is.finite(y_full)]
+          y_mod <- diff(log(y_full))
+          if (isTRUE(input$garch_scale_100)) y_mod <- 100 * y_mod
+          # returns length reduced by 1
+          # align train_n accordingly (roughly)
+          train_n_mod <- max(5L, min(length(y_mod), train_n - 1L))
+          list(y = y_mod, x = df$x[-1], train_n = train_n_mod, test_n = max(0L, length(y_mod) - train_n_mod))
+        } else {
+          y_mod <- as.numeric(df$y_trans)
+          ok <- is.finite(y_mod)
+          y_mod <- y_mod[ok]
+          x_mod <- df$x[ok]
+          train_n_mod <- max(5L, min(length(y_mod), train_n))
+          list(y = y_mod, x = x_mod, train_n = train_n_mod, test_n = max(0L, length(y_mod) - train_n_mod))
+        }
+      }
+    }
+    
+    # fallback: use all data
+    if (isTRUE(input$garch_series_type == "logret")) {
+      y_full <- as.numeric(df$y_trans)
+      y_full <- y_full[is.finite(y_full)]
+      y_mod <- diff(log(y_full))
+      if (isTRUE(input$garch_scale_100)) y_mod <- 100 * y_mod
+      list(y = y_mod, x = df$x[-1], train_n = length(y_mod), test_n = 0L)
+    } else {
+      y_mod <- as.numeric(df$y_trans)
+      ok <- is.finite(y_mod)
+      list(y = y_mod[ok], x = df$x[ok], train_n = sum(ok), test_n = 0L)
+    }
+  })
+  
+  # ---- Fit event
+  garch_fit <- eventReactive(input$fit_garch, {
+    need_pkg("rugarch")
+    s <- garch_series()
+    y <- s$y
+    validate(need(length(y) >= 30, "Need at least ~30 observations for a stable GARCH fit."))
+    
+    # training window
+    y_train <- y[seq_len(s$train_n)]
+    
+    spec <- rugarch::ugarchspec(
+      variance.model = list(
+        model = input$garch_vmodel,
+        garchOrder = c(as.integer(input$garch_p), as.integer(input$garch_q))
+      ),
+      mean.model = list(
+        armaOrder = c(as.integer(input$garch_ar), as.integer(input$garch_ma)),
+        include.mean = isTRUE(input$garch_include_mean)
+      ),
+      distribution.model = input$garch_dist
+    )
+    
+    fit <- tryCatch(
+      rugarch::ugarchfit(spec = spec, data = y_train, solver = "hybrid"),
+      error = function(e) {
+        validate(paste("GARCH fit failed:", e$message))
+        NULL
+      }
+    )
+    
+    list(spec = spec, fit = fit, series = s, y_train = y_train)
+  })
+  
+  # ---- Model spec text
+  output$garch_model_spec <- renderPrint({
+    req(garch_fit())
+    gf <- garch_fit()
+    s <- gf$series
+    
+    cat("GARCH model specification\n")
+    cat("------------------------------------------------------------\n")
+    cat("Series modeled        :", if (input$garch_series_type == "logret") "Log-returns" else "Level", "\n")
+    cat("Train N               :", s$train_n, "\n")
+    cat("Test N                :", s$test_n, "\n\n")
+    
+    cat("Mean model (ARMA)\n")
+    cat("  ARMA(p,q)           : (", input$garch_ar, ",", input$garch_ma, ")\n", sep = "")
+    cat("  Include mean (mu)   :", if (isTRUE(input$garch_include_mean)) "Yes" else "No", "\n\n")
+    
+    cat("Variance model\n")
+    cat("  Variant             :", input$garch_vmodel, "\n")
+    cat("  Order (p,q)         : (", input$garch_p, ",", input$garch_q, ")\n\n", sep = "")
+    
+    cat("Innovations\n")
+    cat("  Distribution        :", input$garch_dist, "\n\n")
+    
+    show_methods <- tryCatch(rugarch::infocriteria(gf$fit), error = function(e) NULL)
+    if (!is.null(show_methods)) {
+      cat("Information criteria\n")
+      print(round(show_methods, 4))
+    }
+  })
+  
+  # ---- Coef table
+  output$garch_coef_table <- renderTable({
+    req(garch_fit())
+    gf <- garch_fit()
+    
+    m <- tryCatch(gf$fit@fit$matcoef, error = function(e) NULL)
+    validate(need(!is.null(m), "Could not extract coefficient table."))
+    
+    out <- as.data.frame(m)
+    out$term <- rownames(out)
+    rownames(out) <- NULL
+    out <- out[, c("term", colnames(m)), drop = FALSE]
+    names(out) <- c("term", "Estimate", "Std. Error", "t value", "Pr(>|t|)")
+    out
+  }, rownames = FALSE)
+  
+  # ---- Model equation (MathJax)
+  output$garch_model_equation <- renderUI({
+    req(garch_fit())
+    
+    p  <- as.integer(input$garch_ar)
+    q  <- as.integer(input$garch_ma)
+    vp <- as.integer(input$garch_p)
+    vq <- as.integer(input$garch_q)
+    
+    mean_eq <- if (p == 0 && q == 0) {
+      if (isTRUE(input$garch_include_mean)) "\\mu_t = \\mu" else "\\mu_t = 0"
+    } else {
+      paste0(
+        "y_t = \\mu + \\sum_{i=1}^{", p, "} \\phi_i y_{t-i} + ",
+        "\\sum_{j=1}^{", q, "} \\theta_j \\varepsilon_{t-j} + \\varepsilon_t"
+      )
+    }
+    
+    var_eq <- switch(
+      input$garch_vmodel,
+      "sGARCH"   = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} \\alpha_i \\varepsilon_{t-i}^2 + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+      "gjrGARCH" = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} (\\alpha_i \\varepsilon_{t-i}^2 + \\gamma_i \\varepsilon_{t-i}^2 \\mathbb{I}(\\varepsilon_{t-i}<0)) + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+      "eGARCH"   = paste0("\\log(\\sigma_t^2) = \\omega + \\sum_{i=1}^{", vq, "} (\\alpha_i \\left|\\frac{\\varepsilon_{t-i}}{\\sigma_{t-i}}\\right| + \\gamma_i \\frac{\\varepsilon_{t-i}}{\\sigma_{t-i}}\\right) + \\sum_{j=1}^{", vp, "} \\beta_j \\log(\\sigma_{t-j}^2)"),
+      "\\sigma_t^2 = \\omega + \\sum \\alpha \\varepsilon^2 + \\sum \\beta \\sigma^2"
+    )
+    
+    html <- paste0(
+      "<p><b>Mean equation:</b></p>",
+      "<div>$$", mean_eq, "$$</div>",
+      "<p><b>Variance equation:</b></p>",
+      "<div>$$", var_eq, "$$</div>",
+      "<p>Where $$\\varepsilon_t = \\sigma_t z_t$$ and $$z_t$$ follows the chosen innovation distribution.</p>"
+    )
+    
+    # force MathJax to typeset the updated UI
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "garch_eq_box")
+    }, once = TRUE)
+    
+    HTML(html)
+  })
+  
+  
+  
+  
+  
+  # output$garch_model_equation <- renderUI({
+  #   req(garch_fit())
+  #   
+  #   p <- as.integer(input$garch_ar)
+  #   q <- as.integer(input$garch_ma)
+  #   vp <- as.integer(input$garch_p)
+  #   vq <- as.integer(input$garch_q)
+  #   
+  #   mean_eq <- if (p == 0 && q == 0) {
+  #     if (isTRUE(input$garch_include_mean)) {
+  #       "\\mu_t = \\mu"
+  #     } else {
+  #       "\\mu_t = 0"
+  #     }
+  #   } else {
+  #     # compact ARMA notation
+  #     paste0(
+  #       "y_t = \\mu + \\sum_{i=1}^{", p, "} \\phi_i y_{t-i} + \\sum_{j=1}^{", q, "} \\theta_j \\varepsilon_{t-j} + \\varepsilon_t"
+  #     )
+  #   }
+  #   
+  #   var_eq <- switch(
+  #     input$garch_vmodel,
+  #     "sGARCH"   = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} \\alpha_i \\varepsilon_{t-i}^2 + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+  #     "gjrGARCH" = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} \\left(\\alpha_i \\varepsilon_{t-i}^2 + \\gamma_i \\varepsilon_{t-i}^2 \\mathbb{I}(\\varepsilon_{t-i}<0)\\right) + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+  #     "eGARCH"   = paste0("\\log(\\sigma_t^2) = \\omega + \\sum_{i=1}^{", vq, "} \\left(\\alpha_i \\left|\\frac{\\varepsilon_{t-i}}{\\sigma_{t-i}}\\right| + \\gamma_i \\frac{\\varepsilon_{t-i}}{\\sigma_{t-i}}\\right) + \\sum_{j=1}^{", vp, "} \\beta_j \\log(\\sigma_{t-j}^2)"),
+  #     paste0("\\sigma_t^2 = \\omega + \\sum \\alpha \\varepsilon^2 + \\sum \\beta \\sigma^2")
+  #   )
+  #   
+  #   tags$div(
+  #     tags$p(tags$b("Mean equation:")),
+  #     tags$div(HTML(paste0("$$", mean_eq, "$$"))),
+  #     tags$p(tags$b("Variance equation:")),
+  #     tags$div(HTML(paste0("$$", var_eq, "$$"))),
+  #     tags$p(
+  #       HTML("Where $$\\varepsilon_t = \\sigma_t z_t$$ and $$z_t$$ follows the chosen innovation distribution.")
+  #     )
+  #   )
+  # })
+  
+  # ---- Diagnostics plots (standardized residuals etc.)
+  output$garch_resid_ts <- renderPlot({
+    req(garch_fit())
+    gf <- garch_fit()
+    z <- tryCatch(rugarch::residuals(gf$fit, standardize = TRUE), error = function(e) NULL)
+    validate(need(!is.null(z), "No residuals available."))
+    z <- as.numeric(z)
+    
+    plot(z, type = "l", col = "#2C7FB8", main = "Standardized residuals", xlab = "t", ylab = "z_t")
+    abline(h = 0, lty = 2, col = "gray50")
+  })
+  
+  output$garch_resid_acf <- renderPlot({
+    req(garch_fit())
+    gf <- garch_fit()
+    z <- tryCatch(rugarch::residuals(gf$fit, standardize = TRUE), error = function(e) NULL)
+    validate(need(!is.null(z), "No residuals available."))
+    forecast::ggAcf(as.numeric(z)) + ggplot2::labs(title = "ACF of standardized residuals")
+  })
+  
+  output$garch_resid_hist <- renderPlot({
+    req(garch_fit())
+    gf <- garch_fit()
+    z <- tryCatch(rugarch::residuals(gf$fit, standardize = TRUE), error = function(e) NULL)
+    validate(need(!is.null(z), "No residuals available."))
+    z <- as.numeric(z)
+    
+    ggplot2::ggplot(data.frame(z = z), ggplot2::aes(x = z)) +
+      ggplot2::geom_histogram(bins = 30, fill = "#74a9cf", color = "white") +
+      ggplot2::theme_minimal() +
+      ggplot2::labs(title = "Histogram (standardized residuals)", x = "z_t", y = "Count")
+  })
+  
+  output$garch_resid_qq <- renderPlot({
+    req(garch_fit())
+    gf <- garch_fit()
+    z <- tryCatch(rugarch::residuals(gf$fit, standardize = TRUE), error = function(e) NULL)
+    validate(need(!is.null(z), "No residuals available."))
+    z <- as.numeric(z)
+    
+    qqnorm(z, main = "QQ plot (standardized residuals)", col = "#2C7FB8")
+    qqline(z, col = "gray40", lwd = 2)
+  })
+  
+  # Conditional sigma plot
+  output$garch_sigma_plot <- renderPlot({
+    req(garch_fit())
+    gf <- garch_fit()
+    sig <- tryCatch(rugarch::sigma(gf$fit), error = function(e) NULL)
+    validate(need(!is.null(sig), "No sigma available."))
+    sig <- as.numeric(sig)
+    
+    plot(sig, type = "l", col = "#d95f0e", main = "Conditional volatility (sigma_t)", xlab = "t", ylab = expression(sigma[t]))
+  })
+  
+  # ---- Residual tests (text)
+  output$garch_diag_tests <- renderPrint({
+    req(garch_fit())
+    gf <- garch_fit()
+    
+    z <- as.numeric(rugarch::residuals(gf$fit, standardize = TRUE))
+    z2 <- z^2
+    
+    L <- as.integer(input$diag_lag %||% 12)
+    L <- max(1L, min(L, floor(length(z) / 2)))
+    
+    cat("GARCH residual diagnostics (standardized residuals)\n")
+    cat("------------------------------------------------------------\n")
+    
+    # LB on z
+    lb1 <- tryCatch(Box.test(z, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+    if (!is.null(lb1)) cat(sprintf("- Ljung-Box on z_t: Q(%d)=%.4f, p=%.4g\n", L, lb1$statistic, lb1$p.value))
+    
+    # LB on z^2
+    lb2 <- tryCatch(Box.test(z2, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+    if (!is.null(lb2)) cat(sprintf("- Ljung-Box on z_t^2: Q(%d)=%.4f, p=%.4g\n", L, lb2$statistic, lb2$p.value))
+    
+    # Jarque-Bera
+    jb <- tryCatch(tseries::jarque.bera.test(z), error = function(e) NULL)
+    if (!is.null(jb)) cat(sprintf("- Jarque-Bera: JB=%.4f, p=%.4g\n", jb$statistic, jb$p.value))
+    
+    # ARCH LM (on standardized residuals)
+    if (has_pkg("FinTS")) {
+      arch <- tryCatch(FinTS::ArchTest(z, lags = L), error = function(e) NULL)
+      if (!is.null(arch)) cat(sprintf("- ARCH LM: LM=%.4f, p=%.4g (lags=%d)\n", arch$statistic, arch$p.value, L))
+    } else {
+      cat("- ARCH LM: install.packages('FinTS') to enable this test.\n")
+    }
+    
+    cat("\nRule of thumb:\n")
+    cat("• We want Ljung-Box p-values on z_t and z_t^2 to be > 0.05 (no leftover autocorrelation / ARCH).\n")
+    cat("• Heavy tails: JB often rejects; use Student-t / skewed t innovations.\n")
+  })
+  
+  # ---- Forecast & accuracy
+  garch_forecast <- reactive({
+    req(garch_fit())
+    need_pkg("rugarch")
+    
+    gf <- garch_fit()
+    s <- gf$series
+    y <- s$y
+    
+    # horizon: if test exists => align to test length; else input$garch_h
+    h <- if (s$test_n > 0) s$test_n else {
+      hh <- suppressWarnings(as.integer(input$garch_h))
+      if (!is.finite(hh) || is.na(hh) || hh < 1) 12L else hh
+    }
+    
+    fc <- tryCatch(
+      rugarch::ugarchforecast(gf$fit, n.ahead = h),
+      error = function(e) {
+        validate(paste("Forecast failed:", e$message))
+        NULL
+      }
+    )
+    
+    # extract mean and sigma forecasts
+    mu_hat <- as.numeric(rugarch::fitted(fc))
+    sig_hat <- as.numeric(rugarch::sigma(fc))
+    
+    list(h = h, mu = mu_hat, sigma = sig_hat, series = s, y = y)
+  })
+  
+  output$garch_horizon_note <- renderPrint({
+    req(garch_forecast())
+    fc <- garch_forecast()
+    s <- fc$series
+    if (s$test_n > 0) {
+      cat("Forecast horizon equals the test set length (h = ", fc$h, ").\n", sep = "")
+    } else {
+      cat("No test set detected; using future horizon h = ", fc$h, ".\n", sep = "")
+    }
+  })
+  
+  output$garch_forecast_table <- renderTable({
+    req(garch_forecast())
+    fc <- garch_forecast()
+    out <- data.frame(
+      step = seq_len(fc$h),
+      mean_forecast = fc$mu,
+      sigma_forecast = fc$sigma
+    )
+    if (!isTRUE(input$garch_forecast_sigma)) out$sigma_forecast <- NULL
+    out
+  }, rownames = FALSE)
+  
+  output$garch_accuracy_table <- renderTable({
+    req(garch_forecast())
+    fc <- garch_forecast()
+    s <- fc$series
+    
+    if (s$test_n <= 0) {
+      return(data.frame(Metric = "Note", Value = "No test set available; accuracy not computed.", stringsAsFactors = FALSE))
+    }
+    
+    y_test <- fc$y[(s$train_n + 1):(s$train_n + s$test_n)]
+    y_hat  <- fc$mu[seq_len(length(y_test))]
+    garch_accuracy(y_test, y_hat)
+  }, rownames = FALSE)
+  
+  output$garch_forecast_plot <- renderPlot({
+    req(garch_forecast())
+    fc <- garch_forecast()
+    s <- fc$series
+    
+    y <- fc$y
+    train_n <- s$train_n
+    h <- fc$h
+    
+    # Build x for plotting
+    x <- s$x
+    x_train <- x[seq_len(train_n)]
+    x_fc <- x[(train_n + 1):min(length(x), train_n + h)]
+    if (length(x_fc) < h) {
+      # fallback: simple index extension
+      x_fc <- (length(x_train) + 1):(length(x_train) + h)
+    }
+    
+    df_train <- data.frame(x = x_train, y = y[seq_len(train_n)], set = "Train")
+    df_fc <- data.frame(x = x_fc, mean = fc$mu[seq_len(h)], sigma = fc$sigma[seq_len(h)])
+    
+    p <- ggplot() +
+      geom_line(data = df_train, aes(x = x, y = y), color = "#2C7FB8") +
+      geom_line(data = df_fc, aes(x = x, y = mean), color = "#d95f0e", linewidth = 1) +
+      theme_minimal() +
+      labs(
+        title = "GARCH forecast (mean) and optional volatility band",
+        x = "Time",
+        y = if (input$garch_series_type == "logret") "Return" else "Level"
+      )
+    
+    if (isTRUE(input$garch_forecast_sigma)) {
+      p <- p + geom_ribbon(
+        data = df_fc,
+        aes(x = x, ymin = mean - 1.96 * sigma, ymax = mean + 1.96 * sigma),
+        alpha = 0.15, fill = "#d95f0e"
+      )
+    }
+    
+    # if test exists, overlay actual test
+    if (s$test_n > 0) {
+      df_test <- data.frame(
+        x = x[(train_n + 1):(train_n + s$test_n)],
+        y = y[(train_n + 1):(train_n + s$test_n)]
+      )
+      p <- p + geom_line(data = df_test, aes(x = x, y = y), color = "gray40")
+    }
+    
+    p
+  })
+  
+  
+  # ---- APA paragraph (GARCH)
+  output$garch_apa_paragraph <- renderPrint({
+    req(garch_fit())
+    gf <- garch_fit()
+    
+    # pull series/test info
+    s <- gf$series
+    n_train <- s$train_n
+    n_test  <- s$test_n
+    
+    # info criteria
+    ic <- tryCatch(rugarch::infocriteria(gf$fit), error = function(e) NULL)
+    aic <- if (!is.null(ic) && "Akaike" %in% names(ic)) as.numeric(ic["Akaike"]) else NA_real_
+    bic <- if (!is.null(ic) && "Bayes"  %in% names(ic)) as.numeric(ic["Bayes"])  else NA_real_
+    
+    # coefs
+    mat <- tryCatch(gf$fit@fit$matcoef, error = function(e) NULL)
+    
+    get_coef <- function(name) {
+      if (is.null(mat)) return(list(est = NA_real_, p = NA_real_))
+      if (!name %in% rownames(mat)) return(list(est = NA_real_, p = NA_real_))
+      list(est = as.numeric(mat[name, 1]), p = as.numeric(mat[name, 4]))
+    }
+    
+    # common variance params
+    omega <- get_coef("omega")
+    alpha1 <- get_coef("alpha1")
+    beta1  <- get_coef("beta1")
+    gamma1 <- get_coef("gamma1")   # gjrGARCH
+    shape  <- get_coef("shape")    # t / ged
+    skew   <- get_coef("skew")     # sstd
+    
+    # residual diagnostics
+    z <- tryCatch(as.numeric(rugarch::residuals(gf$fit, standardize = TRUE)), error = function(e) NULL)
+    validate(need(!is.null(z), "Could not compute standardized residuals for APA paragraph."))
+    
+    L <- as.integer(input$diag_lag %||% 12)
+    L <- max(1L, min(L, floor(length(z) / 2)))
+    
+    lb_z  <- tryCatch(Box.test(z,  lag = L, type = "Ljung-Box"), error = function(e) NULL)
+    lb_z2 <- tryCatch(Box.test(z^2, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+    
+    jb <- tryCatch(tseries::jarque.bera.test(z), error = function(e) NULL)
+    
+    arch <- NULL
+    if (has_pkg("FinTS")) {
+      arch <- tryCatch(FinTS::ArchTest(z, lags = L), error = function(e) NULL)
+    }
+    
+    # Forecast accuracy (if test exists)
+    acc_text <- ""
+    if (n_test > 0) {
+      fc <- garch_forecast()
+      y_test <- fc$y[(n_train + 1):(n_train + n_test)]
+      y_hat  <- fc$mu[seq_len(length(y_test))]
+      
+      e <- y_test - y_hat
+      rmse <- sqrt(mean(e^2, na.rm = TRUE))
+      mae  <- mean(abs(e), na.rm = TRUE)
+      mape <- mean(abs(e / y_test), na.rm = TRUE)
+      
+      acc_text <- paste0(
+        " Out-of-sample forecast accuracy over the test set (n = ", n_test,
+        ") was RMSE = ", fmt_num(rmse), ", MAE = ", fmt_num(mae),
+        ", and MAPE = ", fmt_pct(mape), "."
+      )
+    } else {
+      acc_text <- " No holdout test set was detected, so out-of-sample accuracy was not computed."
+    }
+    
+    # build spec text
+    mean_part <- paste0(
+      "An ARMA(", input$garch_ar, ", ", input$garch_ma, ") mean model",
+      if (isTRUE(input$garch_include_mean)) " with an intercept" else " without an intercept",
+      " was specified."
+    )
+    
+    var_part <- paste0(
+      " Conditional variance was modeled using ", input$garch_vmodel,
+      " with order (", input$garch_p, ", ", input$garch_q, ")."
+    )
+    
+    dist_part <- paste0(" Innovations were assumed to follow a ", input$garch_dist, " distribution.")
+    
+    # parameter highlights (only mention if available)
+    parm_bits <- c()
+    
+    if (is.finite(omega$est)) {
+      parm_bits <- c(parm_bits, paste0("ω = ", fmt_num(omega$est), " (p ", fmt_p(omega$p), ")"))
+    }
+    if (is.finite(alpha1$est)) {
+      parm_bits <- c(parm_bits, paste0("α₁ = ", fmt_num(alpha1$est), " (p ", fmt_p(alpha1$p), ")"))
+    }
+    if (is.finite(beta1$est)) {
+      parm_bits <- c(parm_bits, paste0("β₁ = ", fmt_num(beta1$est), " (p ", fmt_p(beta1$p), ")"))
+    }
+    if (is.finite(gamma1$est)) {
+      parm_bits <- c(parm_bits, paste0("γ₁ = ", fmt_num(gamma1$est), " (p ", fmt_p(gamma1$p), ")"))
+    }
+    if (is.finite(shape$est)) {
+      parm_bits <- c(parm_bits, paste0("shape = ", fmt_num(shape$est), " (p ", fmt_p(shape$p), ")"))
+    }
+    if (is.finite(skew$est)) {
+      parm_bits <- c(parm_bits, paste0("skew = ", fmt_num(skew$est), " (p ", fmt_p(skew$p), ")"))
+    }
+    
+    parms_text <- if (length(parm_bits) > 0) {
+      paste0(" Key parameter estimates included ", paste(parm_bits, collapse = "; "), ".")
+    } else {
+      ""
+    }
+    
+    # diagnostics sentence
+    diag_bits <- c()
+    if (!is.null(lb_z))  diag_bits <- c(diag_bits, paste0("Ljung–Box on zₜ: Q(", L, ") = ", fmt_num(lb_z$statistic), ", p ", fmt_p(lb_z$p.value)))
+    if (!is.null(lb_z2)) diag_bits <- c(diag_bits, paste0("Ljung–Box on zₜ²: Q(", L, ") = ", fmt_num(lb_z2$statistic), ", p ", fmt_p(lb_z2$p.value)))
+    if (!is.null(arch))  diag_bits <- c(diag_bits, paste0("ARCH LM: LM = ", fmt_num(arch$statistic), ", p ", fmt_p(arch$p.value)))
+    if (!is.null(jb))    diag_bits <- c(diag_bits, paste0("Jarque–Bera: JB = ", fmt_num(jb$statistic), ", p ", fmt_p(jb$p.value)))
+    
+    diag_text <- if (length(diag_bits) > 0) {
+      paste0(" Residual diagnostics indicated ", paste(diag_bits, collapse = "; "), ".")
+    } else {
+      " Residual diagnostics were not available for reporting."
+    }
+    
+    # AIC/BIC text
+    ic_text <- if (is.finite(aic) || is.finite(bic)) {
+      paste0(
+        " Model fit was summarized by information criteria (AIC = ",
+        if (is.finite(aic)) fmt_num(aic) else "NA",
+        ", BIC = ",
+        if (is.finite(bic)) fmt_num(bic) else "NA",
+        ")."
+      )
+    } else {
+      ""
+    }
+    
+    series_name <- if (input$garch_series_type == "logret") "log-returns" else "the level series"
+    series_scale <- if (input$garch_series_type == "logret" && isTRUE(input$garch_scale_100)) " (scaled by 100)" else ""
+    
+    paragraph <- paste0(
+      "A GARCH model was fitted to ", series_name, series_scale, " using the training sample (n = ", n_train, "). ",
+      mean_part, var_part, dist_part,
+      ic_text,
+      parms_text,
+      diag_text,
+      acc_text
+    )
+    
+    cat(paragraph)
+  })
+  
+  
+  output$garch_conclusion <- renderUI({
+    req(garch_fit())
+    
+    # ---- helpers (use yours if present)
+    fmt_num_local <- function(x, d = 3) {
+      if (!is.finite(x) || is.na(x)) return("NA")
+      formatC(x, format = "f", digits = d)
+    }
+    fmt_p_local <- function(p) {
+      if (!is.finite(p) || is.na(p)) return("= NA")
+      if (p < 0.001) return("< .001")
+      paste0("= ", sub("^0", "", fmt_num_local(p, 3)))
+    }
+    fmt_pct_local <- function(x) {
+      if (!is.finite(x) || is.na(x)) return("NA")
+      paste0(fmt_num_local(100 * x, 2), "%")
+    }
+    
+    gf <- garch_fit()
+    s <- gf$series
+    n_train <- s$train_n
+    n_test  <- s$test_n
+    
+    # ---- equations
+    p  <- as.integer(input$garch_ar)
+    q  <- as.integer(input$garch_ma)
+    vp <- as.integer(input$garch_p)
+    vq <- as.integer(input$garch_q)
+    
+    mean_eq <- if (p == 0 && q == 0) {
+      if (isTRUE(input$garch_include_mean)) "y_t = \\mu + \\varepsilon_t" else "y_t = \\varepsilon_t"
+    } else {
+      paste0(
+        "y_t = \\mu + \\sum_{i=1}^{", p, "} \\phi_i y_{t-i} + ",
+        "\\sum_{j=1}^{", q, "} \\theta_j \\varepsilon_{t-j} + \\varepsilon_t"
+      )
+    }
+    
+    var_eq <- switch(
+      input$garch_vmodel,
+      "sGARCH"   = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} \\alpha_i \\varepsilon_{t-i}^2 + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+      "gjrGARCH" = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} (\\alpha_i \\varepsilon_{t-i}^2 + \\gamma_i \\varepsilon_{t-i}^2\\,\\mathbb{I}(\\varepsilon_{t-i}<0)) + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+      "eGARCH"   = paste0("\\log(\\sigma_t^2) = \\omega + \\sum_{i=1}^{", vq, "} (\\alpha_i |z_{t-i}| + \\gamma_i z_{t-i}) + \\sum_{j=1}^{", vp, "} \\beta_j \\log(\\sigma_{t-j}^2)"),
+      "\\sigma_t^2 = \\omega + \\sum \\alpha \\varepsilon^2 + \\sum \\beta \\sigma^2"
+    )
+    
+    # ---- info criteria
+    ic <- tryCatch(rugarch::infocriteria(gf$fit), error = function(e) NULL)
+    aic <- if (!is.null(ic) && "Akaike" %in% names(ic)) as.numeric(ic["Akaike"]) else NA_real_
+    bic <- if (!is.null(ic) && "Bayes"  %in% names(ic)) as.numeric(ic["Bayes"])  else NA_real_
+    
+    # ---- coefficients and p-values
+    mat <- tryCatch(gf$fit@fit$matcoef, error = function(e) NULL)
+    
+    get_coef <- function(name) {
+      if (is.null(mat) || !name %in% rownames(mat)) return(list(est = NA_real_, p = NA_real_))
+      list(est = as.numeric(mat[name, 1]), p = as.numeric(mat[name, 4]))
+    }
+    
+    omega <- get_coef("omega")
+    alpha1 <- get_coef("alpha1")
+    beta1  <- get_coef("beta1")
+    gamma1 <- get_coef("gamma1")
+    shape  <- get_coef("shape")
+    skew   <- get_coef("skew")
+    mu     <- get_coef("mu")
+    
+    # ---- persistence + half-life (only meaningful for sGARCH/gjrGARCH)
+    persistence <- NA_real_
+    halflife <- NA_real_
+    if (input$garch_vmodel %in% c("sGARCH", "gjrGARCH") && is.finite(alpha1$est) && is.finite(beta1$est)) {
+      # common approximation: alpha + beta (gjr has extra terms; keep conservative summary)
+      persistence <- alpha1$est + beta1$est
+      if (is.finite(persistence) && persistence > 0 && persistence < 1) {
+        halflife <- log(0.5) / log(persistence)
+      }
+    }
+    
+    # ---- residual diagnostics
+    z <- tryCatch(as.numeric(rugarch::residuals(gf$fit, standardize = TRUE)), error = function(e) NULL)
+    validate(need(!is.null(z), "Could not compute standardized residuals."))
+    
+    L <- as.integer(input$diag_lag %||% 12)
+    L <- max(1L, min(L, floor(length(z) / 2)))
+    
+    lb_z  <- tryCatch(Box.test(z, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+    lb_z2 <- tryCatch(Box.test(z^2, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+    jb    <- tryCatch(tseries::jarque.bera.test(z), error = function(e) NULL)
+    arch  <- if (has_pkg("FinTS")) tryCatch(FinTS::ArchTest(z, lags = L), error = function(e) NULL) else NULL
+    
+    # ---- forecast & accuracy (if test exists)
+    acc_line <- "No holdout test set was detected; therefore, out-of-sample accuracy statistics were not computed."
+    fc_tbl <- NULL
+    
+    if (n_test > 0) {
+      fc <- garch_forecast()   # uses your earlier reactive
+      y_test <- fc$y[(n_train + 1):(n_train + n_test)]
+      y_hat  <- fc$mu[seq_len(length(y_test))]
+      
+      e <- y_test - y_hat
+      rmse <- sqrt(mean(e^2, na.rm = TRUE))
+      mae  <- mean(abs(e), na.rm = TRUE)
+      mape <- mean(abs(e / y_test), na.rm = TRUE)
+      
+      acc_line <- paste0(
+        "Forecast accuracy on the test set (n = ", n_test, ") was RMSE = ",
+        fmt_num_local(rmse), ", MAE = ", fmt_num_local(mae),
+        ", and MAPE = ", fmt_pct_local(mape), "."
+      )
+      
+      # small forecast snippet for conclusion
+      fc_tbl <- data.frame(
+        step = seq_len(min(5, fc$h)),
+        mean_forecast = fc$mu[seq_len(min(5, fc$h))],
+        sigma_forecast = fc$sigma[seq_len(min(5, fc$h))]
+      )
+    }
+    
+    # ---- narrative bits
+    series_text <- if (input$garch_series_type == "logret") {
+      if (isTRUE(input$garch_scale_100)) "log-returns (scaled by 100)" else "log-returns"
+    } else {
+      "the level series"
+    }
+    
+    dist_long <- switch(
+      input$garch_dist,
+      "norm" = "Gaussian",
+      "std"  = "Student’s t",
+      "sstd" = "skewed Student’s t",
+      "ged"  = "generalized error (GED)",
+      input$garch_dist
+    )
+    
+    # ---- build HTML (academic format)
+    html <- paste0(
+      "<h4 style='margin-top:0;'>Conclusion (GARCH modelling)</h4>",
+      
+      "<p><b>Model overview.</b> A ", input$garch_vmodel, " model was estimated for ", series_text,
+      " using a training sample of <i>n</i> = ", n_train, " observations. The conditional mean was specified as ARMA(",
+      p, ", ", q, ") ", if (isTRUE(input$garch_include_mean)) "with an intercept" else "without an intercept",
+      ", and innovations were assumed to follow a ", dist_long, " distribution.</p>",
+      
+      "<p><b>Model equations.</b></p>",
+      "<div style='margin-left:6px;'>$$", mean_eq, "$$</div>",
+      "<div style='margin-left:6px;'>$$", var_eq, "$$</div>",
+      "<p>with $$\\varepsilon_t = \\sigma_t z_t$$.</p>",
+      
+      "<p><b>Key estimation results.</b> ",
+      if (is.finite(aic) || is.finite(bic)) paste0("Information criteria indicated AIC = ", fmt_num_local(aic), " and BIC = ", fmt_num_local(bic), ". ") else "",
+      if (is.finite(mu$est)) paste0("The estimated mean term was \\(\\mu\\) = ", fmt_num_local(mu$est), " (p ", fmt_p_local(mu$p), "). ") else "",
+      if (is.finite(omega$est)) paste0("The variance intercept was \\(\\omega\\) = ", fmt_num_local(omega$est), " (p ", fmt_p_local(omega$p), "). ") else "",
+      if (is.finite(alpha1$est)) paste0("The ARCH effect \\(\\alpha_1\\) = ", fmt_num_local(alpha1$est), " (p ", fmt_p_local(alpha1$p), "), ") else "",
+      if (is.finite(beta1$est))  paste0("and the GARCH effect \\(\\beta_1\\) = ", fmt_num_local(beta1$est), " (p ", fmt_p_local(beta1$p), "). ") else "",
+      if (is.finite(gamma1$est)) paste0("An asymmetric (leverage) component \\(\\gamma_1\\) = ", fmt_num_local(gamma1$est), " (p ", fmt_p_local(gamma1$p), ") was also estimated. ") else "",
+      if (is.finite(shape$est))  paste0("Tail thickness (shape) was estimated as ", fmt_num_local(shape$est), " (p ", fmt_p_local(shape$p), "). ") else "",
+      if (is.finite(skew$est))   paste0("Skewness (skew) was estimated as ", fmt_num_local(skew$est), " (p ", fmt_p_local(skew$p), "). ") else "",
+      if (is.finite(persistence)) paste0("Volatility persistence (approx. \\(\\alpha_1 + \\beta_1\\)) was ", fmt_num_local(persistence), 
+                                         if (is.finite(halflife)) paste0(", corresponding to an approximate half-life of ", fmt_num_local(halflife, 2), " periods. ") else ". ")
+      else "",
+      "</p>",
+      
+      "<p><b>Residual diagnostics.</b> ",
+      if (!is.null(lb_z))  paste0("Ljung–Box tests suggested ", if (lb_z$p.value > 0.05) "no" else "remaining", " autocorrelation in standardized residuals (Q(", L, ") = ", fmt_num_local(lb_z$statistic), ", p ", fmt_p_local(lb_z$p.value), "). ") else "",
+      if (!is.null(lb_z2)) paste0("For squared residuals, the Ljung–Box test ", if (lb_z2$p.value > 0.05) "did not indicate" else "indicated", " remaining ARCH structure (Q(", L, ") = ", fmt_num_local(lb_z2$statistic), ", p ", fmt_p_local(lb_z2$p.value), "). ") else "",
+      if (!is.null(arch))  paste0("The ARCH LM test ", if (arch$p.value > 0.05) "did not provide evidence" else "provided evidence", " of additional conditional heteroskedasticity (LM = ", fmt_num_local(arch$statistic), ", p ", fmt_p_local(arch$p.value), "). ") else "",
+      if (!is.null(jb))    paste0("Normality was assessed using Jarque–Bera (JB = ", fmt_num_local(jb$statistic), ", p ", fmt_p_local(jb$p.value), "), which commonly rejects under heavy tails—consistent with adopting non-Gaussian innovations when appropriate. ") else "",
+      "</p>",
+      
+      "<p><b>Forecast performance.</b> ", acc_line, "</p>",
+      
+      if (!is.null(fc_tbl)) {
+        paste0(
+          "<p><b>Forecast excerpt (first 5 steps).</b></p>",
+          "<div style='margin-left:6px;'>",
+          paste0(
+            "<table class='table table-condensed' style='width:100%;max-width:520px;'>",
+            "<thead><tr><th>Step</th><th>Mean forecast</th><th>Sigma forecast</th></tr></thead><tbody>",
+            paste(
+              apply(fc_tbl, 1, function(r) {
+                paste0(
+                  "<tr><td>", r[[1]], "</td><td>", fmt_num_local(as.numeric(r[[2]])),
+                  "</td><td>", fmt_num_local(as.numeric(r[[3]])), "</td></tr>"
+                )
+              }),
+              collapse = ""
+            ),
+            "</tbody></table>"
+          ),
+          "</div>"
+        )
+      } else "",
+      
+      "<p><b>Overall conclusion.</b> Collectively, the estimated parameters and residual diagnostics ",
+      "support the use of a conditional heteroskedasticity framework for capturing time-varying volatility in the series. ",
+      "When diagnostics indicate limited remaining autocorrelation in \\(z_t\\) and \\(z_t^2\\), the fitted GARCH specification ",
+      "may be considered adequate for inference and forecasting. Where residual tests suggest remaining dependence or heavy tails, ",
+      "improvements may include refining the ARMA mean orders, increasing the GARCH order, or adopting heavier-tailed/skewed innovation distributions.</p>"
+    )
+    
+    # trigger MathJax typesetting for this conclusion box
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "garch_conclusion_box")
+    }, once = TRUE)
+    
+    HTML(html)
+  })
+  
+  
+  
+  
+  # =========================
+  # 9 — Auto-GARCH (SERVER)
+  # =========================
+  
+  output$autogarch_notes <- renderUI({
+    if (isTRUE(input$show_teaching_notes)) {
+      tags$div(
+        class = "alert alert-info",
+        tags$b("Auto-GARCH:"),
+        " searches across GARCH variants, orders, and innovation distributions, and selects the best model using AIC/BIC.",
+        tags$br(),
+        "Tip: Start with (1,1) + {sGARCH, gjrGARCH} and {std, norm} to keep search fast."
+      )
+    }
+  })
+  
+  output$autogarch_what_to_do <- renderUI({
+    tags$div(
+      tags$ol(
+        tags$li("Upload data and set frequency/transform in the left sidebar."),
+        tags$li("Choose series type (level vs log-returns)."),
+        tags$li("Choose search space (mean ARMA grid, variance models, distributions)."),
+        tags$li("Click “Run Auto-GARCH Search”."),
+        tags$li("Inspect top candidates, diagnostics, residual tests, then forecast performance.")
+      )
+    )
+  })
+  
+  # ---- Helper: build series for Auto-GARCH
+  autogarch_series <- reactive({
+    req(ts_train_test())
+    s <- ts_train_test()
+    y_full <- as.numeric(s$ts_full)
+    
+    if (input$autogarch_series_type == "logret") {
+      # log-returns: diff(log(y))
+      y_full <- diff(log(y_full))
+      y_full <- y_full[is.finite(y_full)]
+      if (isTRUE(input$autogarch_scale_100)) y_full <- 100 * y_full
+    } else {
+      y_full <- y_full[is.finite(y_full)]
+    }
+    
+    # train/test sizes based on original split proportion
+    # If train_prop == 1 => test size 0
+    n_full <- length(y_full)
+    train_prop <- suppressWarnings(as.numeric(input$train_prop))
+    if (!is.finite(train_prop) || train_prop <= 0) train_prop <- 1
+    n_train <- if (train_prop >= 0.999) n_full else max(10L, floor(train_prop * n_full))
+    n_test  <- max(0L, n_full - n_train)
+    
+    list(
+      y = y_full,
+      train_n = n_train,
+      test_n  = n_test
+    )
+  })
+  
+  # ---- Auto search (eventReactive on button)
+  autogarch_search <- eventReactive(input$fit_autogarch, {
+    validate(need(has_pkg("rugarch"), "Package 'rugarch' is required for Auto-GARCH. Please install it."))
+    s <- autogarch_series()
+    y <- s$y
+    validate(need(length(y) >= 80, "Need at least ~80 observations for a stable Auto-GARCH search."))
+    
+    y_train <- y[seq_len(s$train_n)]
+    
+    # grids
+    vmodels <- input$autogarch_vmodels
+    dists   <- input$autogarch_dists
+    validate(need(length(vmodels) > 0, "Select at least one GARCH variant."))
+    validate(need(length(dists) > 0, "Select at least one distribution."))
+    
+    gorders <- switch(
+      input$autogarch_orders,
+      "11"    = list(c(1L, 1L)),
+      "small" = list(c(1L, 1L), c(1L, 2L), c(2L, 1L)),
+      "22"    = list(c(1L, 1L), c(1L, 2L), c(2L, 1L), c(2L, 2L)),
+      list(c(1L, 1L))
+    )
+    
+    if (isTRUE(input$autogarch_search_mean)) {
+      pmax <- as.integer(input$autogarch_pmax); if (!is.finite(pmax) || pmax < 0) pmax <- 0L
+      qmax <- as.integer(input$autogarch_qmax); if (!is.finite(qmax) || qmax < 0) qmax <- 0L
+      arma_grid <- expand.grid(ar = 0:pmax, ma = 0:qmax)
+    } else {
+      arma_grid <- data.frame(ar = 0L, ma = 0L)
+    }
+    
+    include_mean <- isTRUE(input$autogarch_include_mean)
+    
+    # safe fit one
+    fit_one <- function(vmodel, dist, go, ar, ma) {
+      spec <- rugarch::ugarchspec(
+        variance.model = list(model = vmodel, garchOrder = c(go[1], go[2])),
+        mean.model = list(armaOrder = c(ar, ma), include.mean = include_mean),
+        distribution.model = dist
+      )
+      fit <- tryCatch(
+        rugarch::ugarchfit(spec = spec, data = y_train, solver = "hybrid"),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) return(NULL)
+      ic <- tryCatch(rugarch::infocriteria(fit), error = function(e) NULL)
+      if (is.null(ic)) return(NULL)
+      
+      data.frame(
+        vmodel = vmodel, dist = dist,
+        garch_p = go[1], garch_q = go[2],
+        ar = ar, ma = ma,
+        AIC = as.numeric(ic["Akaike"]),
+        BIC = as.numeric(ic["Bayes"]),
+        stringsAsFactors = FALSE,
+        fit = I(list(fit))
+      )
+    }
+    
+    # run search with progress
+    total <- length(vmodels) * length(dists) * length(gorders) * nrow(arma_grid)
+    res_list <- vector("list", total)
+    k <- 1L
+    
+    withProgress(message = "Auto-GARCH search", value = 0, {
+      for (vm in vmodels) {
+        for (di in dists) {
+          for (go in gorders) {
+            for (i in seq_len(nrow(arma_grid))) {
+              incProgress(1 / total, detail = paste(vm, di, paste0("(", go[1], ",", go[2], ")"), "ARMA", arma_grid$ar[i], arma_grid$ma[i]))
+              out <- fit_one(vm, di, go, arma_grid$ar[i], arma_grid$ma[i])
+              if (!is.null(out)) {
+                res_list[[k]] <- out
+                k <- k + 1L
+              }
+            }
+          }
+        }
+      }
+    })
+    
+    res_list <- res_list[seq_len(k - 1L)]
+    validate(need(length(res_list) > 0, "All candidate models failed. Try smaller ARMA grid, fewer distributions, or only sGARCH(1,1)."))
+    
+    res <- do.call(rbind, res_list)
+    
+    # rank by selection criterion
+    ic_col <- input$autogarch_select_ic
+    res <- res[order(res[[ic_col]]), , drop = FALSE]
+    res
+  })
+  
+  # ---- best fit + series bundle
+  autogarch_best <- reactive({
+    req(autogarch_search())
+    res <- autogarch_search()
+    list(
+      fit = res$fit[[1]],
+      meta = res[1, c("vmodel","dist","garch_p","garch_q","ar","ma","AIC","BIC"), drop = FALSE],
+      series = autogarch_series()
+    )
+  })
+  
+  # ---- search results table
+  output$autogarch_rank_table <- renderTable({
+    validate(need(input$fit_autogarch > 0, "Click “Run Auto-GARCH Search” to see results."))
+    req(autogarch_search())
+    topk <- as.integer(input$autogarch_topk)
+    if (!is.finite(topk) || topk < 5) topk <- 10L
+    
+    res <- autogarch_search()
+    out <- head(res, topk)
+    out$fit <- NULL
+    out
+  }, rownames = FALSE)
+  
+  output$autogarch_best_spec <- renderPrint({
+    validate(need(input$fit_autogarch > 0, "Click “Run Auto-GARCH Search” first."))
+    req(autogarch_best())
+    b <- autogarch_best()
+    cat("Best Auto-GARCH model selected.\n\n")
+    print(b$meta)
+    cat("\nInfo criteria (rugarch::infocriteria):\n")
+    print(round(rugarch::infocriteria(b$fit), 4))
+  })
+  
+  # ---- model spec + coefficient table
+  output$autogarch_model_spec <- renderPrint({
+    validate(need(input$fit_autogarch > 0, "Click “Run Auto-GARCH Search” first."))
+    req(autogarch_best())
+    b <- autogarch_best()
+    
+    cat("Auto-GARCH best specification:\n")
+    print(b$meta)
+    cat("\n\nRUGARCH fit summary:\n")
+    show(b$fit)
+  })
+  
+  output$autogarch_coef_table <- renderTable({
+    validate(need(input$fit_autogarch > 0, "Click “Run Auto-GARCH Search” first."))
+    req(autogarch_best())
+    fit <- autogarch_best()$fit
+    mat <- tryCatch(fit@fit$matcoef, error = function(e) NULL)
+    validate(need(!is.null(mat), "Coefficient table unavailable."))
+    
+    data.frame(
+      Term = rownames(mat),
+      Estimate = as.numeric(mat[, 1]),
+      `Std. Error` = as.numeric(mat[, 2]),
+      `t value` = as.numeric(mat[, 3]),
+      `Pr(>|t|)` = as.numeric(mat[, 4]),
+      row.names = NULL,
+      check.names = FALSE
+    )
+  }, digits = 5)
+  
+  # ---- equation (same style as your GARCH equation)
+  output$autogarch_model_equation <- renderUI({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search to generate the equation."))
+    req(autogarch_best())
+    b <- autogarch_best()
+    m <- b$meta[1, ]
+    
+    p  <- as.integer(m$ar); if (!is.finite(p)) p <- 0L
+    q  <- as.integer(m$ma); if (!is.finite(q)) q <- 0L
+    vp <- as.integer(m$garch_p); if (!is.finite(vp)) vp <- 1L
+    vq <- as.integer(m$garch_q); if (!is.finite(vq)) vq <- 1L
+    vmodel <- as.character(m$vmodel)
+    
+    mean_eq <- if (p == 0 && q == 0) {
+      if (isTRUE(input$autogarch_include_mean)) "y_t = \\mu + \\varepsilon_t" else "y_t = \\varepsilon_t"
+    } else {
+      paste0("y_t = \\mu + \\sum_{i=1}^{", p, "} \\phi_i y_{t-i} + \\sum_{j=1}^{", q, "} \\theta_j \\varepsilon_{t-j} + \\varepsilon_t")
+    }
+    
+    var_eq <- switch(
+      vmodel,
+      "sGARCH"   = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} \\alpha_i \\varepsilon_{t-i}^2 + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+      "gjrGARCH" = paste0("\\sigma_t^2 = \\omega + \\sum_{i=1}^{", vq, "} (\\alpha_i \\varepsilon_{t-i}^2 + \\gamma_i \\varepsilon_{t-i}^2\\,\\mathbb{I}(\\varepsilon_{t-i}<0)) + \\sum_{j=1}^{", vp, "} \\beta_j \\sigma_{t-j}^2"),
+      "eGARCH"   = paste0("\\log(\\sigma_t^2) = \\omega + \\sum_{i=1}^{", vq, "} (\\alpha_i |z_{t-i}| + \\gamma_i z_{t-i}) + \\sum_{j=1}^{", vp, "} \\beta_j \\log(\\sigma_{t-j}^2)"),
+      paste0("\\sigma_t^2 = \\omega + \\sum \\alpha \\varepsilon^2 + \\sum \\beta \\sigma^2")
+    )
+    
+    html <- paste0(
+      "<p><b>Mean equation:</b></p><div>$$", mean_eq, "$$</div>",
+      "<p><b>Variance equation:</b></p><div>$$", var_eq, "$$</div>",
+      "<p>Where $$\\varepsilon_t = \\sigma_t z_t$$.</p>"
+    )
+    
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "autogarch_eq_box")
+    }, once = TRUE)
+    
+    HTML(html)
+  })
+  
+  # ---- residuals + sigma
+  autogarch_resids <- reactive({
+    req(autogarch_best())
+    fit <- autogarch_best()$fit
+    z <- tryCatch(as.numeric(rugarch::residuals(fit, standardize = TRUE)), error = function(e) NULL)
+    validate(need(!is.null(z), "Cannot compute standardized residuals."))
+    z
+  })
+  
+  autogarch_sigma <- reactive({
+    req(autogarch_best())
+    fit <- autogarch_best()$fit
+    sig <- tryCatch(as.numeric(rugarch::sigma(fit)), error = function(e) NULL)
+    validate(need(!is.null(sig), "Cannot compute sigma."))
+    sig
+  })
+  
+  # ---- diagnostics plots
+  output$autogarch_resid_ts <- renderPlot({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    z <- autogarch_resids()
+    plot(z, type = "l", main = "Standardized residuals", ylab = "z_t", xlab = "t")
+    abline(h = 0, col = "red", lty = 2)
+  })
+  
+  output$autogarch_resid_acf <- renderPlot({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    z <- autogarch_resids()
+    stats::acf(z, main = "ACF of standardized residuals")
+  })
+  
+  output$autogarch_resid_hist <- renderPlot({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    z <- autogarch_resids()
+    hist(z, breaks = 30, main = "Histogram of z_t", xlab = "z_t")
+  })
+  
+  output$autogarch_resid_qq <- renderPlot({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    z <- autogarch_resids()
+    qqnorm(z, main = "Q–Q plot of z_t"); qqline(z, col = "red")
+  })
+  
+  output$autogarch_sigma_plot <- renderPlot({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    sig <- autogarch_sigma()
+    plot(sig, type = "l", main = "Conditional volatility (sigma)", ylab = "sigma_t", xlab = "t")
+  })
+  
+  # ---- residual tests text
+  output$autogarch_diag_tests <- renderPrint({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    z <- autogarch_resids()
+    
+    L <- as.integer(input$diag_lag)
+    if (!is.finite(L) || L < 1) L <- 12L
+    L <- max(1L, min(L, floor(length(z) / 2)))
+    
+    cat("Residual tests (standardized residuals z_t)\n")
+    cat("=======================================\n\n")
+    
+    lb1 <- Box.test(z,  lag = L, type = "Ljung-Box")
+    lb2 <- Box.test(z^2, lag = L, type = "Ljung-Box")
+    
+    cat("Ljung–Box on z_t:\n"); print(lb1); cat("\n")
+    cat("Ljung–Box on z_t^2:\n"); print(lb2); cat("\n")
+    
+    if (has_pkg("FinTS")) {
+      cat("ARCH LM test (FinTS::ArchTest):\n")
+      print(FinTS::ArchTest(z, lags = L)); cat("\n")
+    } else {
+      cat("ARCH LM test: FinTS not installed.\n\n")
+    }
+    
+    if (has_pkg("tseries")) {
+      cat("Jarque–Bera normality test (tseries):\n")
+      print(tseries::jarque.bera.test(z)); cat("\n")
+    } else {
+      cat("Jarque–Bera: tseries not installed.\n\n")
+    }
+  })
+  
+  # ---- forecast + accuracy
+  autogarch_forecast <- reactive({
+    req(autogarch_best())
+    b <- autogarch_best()
+    fit <- b$fit
+    s <- b$series
+    
+    n_test <- as.integer(s$test_n); if (!is.finite(n_test)) n_test <- 0L
+    n_train <- as.integer(s$train_n)
+    
+    if (n_test > 0) {
+      h <- n_test
+    } else {
+      h_in <- suppressWarnings(as.integer(input$autogarch_h))
+      if (!is.finite(h_in) || h_in < 1) h_in <- 20L
+      h <- h_in
+    }
+    
+    fc <- rugarch::ugarchforecast(fit, n.ahead = h)
+    
+    mu <- tryCatch(as.numeric(rugarch::fitted(fc)), error = function(e) rep(NA_real_, h))
+    sig <- tryCatch(as.numeric(rugarch::sigma(fc)), error = function(e) rep(NA_real_, h))
+    
+    list(h = h, fc = fc, mu = mu, sigma = sig)
+  })
+  
+  output$autogarch_horizon_note <- renderPrint({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    s <- autogarch_series()
+    if (s$test_n > 0) {
+      cat("Holdout test set detected. Forecast horizon h was set to the test length (h =", s$test_n, ").\n")
+    } else {
+      h <- autogarch_forecast()$h
+      cat("No test set detected. Forecast horizon h was set to", h, "using the Auto-GARCH horizon input.\n")
+    }
+  })
+  
+  output$autogarch_accuracy_table <- renderTable({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    b <- autogarch_best()
+    s <- b$series
+    if (s$test_n <= 0) return(NULL)
+    
+    y <- b$series$y
+    y_test <- y[(s$train_n + 1):(s$train_n + s$test_n)]
+    
+    mu <- autogarch_forecast()$mu[seq_along(y_test)]
+    validate(need(length(mu) == length(y_test), "Forecast length mismatch."))
+    
+    accuracy_df(y_test, mu)
+  }, rownames = FALSE)
+  
+  output$autogarch_forecast_table <- renderTable({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    f <- autogarch_forecast()
+    h <- f$h
+    out <- data.frame(
+      step = 1:h,
+      mean_forecast = f$mu,
+      sigma_forecast = if (isTRUE(input$autogarch_forecast_sigma)) f$sigma else NA_real_
+    )
+    out
+  }, digits = 6)
+  
+  output$autogarch_forecast_plot <- renderPlot({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    b <- autogarch_best()
+    s <- b$series
+    y <- b$series$y
+    
+    f <- autogarch_forecast()
+    h <- f$h
+    
+    # plot last window + forecast
+    n <- length(y)
+    window <- min(200, n)
+    y_tail <- y[(n - window + 1):n]
+    
+    plot(y_tail, type = "l", main = "Auto-GARCH: mean forecast", ylab = "Series", xlab = "t (tail)")
+    lines((window + 1):(window + h), f$mu, col = "blue", lwd = 2)
+    
+    if (isTRUE(input$autogarch_forecast_sigma)) {
+      # simple +/- 2*sigma band for visualization
+      up <- f$mu + 2 * f$sigma
+      lo <- f$mu - 2 * f$sigma
+      lines((window + 1):(window + h), up, col = "gray40", lty = 2)
+      lines((window + 1):(window + h), lo, col = "gray40", lty = 2)
+      legend("topleft", legend = c("history", "mean forecast", "±2 sigma"), col = c("black","blue","gray40"),
+             lty = c(1,1,2), bty = "n")
+    } else {
+      legend("topleft", legend = c("history", "mean forecast"), col = c("black","blue"),
+             lty = c(1,1), bty = "n")
+    }
+  })
+  
+  # ---- APA paragraph (Auto-GARCH)
+  output$autogarch_apa_paragraph <- renderPrint({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    req(autogarch_best())
+    b <- autogarch_best()
+    m <- b$meta[1, ]
+    
+    ic <- rugarch::infocriteria(b$fit)
+    aic <- as.numeric(ic["Akaike"])
+    bic <- as.numeric(ic["Bayes"])
+    
+    z <- autogarch_resids()
+    L <- as.integer(input$diag_lag); if (!is.finite(L) || L < 1) L <- 12L
+    L <- max(1L, min(L, floor(length(z) / 2)))
+    
+    lbz  <- Box.test(z, lag = L, type = "Ljung-Box")
+    lbz2 <- Box.test(z^2, lag = L, type = "Ljung-Box")
+    
+    cat(
+      "An Auto-GARCH search selected a ", m$vmodel, " model with GARCH order (",
+      m$garch_p, ", ", m$garch_q, "), ARMA(", m$ar, ", ", m$ma, ") mean, and ",
+      m$dist, " innovations. Model fit was summarized by AIC = ", fmt_num(aic, 3),
+      " and BIC = ", fmt_num(bic, 3), ". Residual diagnostics indicated Ljung–Box ",
+      "tests on standardized residuals z_t (Q(", L, ") = ", fmt_num(lbz$statistic, 3),
+      ", p ", fmt_p(lbz$p.value), ") and on squared residuals z_t^2 (Q(", L, ") = ",
+      fmt_num(lbz2$statistic, 3), ", p ", fmt_p(lbz2$p.value), ").",
+      sep = ""
+    )
+  })
+  
+  # ---- Conclusion (academic) (Auto-GARCH)
+  output$autogarch_conclusion <- renderUI({
+    validate(need(input$fit_autogarch > 0, "Run Auto-GARCH Search first."))
+    req(autogarch_best())
+    
+    b <- autogarch_best()
+    m <- b$meta[1, ]
+    s <- b$series
+    n_train <- s$train_n
+    n_test  <- s$test_n
+    
+    # equation rendered elsewhere; conclusion references it + tests + accuracy
+    z <- autogarch_resids()
+    L <- as.integer(input$diag_lag); if (!is.finite(L) || L < 1) L <- 12L
+    L <- max(1L, min(L, floor(length(z) / 2)))
+    
+    lbz  <- Box.test(z, lag = L, type = "Ljung-Box")
+    lbz2 <- Box.test(z^2, lag = L, type = "Ljung-Box")
+    
+    ic <- rugarch::infocriteria(b$fit)
+    aic <- as.numeric(ic["Akaike"])
+    bic <- as.numeric(ic["Bayes"])
+    
+    # accuracy summary (if test exists)
+    acc_txt <- "No holdout test set was detected; therefore, out-of-sample accuracy was not computed."
+    if (n_test > 0) {
+      acc <- tryCatch(output$autogarch_accuracy_table(), error = function(e) NULL)
+      # better: recompute quickly
+      y <- b$series$y
+      y_test <- y[(n_train + 1):(n_train + n_test)]
+      mu <- autogarch_forecast()$mu[seq_along(y_test)]
+      e <- y_test - mu
+      rmse <- sqrt(mean(e^2, na.rm = TRUE))
+      mae  <- mean(abs(e), na.rm = TRUE)
+      acc_txt <- paste0("Forecast accuracy on the test set (n = ", n_test, ") was RMSE = ", fmt_num(rmse, 3),
+                        " and MAE = ", fmt_num(mae, 3), ".")
+    }
+    
+    html <- paste0(
+      "<h4 style='margin-top:0;'>Auto-GARCH conclusion (academic)</h4>",
+      "<p><b>Selected specification.</b> The Auto-GARCH search selected <b>", m$vmodel,
+      "</b>(", m$garch_p, ",", m$garch_q, ") with ARMA(", m$ar, ",", m$ma,
+      ") mean and <b>", m$dist, "</b> innovations. Fit indices were AIC = ",
+      fmt_num(aic, 3), " and BIC = ", fmt_num(bic, 3), ".</p>",
+      "<p><b>Model adequacy.</b> Ljung–Box tests suggested ",
+      "Q(", L, ") = ", fmt_num(lbz$statistic, 3), " (p ", fmt_p(lbz$p.value),
+      ") for z<sub>t</sub> and Q(", L, ") = ", fmt_num(lbz2$statistic, 3),
+      " (p ", fmt_p(lbz2$p.value), ") for z<sub>t</sub><sup>2</sup>. ",
+      "When these are non-significant, the fitted variance dynamics are typically considered adequate.</p>",
+      "<p><b>Forecasting.</b> ", acc_txt, "</p>",
+      "<p><b>Overall.</b> The automated selection provides a defensible volatility model candidate. ",
+      "If residual tests indicate remaining dependence, refine the mean ARMA orders, broaden the order search, or consider alternative innovation distributions.</p>"
+    )
+    
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "autogarch_conclusion_box")
+    }, once = TRUE)
+    
+    HTML(html)
+  })
+  
+  
+  
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  
+  
+  
+  # # Manual SARIMAX selector UI
+  # output$sarimax_xreg_ui <- renderUI({
+  #   req(prepared())
+  #   df <- prepared()$df
+  #   
+  #   # exclude date/value columns if you have them; adjust names as needed
+  #   candidates <- setdiff(names(df), c(prepared()$date_col, prepared()$value_col))
+  #   candidates <- candidates[candidates != ""]
+  #   selectizeInput(
+  #     "sarimax_x_cols",
+  #     "Select X variables",
+  #     choices = candidates,
+  #     multiple = TRUE,
+  #     options = list(placeholder = "Choose one or more regressors…")
+  #   )
+  # })
+  # 
+  # 
+  # # Auto-SARIMAX selector UI
+  # output$autox_xreg_ui <- renderUI({
+  #   req(prepared())
+  #   df <- prepared()$df
+  #   candidates <- setdiff(names(df), c(prepared()$date_col, prepared()$value_col))
+  #   candidates <- candidates[candidates != ""]
+  #   selectizeInput(
+  #     "autox_x_cols",
+  #     "Select X variables",
+  #     choices = candidates,
+  #     multiple = TRUE,
+  #     options = list(placeholder = "Choose one or more regressors…")
+  #   )
+  # })
+  # 
+  # 
+  #   #   3) SARIMAX (Manual): fit, equation, diagnostics, forecast
+  #   
+  # # a) Fit
+  # sarimax_fit <- eventReactive(input$fit_sarimax, {
+  #   req(ts_train_test(), prepared())
+  #   
+  #   s <- ts_train_test()
+  #   y_train <- as.numeric(s$ts_train)
+  #   y_test  <- as.numeric(s$ts_test)
+  #   
+  #   train_n <- length(y_train)
+  #   test_n  <- length(y_test)
+  #   
+  #   df <- prepared()$df
+  #   xcols <- input$sarimax_x_cols %||% character(0)
+  #   
+  #   xs <- build_xreg_split(df, xcols, train_n, test_n, scale_x = isTRUE(input$sarimax_scale_x))
+  #   
+  #   # seasonal period
+  #   s_in <- suppressWarnings(as.integer(input$sx_s))
+  #   if (!is.finite(s_in)) s_in <- as.integer(prepared()$freq)
+  #   if (!is.finite(s_in) || s_in < 1) s_in <- 1L
+  #   
+  #   fit <- forecast::Arima(
+  #     y_train,
+  #     order = c(as.integer(input$sx_p), as.integer(input$sx_d), as.integer(input$sx_q)),
+  #     seasonal = list(order = c(as.integer(input$sx_P), as.integer(input$sx_D), as.integer(input$sx_Q)), period = s_in),
+  #     xreg = xs$x_train,
+  #     include.mean = isTRUE(input$sarimax_drift),
+  #     include.drift = isTRUE(input$sarimax_drift),
+  #     method = "ML"
+  #   )
+  #   
+  #   list(
+  #     fit = fit,
+  #     xcols = xcols,
+  #     x_train = xs$x_train,
+  #     x_test = xs$x_test,
+  #     y_train = y_train,
+  #     y_test = y_test,
+  #     period = s_in
+  #   )
+  # })
+  # 
+  # 
+  # # b) Model spec + coefs
+  # output$sarimax_model_spec <- renderPrint({
+  #   validate(need(input$fit_sarimax > 0, "Click Fit to estimate SARIMAX."))
+  #   req(sarimax_fit())
+  #   print(sarimax_fit()$fit)
+  # })
+  # 
+  # output$sarimax_coef_table <- renderTable({
+  #   req(sarimax_fit())
+  #   sm <- summary(sarimax_fit()$fit)
+  #   co <- as.data.frame(sm$coef)
+  #   co$term <- rownames(co)
+  #   rownames(co) <- NULL
+  #   co <- co[, c("term", names(co)[1:(ncol(co)-1)]), drop = FALSE]
+  #   co
+  # }, digits = 5)
+  # 
+  # 
+  # 
+  # # c) Equation (MathJax)
+  # output$sarimax_model_equation <- renderUI({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX to show the equation."))
+  #   req(sarimax_fit())
+  #   obj <- sarimax_fit()
+  #   xcols <- obj$xcols
+  #   
+  #   # build LaTeX for regression part
+  #   x_part <- if (length(xcols) == 0) {
+  #     "0"
+  #   } else {
+  #     paste0("\\sum_{k=1}^{", length(xcols), "} \\beta_k x_{k,t}")
+  #   }
+  #   
+  #   # mean equation (generic SARIMAX)
+  #   mean_eq <- paste0(
+  #     "y_t = c + ", x_part, " + \\varepsilon_t"
+  #   )
+  #   
+  #   # full SARIMA operator form (generic)
+  #   op_eq <- paste0(
+  #     "\\Phi(B^s)\\phi(B)(1-B)^d(1-B^s)^D y_t = c + ",
+  #     x_part, " + \\Theta(B^s)\\theta(B)\\varepsilon_t"
+  #   )
+  #   
+  #   html <- paste0(
+  #     "<p><b>Regression mean equation:</b></p><div>$$", mean_eq, "$$</div>",
+  #     "<p><b>SARIMAX operator form:</b></p><div>$$", op_eq, "$$</div>"
+  #   )
+  #   
+  #   session$onFlushed(function() {
+  #     session$sendCustomMessage("mathjax-typeset", "sarimax_eq_box")
+  #   }, once = TRUE)
+  #   
+  #   HTML(html)
+  # })
+  # 
+  # 
+  # 
+  # # d) Diagnostics plots + residual tests
+  # sarimax_resid <- reactive({
+  #   req(sarimax_fit())
+  #   as.numeric(residuals(sarimax_fit()$fit))
+  # })
+  # 
+  # output$sarimax_resid_ts <- renderPlot({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   r <- sarimax_resid()
+  #   plot(r, type = "l", main = "Residuals", ylab = "e_t", xlab = "t")
+  #   abline(h = 0, col = "red", lty = 2)
+  # })
+  # 
+  # output$sarimax_resid_acf <- renderPlot({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   stats::acf(sarimax_resid(), main = "ACF of residuals")
+  # })
+  # 
+  # output$sarimax_resid_hist <- renderPlot({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   hist(sarimax_resid(), breaks = 30, main = "Residual histogram", xlab = "e_t")
+  # })
+  # 
+  # output$sarimax_resid_qq <- renderPlot({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   r <- sarimax_resid()
+  #   qqnorm(r, main = "Q–Q plot"); qqline(r, col = "red")
+  # })
+  # 
+  # output$sarimax_resid_lb_pvals <- renderPlot({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   r <- sarimax_resid()
+  #   maxL <- max(5, as.integer(input$diag_lag))
+  #   lags <- 1:maxL
+  #   pvals <- sapply(lags, function(L) {
+  #     out <- tryCatch(Box.test(r, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+  #     if (is.null(out)) NA_real_ else out$p.value
+  #   })
+  #   plot(lags, pvals, type = "b", pch = 16, ylim = c(0,1),
+  #        main = "Ljung–Box p-values by lag", xlab = "Lag", ylab = "p-value")
+  #   abline(h = 0.05, col = "red", lty = 2)
+  # })
+  # 
+  # output$sarimax_diag_tests <- renderPrint({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   r <- sarimax_resid()
+  #   L <- as.integer(input$diag_lag); if (!is.finite(L) || L < 1) L <- 12L
+  #   cat("Residual tests (SARIMAX)\n=======================\n\n")
+  #   print(Box.test(r, lag = L, type = "Ljung-Box"))
+  #   cat("\n")
+  #   if (requireNamespace("tseries", quietly = TRUE)) {
+  #     print(tseries::jarque.bera.test(r))
+  #     cat("\n")
+  #   }
+  # })
+  # 
+  # # e) Forecast & accuracy
+  # sarimax_forecast <- reactive({
+  #   req(sarimax_fit())
+  #   obj <- sarimax_fit()
+  #   
+  #   n_test <- length(obj$y_test)
+  #   if (n_test > 0) {
+  #     h <- n_test
+  #   } else {
+  #     h_in <- suppressWarnings(as.integer(input$sarimax_h))
+  #     if (!is.finite(h_in) || h_in < 1) h_in <- 20L
+  #     h <- h_in
+  #   }
+  #   
+  #   xfuture <- if (is.null(obj$x_test) || n_test == 0) {
+  #     # future mode: require user-provided future X? If absent, set zeros.
+  #     if (is.null(obj$x_train)) NULL else matrix(0, nrow = h, ncol = ncol(obj$x_train),
+  #                                                dimnames = list(NULL, colnames(obj$x_train)))
+  #   } else {
+  #     obj$x_test
+  #   }
+  #   
+  #   fc <- forecast::forecast(obj$fit, h = h, xreg = xfuture)
+  #   list(fc = fc, h = h, xfuture = xfuture)
+  # })
+  # 
+  # output$sarimax_horizon_note <- renderPrint({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   obj <- sarimax_fit()
+  #   if (length(obj$y_test) > 0) {
+  #     cat("Holdout test detected. Forecast horizon h was set to test length (h =", length(obj$y_test), ").\n")
+  #   } else {
+  #     cat("No test set detected. Forecast horizon uses sarimax_h (or default).\n")
+  #     cat("Note: future X values are set to 0 unless you implement a future-X input.\n")
+  #   }
+  # })
+  # 
+  # output$sarimax_forecast_plot <- renderPlot({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   plot(sarimax_forecast()$fc, main = "SARIMAX forecast")
+  # })
+  # 
+  # output$sarimax_forecast_table <- renderTable({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   fc <- sarimax_forecast()$fc
+  #   out <- data.frame(
+  #     t = seq_along(fc$mean),
+  #     mean = as.numeric(fc$mean),
+  #     lo80 = as.numeric(fc$lower[,1]),
+  #     hi80 = as.numeric(fc$upper[,1]),
+  #     lo95 = as.numeric(fc$lower[,2]),
+  #     hi95 = as.numeric(fc$upper[,2])
+  #   )
+  #   out
+  # }, digits = 6)
+  # 
+  # output$sarimax_accuracy_table <- renderTable({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   obj <- sarimax_fit()
+  #   if (length(obj$y_test) == 0) return(NULL)
+  #   
+  #   y_test <- obj$y_test
+  #   y_hat <- as.numeric(sarimax_forecast()$fc$mean)
+  #   accuracy_df(y_test, y_hat)
+  # }, rownames = FALSE)
+  # 
+  # output$apa_sarimax_paragraph <- renderPrint({
+  #   validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+  #   obj <- sarimax_fit()
+  #   fit <- obj$fit
+  #   sm <- summary(fit)
+  #   cat("A SARIMAX model was estimated with exogenous regressors (xreg) to model the mean structure while capturing seasonal and non-seasonal dynamics. ",
+  #       "The fitted specification was ", as.character(fit),
+  #       ". Model adequacy was assessed via residual diagnostics (ACF and Ljung–Box), and forecasts were generated using the available exogenous information.",
+  #       sep = "")
+  # })
+  # 
+  # 
+  # 
+  # 
+  # #==============================================================
+  # # 4) Auto-SARIMAX: fit + outputs (parallel to Auto-ARIMA)
+  # #==============================================================
+  # 
+  # # a) Fit
+  # autox_fit <- eventReactive(input$fit_autox, {
+  #   req(ts_train_test(), prepared())
+  #   
+  #   s <- ts_train_test()
+  #   y_train <- as.numeric(s$ts_train)
+  #   y_test  <- as.numeric(s$ts_test)
+  #   
+  #   train_n <- length(y_train)
+  #   test_n  <- length(y_test)
+  #   
+  #   df <- prepared()$df
+  #   xcols <- input$autox_x_cols %||% character(0)
+  #   xs <- build_xreg_split(df, xcols, train_n, test_n, scale_x = isTRUE(input$autox_scale_x))
+  #   
+  #   fit <- forecast::auto.arima(
+  #     y_train,
+  #     xreg = xs$x_train,
+  #     seasonal = isTRUE(input$autox_seasonal),
+  #     stepwise = isTRUE(input$autox_stepwise),
+  #     approximation = isTRUE(input$autox_approx),
+  #     allowmean = isTRUE(input$autox_allow_mean),
+  #     allowdrift = isTRUE(input$autox_allow_mean),
+  #     max.order = as.integer(input$autox_max_order)
+  #   )
+  #   
+  #   list(
+  #     fit = fit,
+  #     xcols = xcols,
+  #     x_train = xs$x_train,
+  #     x_test = xs$x_test,
+  #     y_train = y_train,
+  #     y_test = y_test
+  #   )
+  # })
+  # 
+  # 
+  # # b) Outputs
+  # output$autox_model_spec <- renderPrint({
+  #   validate(need(input$fit_autox > 0, "Click Fit Auto-SARIMAX first."))
+  #   req(autox_fit())
+  #   print(autox_fit()$fit)
+  # })
+  # 
+  # output$autox_coef_table <- renderTable({
+  #   req(autox_fit())
+  #   sm <- summary(autox_fit()$fit)
+  #   co <- as.data.frame(sm$coef)
+  #   co$term <- rownames(co)
+  #   rownames(co) <- NULL
+  #   co
+  # }, digits = 5)
+  # 
+  # output$autox_model_equation <- renderUI({
+  #   validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX to show the equation."))
+  #   req(autox_fit())
+  #   obj <- autox_fit()
+  #   xcols <- obj$xcols
+  #   
+  #   x_part <- if (length(xcols) == 0) "0" else paste0("\\sum_{k=1}^{", length(xcols), "} \\beta_k x_{k,t}")
+  #   mean_eq <- paste0("y_t = c + ", x_part, " + \\varepsilon_t")
+  #   
+  #   html <- paste0(
+  #     "<p><b>Regression mean equation:</b></p><div>$$", mean_eq, "$$</div>",
+  #     "<p><b>Selected ARIMA structure (from auto.arima):</b> ", as.character(obj$fit), "</p>"
+  #   )
+  #   
+  #   session$onFlushed(function() {
+  #     session$sendCustomMessage("mathjax-typeset", "autox_eq_box")
+  #   }, once = TRUE)
+  #   
+  #   HTML(html)
+  # })
+  
+  
+  
+
+  
+  
+  # =============================
+  # Auto-SARIMAX (auto.arima + xreg)
+  # =============================
+  
+  output$step5b_notes <- renderUI({
+    tags$div(
+      tags$ol(
+        tags$li("Select one or more exogenous regressors (X)."),
+        tags$li("Click “Fit Auto-SARIMAX”."),
+        tags$li("Inspect model specification and coefficients."),
+        tags$li("Check residual diagnostics and formal tests."),
+        tags$li("Review forecasts and (if available) test-set accuracy."),
+        tags$li(tags$b("Note:"), " If train_prop = 1 (no test set), future X values are assumed 0 unless you add a future-X input.")
+      )
+    )
+  })
+  
+  # ---- X selector UI (uses prepared()$df and excludes date/value columns if available)
+  output$autox_xreg_ui <- renderUI({
+    req(prepared())
+    df <- prepared()$df
+    
+    date_col  <- prepared()$date_col %||% character(0)
+    value_col <- prepared()$value_col %||% character(0)
+    
+    candidates <- setdiff(names(df), c(date_col, value_col))
+    candidates <- candidates[nzchar(candidates)]
+    
+    selectizeInput(
+      "autox_x_cols",
+      "Select X variables",
+      choices = candidates,
+      multiple = TRUE,
+      options = list(placeholder = "Choose one or more regressors…")
+    )
+  })
+  
+  # ---- Fit model (cached on Fit button)
+  autox_fit <- eventReactive(input$fit_autox, {
+    req(ts_train_test(), prepared())
+    validate(need(requireNamespace("forecast", quietly = TRUE), "Package 'forecast' is required for Auto-SARIMAX."))
+    
+    s <- ts_train_test()
+    y_train <- as.numeric(s$ts_train)
+    y_test  <- as.numeric(s$ts_test)
+    
+    train_n <- length(y_train)
+    test_n  <- length(y_test)
+    
+    df <- prepared()$df
+    xcols <- input$autox_x_cols %||% character(0)
+    
+    xs <- build_xreg_split(
+      df = df,
+      cols = xcols,
+      train_n = train_n,
+      test_n  = test_n,
+      scale_x = isTRUE(input$autox_scale_x)
+    )
+    
+    fit <- forecast::auto.arima(
+      y_train,
+      xreg = xs$x_train,
+      seasonal = isTRUE(input$autox_seasonal),
+      stepwise = isTRUE(input$autox_stepwise),
+      approximation = isTRUE(input$autox_approx),
+      allowmean = isTRUE(input$autox_allow_mean),
+      allowdrift = isTRUE(input$autox_allow_mean),
+      max.order = as.integer(input$autox_max_order)
+    )
+    
+    list(
+      fit = fit,
+      xcols = xcols,
+      x_train = xs$x_train,
+      x_test  = xs$x_test,
+      y_train = y_train,
+      y_test  = y_test
+    )
+  })
+  
+  # ---- Spec
+  output$autox_model_spec <- renderPrint({
+    validate(need(input$fit_autox > 0, "Click “Fit Auto-SARIMAX” first."))
+    req(autox_fit())
+    print(autox_fit()$fit)
+  })
+  
+  # ---- Coefs
+  output$autox_coef_table <- renderTable({
+    req(autox_fit())
+    sm <- summary(autox_fit()$fit)
+    co <- as.data.frame(sm$coef)
+    co$Term <- rownames(co)
+    rownames(co) <- NULL
+    co <- co[, c("Term", setdiff(names(co), "Term")), drop = FALSE]
+    co
+  }, digits = 6)
+  
+  # ---- Equation (MathJax, rendered like GARCH style)
+  output$autox_model_equation <- renderUI({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX to show the equation."))
+    req(autox_fit())
+    obj <- autox_fit()
+    
+    xcols <- obj$xcols
+    x_part <- if (length(xcols) == 0) {
+      "0"
+    } else {
+      paste0("\\sum_{k=1}^{", length(xcols), "} \\beta_k x_{k,t}")
+    }
+    
+    mean_eq <- paste0("y_t = c + ", x_part, " + \\varepsilon_t")
+    
+    html <- paste0(
+      "<p><b>Mean (regression) equation:</b></p><div>$$", mean_eq, "$$</div>",
+      "<p><b>Selected ARIMA structure (auto.arima):</b> ", as.character(obj$fit), "</p>"
+    )
+    
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "autox_eq_box")
+    }, once = TRUE)
+    
+    HTML(html)
+  })
+  
+  # ---- Residuals
+  autox_resid <- reactive({
+    req(autox_fit())
+    as.numeric(residuals(autox_fit()$fit))
+  })
+  
+  # ---- Diagnostics plots
+  output$autox_resid_ts <- renderPlot({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    r <- autox_resid()
+    plot(r, type = "l", main = "Residuals", ylab = "e_t", xlab = "t")
+    abline(h = 0, col = "red", lty = 2)
+  })
+  
+  output$autox_resid_acf <- renderPlot({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    stats::acf(autox_resid(), main = "ACF of residuals")
+  })
+  
+  output$autox_resid_hist <- renderPlot({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    hist(autox_resid(), breaks = 30, main = "Residual histogram", xlab = "e_t")
+  })
+  
+  output$autox_resid_qq <- renderPlot({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    r <- autox_resid()
+    qqnorm(r, main = "Q–Q plot")
+    qqline(r, col = "red")
+  })
+  
+  output$autox_resid_lb_pvals <- renderPlot({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    r <- autox_resid()
+    maxL <- suppressWarnings(as.integer(input$diag_lag))
+    if (!is.finite(maxL) || maxL < 5) maxL <- 12L
+    lags <- 1:maxL
+    pvals <- sapply(lags, function(L) {
+      out <- tryCatch(Box.test(r, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+      if (is.null(out)) NA_real_ else out$p.value
+    })
+    plot(lags, pvals, type = "b", pch = 16, ylim = c(0, 1),
+         main = "Ljung–Box p-values by lag", xlab = "Lag", ylab = "p-value")
+    abline(h = 0.05, col = "red", lty = 2)
+  })
+  
+  # ---- Residual tests
+  output$autox_diag_tests <- renderPrint({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    r <- autox_resid()
+    
+    L <- suppressWarnings(as.integer(input$diag_lag))
+    if (!is.finite(L) || L < 1) L <- 12L
+    
+    cat("Residual tests (Auto-SARIMAX)\n========================\n\n")
+    cat("Ljung–Box:\n")
+    print(Box.test(r, lag = L, type = "Ljung-Box"))
+    cat("\n")
+    
+    if (requireNamespace("tseries", quietly = TRUE)) {
+      cat("Jarque–Bera normality test:\n")
+      print(tseries::jarque.bera.test(r))
+      cat("\n")
+    } else {
+      cat("Jarque–Bera: package 'tseries' not installed.\n\n")
+    }
+  })
+  
+  # ---- Forecast
+  autox_forecast <- reactive({
+    req(autox_fit())
+    validate(need(requireNamespace("forecast", quietly = TRUE), "Package 'forecast' is required."))
+    
+    obj <- autox_fit()
+    test_n <- length(obj$y_test)
+    
+    if (test_n > 0) {
+      h <- test_n
+      xfuture <- obj$x_test
+    } else {
+      h_in <- suppressWarnings(as.integer(input$autox_h))
+      if (!is.finite(h_in) || h_in < 1) h_in <- 20L
+      h <- h_in
+      
+      # No future X UI -> default zeros matrix with same columns as training X
+      xfuture <- if (is.null(obj$x_train)) NULL else
+        matrix(0, nrow = h, ncol = ncol(obj$x_train), dimnames = list(NULL, colnames(obj$x_train)))
+    }
+    
+    fc <- forecast::forecast(obj$fit, h = h, xreg = xfuture)
+    list(fc = fc, h = h)
+  })
+  
+  output$autox_horizon_note <- renderPrint({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    obj <- autox_fit()
+    if (length(obj$y_test) > 0) {
+      cat("Holdout test detected. Forecast horizon set to test length (h =", length(obj$y_test), ").\n")
+    } else {
+      cat("No test detected. Forecast horizon uses autox_h (or default). Future X is assumed 0 unless you add a future-X input.\n")
+    }
+  })
+  
+  output$autox_forecast_plot <- renderPlot({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    plot(autox_forecast()$fc, main = "Auto-SARIMAX forecast")
+  })
+  
+  output$autox_forecast_table <- renderTable({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    fc <- autox_forecast()$fc
+    data.frame(
+      step = seq_along(fc$mean),
+      mean = as.numeric(fc$mean),
+      lo80 = as.numeric(fc$lower[, 1]),
+      hi80 = as.numeric(fc$upper[, 1]),
+      lo95 = as.numeric(fc$lower[, 2]),
+      hi95 = as.numeric(fc$upper[, 2])
+    )
+  }, digits = 6)
+  
+  output$autox_accuracy_table <- renderTable({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    obj <- autox_fit()
+    if (length(obj$y_test) == 0) return(NULL)
+    
+    y_test <- obj$y_test
+    y_hat  <- as.numeric(autox_forecast()$fc$mean)
+    
+    if (exists("accuracy_df", mode = "function")) {
+      accuracy_df(y_test, y_hat)
+    } else {
+      e <- y_test - y_hat
+      data.frame(
+        Metric = c("RMSE", "MAE"),
+        Value  = c(sqrt(mean(e^2, na.rm = TRUE)), mean(abs(e), na.rm = TRUE))
+      )
+    }
+  }, rownames = FALSE)
+  
+  output$apa_autox_paragraph <- renderPrint({
+    validate(need(input$fit_autox > 0, "Fit Auto-SARIMAX first."))
+    obj <- autox_fit()
+    cat(
+      "An Auto-SARIMAX model was estimated using forecast::auto.arima with exogenous regressors (xreg). ",
+      "The selected specification was ", as.character(obj$fit),
+      ". Residual diagnostics (plots and Ljung–Box testing) were used to assess adequacy, and forecasts were generated conditional on the available xreg information.",
+      sep = ""
+    )
+  })
+  
+  
+  
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  
+  # =============================
+  # Manual SARIMAX (Arima + xreg)
+  # =============================
+  
+  `%||%` <- function(a, b) if (!is.null(a)) a else b  # only if you don't already have it
+  
+  output$step6b_notes <- renderUI({
+    tags$div(
+      tags$ol(
+        tags$li("Select one or more exogenous regressors (X)."),
+        tags$li("Choose the SARIMA orders (p,d,q)(P,D,Q)[s]."),
+        tags$li("Click Fit to estimate SARIMAX."),
+        tags$li("Check diagnostics and residual tests."),
+        tags$li("Evaluate forecasts and (if available) test-set accuracy."),
+        tags$li(tags$b("Note:"), " If train_prop = 1 (no test set), future X values are assumed 0 unless you add a future-X input.")
+      )
+    )
+  })
+  
+  # ---- X selector UI
+  output$sarimax_xreg_ui <- renderUI({
+    req(prepared())
+    df <- prepared()$df
+    
+    date_col  <- prepared()$date_col %||% character(0)
+    value_col <- prepared()$value_col %||% character(0)
+    
+    candidates <- setdiff(names(df), c(date_col, value_col))
+    candidates <- candidates[nzchar(candidates)]
+    
+    selectizeInput(
+      "sarimax_x_cols",
+      "Select X variables",
+      choices = candidates,
+      multiple = TRUE,
+      options = list(placeholder = "Choose one or more regressors…")
+    )
+  })
+  
+  # ---- Split text/plot (simple; adjust if you already have a nicer split plot helper)
+  output$sarimax_split_text <- renderPrint({
+    req(ts_train_test())
+    s <- ts_train_test()
+    cat("Training length:", length(s$ts_train), "\n")
+    cat("Test length:", length(s$ts_test), "\n")
+  })
+  
+  output$sarimax_split_plot <- renderPlot({
+    req(ts_train_test())
+    s <- ts_train_test()
+    y <- as.numeric(s$ts_full)
+    n_train <- length(s$ts_train)
+    
+    plot(y, type = "l", main = "Train/Test split", xlab = "t", ylab = "y")
+    abline(v = n_train, col = "red", lty = 2)
+    legend("topleft", legend = c("Series", "Train/Test boundary"), col = c("black", "red"), lty = c(1,2), bty = "n")
+  })
+  
+  # ---- Fit SARIMAX (cached)
+  sarimax_fit <- eventReactive(input$fit_sarimax, {
+    req(ts_train_test(), prepared())
+    validate(need(requireNamespace("forecast", quietly = TRUE), "Package 'forecast' is required for SARIMAX."))
+    
+    s <- ts_train_test()
+    y_train <- as.numeric(s$ts_train)
+    y_test  <- as.numeric(s$ts_test)
+    
+    train_n <- length(y_train)
+    test_n  <- length(y_test)
+    
+    df <- prepared()$df
+    xcols <- input$sarimax_x_cols %||% character(0)
+    
+    xs <- build_xreg_split(
+      df = df,
+      cols = xcols,
+      train_n = train_n,
+      test_n  = test_n,
+      scale_x = isTRUE(input$sarimax_scale_x)
+    )
+    
+    # seasonal period: sx_s overrides sidebar frequency
+    s_in <- suppressWarnings(as.integer(input$sx_s))
+    if (!is.finite(s_in)) s_in <- suppressWarnings(as.integer(prepared()$freq))
+    if (!is.finite(s_in) || s_in < 1) s_in <- 1L
+    
+    p <- as.integer(input$sx_p); if (!is.finite(p) || p < 0) p <- 0L
+    d <- as.integer(input$sx_d); if (!is.finite(d) || d < 0) d <- 0L
+    q <- as.integer(input$sx_q); if (!is.finite(q) || q < 0) q <- 0L
+    
+    P <- as.integer(input$sx_P); if (!is.finite(P) || P < 0) P <- 0L
+    D <- as.integer(input$sx_D); if (!is.finite(D) || D < 0) D <- 0L
+    Q <- as.integer(input$sx_Q); if (!is.finite(Q) || Q < 0) Q <- 0L
+    
+    drift <- isTRUE(input$sarimax_drift)
+    
+    fit <- forecast::Arima(
+      y_train,
+      order = c(p, d, q),
+      seasonal = list(order = c(P, D, Q), period = s_in),
+      xreg = xs$x_train,
+      include.mean = drift,
+      include.drift = drift,
+      method = "ML"
+    )
+    
+    list(
+      fit = fit,
+      xcols = xcols,
+      x_train = xs$x_train,
+      x_test  = xs$x_test,
+      y_train = y_train,
+      y_test  = y_test,
+      period  = s_in,
+      orders  = list(p=p,d=d,q=q,P=P,D=D,Q=Q)
+    )
+  })
+  
+  # ---- Model spec
+  output$sarimax_model_spec <- renderPrint({
+    validate(need(input$fit_sarimax > 0, "Click Fit SARIMAX first."))
+    req(sarimax_fit())
+    print(sarimax_fit()$fit)
+  })
+  
+  # ---- Coef table
+  output$sarimax_coef_table <- renderTable({
+    req(sarimax_fit())
+    sm <- summary(sarimax_fit()$fit)
+    co <- as.data.frame(sm$coef)
+    co$Term <- rownames(co)
+    rownames(co) <- NULL
+    co <- co[, c("Term", setdiff(names(co), "Term")), drop = FALSE]
+    co
+  }, digits = 6)
+  
+  # ---- Equation (MathJax)
+  output$sarimax_model_equation <- renderUI({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX to show the equation."))
+    req(sarimax_fit())
+    obj <- sarimax_fit()
+    
+    k <- length(obj$xcols)
+    
+    x_part <- if (k == 0) {
+      "0"
+    } else {
+      paste0("\\sum_{k=1}^{", k, "} \\beta_k x_{k,t}")
+    }
+    
+    mean_eq <- paste0("y_t = c + ", x_part, " + \\varepsilon_t")
+    
+    # Operator form for SARIMAX (generic)
+    op_eq <- paste0(
+      "\\Phi(B^s)\\phi(B)(1-B)^d(1-B^s)^D y_t = c + ",
+      x_part,
+      " + \\Theta(B^s)\\theta(B)\\varepsilon_t"
+    )
+    
+    html <- paste0(
+      "<p><b>Regression mean equation:</b></p><div>$$", mean_eq, "$$</div>",
+      "<p><b>SARIMAX operator form:</b></p><div>$$", op_eq, "$$</div>"
+    )
+    
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "sarimax_eq_box")
+    }, once = TRUE)
+    
+    HTML(html)
+  })
+  
+  # ---- Residuals
+  sarimax_resid <- reactive({
+    req(sarimax_fit())
+    as.numeric(residuals(sarimax_fit()$fit))
+  })
+  
+  # ---- Diagnostics plots
+  output$sarimax_resid_ts <- renderPlot({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    r <- sarimax_resid()
+    plot(r, type = "l", main = "Residuals", ylab = "e_t", xlab = "t")
+    abline(h = 0, col = "red", lty = 2)
+  })
+  
+  output$sarimax_resid_acf <- renderPlot({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    stats::acf(sarimax_resid(), main = "ACF of residuals")
+  })
+  
+  output$sarimax_resid_hist <- renderPlot({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    hist(sarimax_resid(), breaks = 30, main = "Residual histogram", xlab = "e_t")
+  })
+  
+  output$sarimax_resid_qq <- renderPlot({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    r <- sarimax_resid()
+    qqnorm(r, main = "Q–Q plot"); qqline(r, col = "red")
+  })
+  
+  output$sarimax_resid_lb_pvals <- renderPlot({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    r <- sarimax_resid()
+    maxL <- suppressWarnings(as.integer(input$diag_lag))
+    if (!is.finite(maxL) || maxL < 5) maxL <- 12L
+    lags <- 1:maxL
+    pvals <- sapply(lags, function(L) {
+      out <- tryCatch(Box.test(r, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+      if (is.null(out)) NA_real_ else out$p.value
+    })
+    plot(lags, pvals, type = "b", pch = 16, ylim = c(0, 1),
+         main = "Ljung–Box p-values by lag", xlab = "Lag", ylab = "p-value")
+    abline(h = 0.05, col = "red", lty = 2)
+  })
+  
+  # ---- Residual tests
+  output$sarimax_diag_tests <- renderPrint({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    r <- sarimax_resid()
+    
+    L <- suppressWarnings(as.integer(input$diag_lag))
+    if (!is.finite(L) || L < 1) L <- 12L
+    
+    cat("Residual tests (Manual SARIMAX)\n==========================\n\n")
+    
+    cat("Ljung–Box:\n")
+    print(Box.test(r, lag = L, type = "Ljung-Box"))
+    cat("\n")
+    
+    if (requireNamespace("tseries", quietly = TRUE)) {
+      cat("Jarque–Bera normality test:\n")
+      print(tseries::jarque.bera.test(r))
+      cat("\n")
+    } else {
+      cat("Jarque–Bera: package 'tseries' not installed.\n\n")
+    }
+  })
+  
+  # ---- Forecast
+  sarimax_forecast <- reactive({
+    req(sarimax_fit())
+    validate(need(requireNamespace("forecast", quietly = TRUE), "Package 'forecast' is required."))
+    
+    obj <- sarimax_fit()
+    test_n <- length(obj$y_test)
+    
+    if (test_n > 0) {
+      h <- test_n
+      xfuture <- obj$x_test
+    } else {
+      h_in <- suppressWarnings(as.integer(input$sarimax_h))
+      if (!is.finite(h_in) || h_in < 1) h_in <- 20L
+      h <- h_in
+      
+      # No future X UI -> default zeros
+      xfuture <- if (is.null(obj$x_train)) NULL else
+        matrix(0, nrow = h, ncol = ncol(obj$x_train), dimnames = list(NULL, colnames(obj$x_train)))
+    }
+    
+    fc <- forecast::forecast(obj$fit, h = h, xreg = xfuture)
+    list(fc = fc, h = h)
+  })
+  
+  output$sarimax_horizon_note <- renderPrint({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    obj <- sarimax_fit()
+    if (length(obj$y_test) > 0) {
+      cat("Holdout test detected. Forecast horizon set to test length (h =", length(obj$y_test), ").\n")
+    } else {
+      cat("No test detected. Forecast horizon uses sarimax_h (or default). Future X is assumed 0 unless you add a future-X input.\n")
+    }
+  })
+  
+  output$sarimax_forecast_plot <- renderPlot({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    plot(sarimax_forecast()$fc, main = "SARIMAX forecast")
+  })
+  
+  output$sarimax_forecast_table <- renderTable({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    fc <- sarimax_forecast()$fc
+    data.frame(
+      step = seq_along(fc$mean),
+      mean = as.numeric(fc$mean),
+      lo80 = as.numeric(fc$lower[, 1]),
+      hi80 = as.numeric(fc$upper[, 1]),
+      lo95 = as.numeric(fc$lower[, 2]),
+      hi95 = as.numeric(fc$upper[, 2])
+    )
+  }, digits = 6)
+  
+  output$sarimax_accuracy_table <- renderTable({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    obj <- sarimax_fit()
+    if (length(obj$y_test) == 0) return(NULL)
+    
+    y_test <- obj$y_test
+    y_hat  <- as.numeric(sarimax_forecast()$fc$mean)
+    
+    if (exists("accuracy_df", mode = "function")) {
+      accuracy_df(y_test, y_hat)
+    } else {
+      e <- y_test - y_hat
+      data.frame(
+        Metric = c("RMSE", "MAE"),
+        Value  = c(sqrt(mean(e^2, na.rm = TRUE)), mean(abs(e), na.rm = TRUE))
+      )
+    }
+  }, rownames = FALSE)
+  
+  # ---- APA paragraph
+  output$apa_sarimax_paragraph <- renderPrint({
+    validate(need(input$fit_sarimax > 0, "Fit SARIMAX first."))
+    obj <- sarimax_fit()
+    fit <- obj$fit
+    
+    cat(
+      "A SARIMAX model (seasonal ARIMA with exogenous regressors) was estimated using forecast::Arima with xreg predictors. ",
+      "The specified model was ", as.character(fit),
+      if (isTRUE(input$sarimax_drift)) " including a drift/mean term." else " without a drift/mean term.",
+      " Model adequacy was assessed using residual plots and Ljung–Box testing, and forecasts were generated conditional on the available exogenous information.",
+      sep = ""
+    )
+  })
+  
+  
+  
+  
+  
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  #=====================================================================================================
+  
+  
+  
+  # ============================
+  # ChatGPT-SARIMA (Manual) TAB
+  # ============================
+  
+  # ---- small helpers (safe if you already have them)
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  cg_fmt_num <- function(x, d = 3) {
+    if (length(x) == 0 || !is.finite(x)) return(NA_character_)
+    formatC(x, format = "f", digits = d)
+  }
+  cg_fmt_p <- function(p) {
+    if (!is.finite(p)) return("= NA")
+    if (p < 0.001) "< .001" else paste0("= ", cg_fmt_num(p, 3))
+  }
+  cg_sig_stars <- function(p) {
+    if (!is.finite(p)) return("")
+    if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else if (p < 0.1) "†" else ""
+  }
+  
+  output$cg_notes <- renderUI({
+    if (!isTRUE(input$cg_show_teaching)) return(NULL)
+    tags$div(
+      class = "alert alert-info",
+      tags$b("ChatGPT-SARIMA workflow:"),
+      tags$ol(
+        tags$li("Confirm stationarity/differencing decisions (d, D) on the Stationarity tab."),
+        tags$li("Use ACF/PACF patterns to propose p/q and P/Q (seasonal at lag s)."),
+        tags$li("Fit the model; then check residuals: they should resemble white noise."),
+        tags$li("If residual autocorrelation remains, adjust orders; if volatility clustering exists, consider GARCH.")
+      )
+    )
+  })
+  
+  # ---- Split summary + plot
+  output$cg_split_text <- renderPrint({
+    req(ts_train_test())
+    s <- ts_train_test()
+    cat("Training length:", length(s$ts_train), "\n")
+    cat("Test length:", length(s$ts_test), "\n")
+  })
+  
+  output$cg_split_plot <- renderPlot({
+    req(ts_train_test())
+    s <- ts_train_test()
+    y <- as.numeric(s$ts_full)
+    n_train <- length(s$ts_train)
+    
+    plot(y, type = "l", main = "Train/Test split", xlab = "t", ylab = "y")
+    abline(v = n_train, col = "red", lty = 2)
+    legend("topleft", legend = c("Series", "Train/Test boundary"),
+           col = c("black", "red"), lty = c(1, 2), bty = "n")
+  })
+  
+  # ---- Fit SARIMA (cached on button)
+  cg_fit <- eventReactive(input$fit_cg_sarima, {
+    req(ts_train_test())
+    validate(need(requireNamespace("forecast", quietly = TRUE), "Package 'forecast' is required."))
+    
+    s <- ts_train_test()
+    y_train <- as.numeric(s$ts_train)
+    y_test  <- as.numeric(s$ts_test)
+    
+    p <- as.integer(input$cg_p); if (!is.finite(p) || p < 0) p <- 0L
+    d <- as.integer(input$cg_d); if (!is.finite(d) || d < 0) d <- 0L
+    q <- as.integer(input$cg_q); if (!is.finite(q) || q < 0) q <- 0L
+    
+    P <- as.integer(input$cg_P); if (!is.finite(P) || P < 0) P <- 0L
+    D <- as.integer(input$cg_D); if (!is.finite(D) || D < 0) D <- 0L
+    Q <- as.integer(input$cg_Q); if (!is.finite(Q) || Q < 0) Q <- 0L
+    
+    s_in <- suppressWarnings(as.integer(input$cg_s))
+    if (!is.finite(s_in)) {
+      # try prepared()$freq if available, else default 1
+      s_in <- tryCatch(as.integer(prepared()$freq), error = function(e) NA_integer_)
+    }
+    if (!is.finite(s_in) || s_in < 1) s_in <- 1L
+    
+    include_mean <- isTRUE(input$cg_include_mean)
+    method <- as.character(input$cg_method) %||% "ML"
+    
+    fit <- forecast::Arima(
+      y_train,
+      order = c(p, d, q),
+      seasonal = list(order = c(P, D, Q), period = s_in),
+      include.mean = include_mean,
+      include.drift = include_mean,
+      method = method,
+      biasadj = isTRUE(input$cg_biasadj)
+    )
+    
+    list(
+      fit = fit,
+      y_train = y_train,
+      y_test  = y_test,
+      p=p, d=d, q=q, P=P, D=D, Q=Q, s=s_in,
+      include_mean = include_mean
+    )
+  })
+  
+  # ---- Model spec + IC table
+  output$cg_model_spec <- renderPrint({
+    validate(need(input$fit_cg_sarima > 0, "Click Fit to estimate ChatGPT-SARIMA."))
+    req(cg_fit())
+    print(cg_fit()$fit)
+  })
+  
+  output$cg_ic_table <- renderTable({
+    req(cg_fit())
+    fit <- cg_fit()$fit
+    data.frame(
+      Metric = c("AIC", "AICc", "BIC", "logLik"),
+      Value  = c(
+        as.numeric(fit$aic),
+        as.numeric(fit$aicc),
+        as.numeric(fit$bic),
+        as.numeric(stats::logLik(fit))
+      )
+    )
+  }, digits = 4)
+  
+  # ---- Coef table with stars
+  output$cg_coef_table <- renderTable({
+    req(cg_fit())
+    sm <- summary(cg_fit()$fit)
+    co <- as.data.frame(sm$coef)
+    co$Term <- rownames(co); rownames(co) <- NULL
+    names(co) <- c("Estimate", "Std.Error", "t.value", "Pr(>|t|)", "Term")
+    
+    co <- co[, c("Term", "Estimate", "Std.Error", "t.value", "Pr(>|t|)"), drop = FALSE]
+    co$Estimate <- as.numeric(co$Estimate)
+    co$Std.Error <- as.numeric(co$Std.Error)
+    co$`t.value` <- as.numeric(co$`t.value`)
+    co$`Pr(>|t|)` <- as.numeric(co$`Pr(>|t|)`)
+    
+    if (isTRUE(input$cg_show_stars)) {
+      co$Sig <- vapply(co$`Pr(>|t|)`, cg_sig_stars, character(1))
+    }
+    
+    co
+  }, digits = 6)
+  
+  # ---- Equation (MathJax) — rendered as HTML + forced typeset
+  output$cg_model_equation <- renderUI({
+    validate(need(input$fit_cg_sarima > 0, "Fit the model to generate the equation."))
+    req(cg_fit())
+    obj <- cg_fit()
+    
+    # Generic academic operator form
+    # (This avoids fragile “expanded numeric” equations and renders reliably.)
+    eq <- paste0(
+      "\\Phi(B^{", obj$s, "})\\,\\phi(B)\\,(1-B)^{", obj$d, "}(1-B^{", obj$s, "})^{", obj$D, "}\\,y_t = ",
+      if (obj$include_mean) "c + " else "",
+      "\\Theta(B^{", obj$s, "})\\,\\theta(B)\\,\\varepsilon_t"
+    )
+    
+    html <- paste0(
+      "<p><b>SARIMA operator form:</b></p>",
+      "<div>$$", eq, "$$</div>",
+      "<p><b>Selected orders:</b> SARIMA(",
+      obj$p, ",", obj$d, ",", obj$q, ")(",
+      obj$P, ",", obj$D, ",", obj$Q, ")[", obj$s, "]</p>"
+    )
+    
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "cg_eq_box")
+    }, once = TRUE)
+    
+    HTML(html)
+  })
+  
+  # ---- Residuals
+  cg_resid <- reactive({
+    req(cg_fit())
+    as.numeric(residuals(cg_fit()$fit))
+  })
+  
+  # ---- Diagnostics plots
+  output$cg_resid_ts <- renderPlot({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    r <- cg_resid()
+    plot(r, type = "l", main = "Residuals", ylab = "e_t", xlab = "t")
+    abline(h = 0, col = "red", lty = 2)
+  })
+  
+  output$cg_resid_acf <- renderPlot({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    stats::acf(cg_resid(), main = "ACF of residuals")
+  })
+  
+  output$cg_resid_hist <- renderPlot({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    hist(cg_resid(), breaks = 30, main = "Residual histogram", xlab = "e_t")
+  })
+  
+  output$cg_resid_qq <- renderPlot({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    r <- cg_resid()
+    qqnorm(r, main = "Q–Q plot"); qqline(r, col = "red")
+  })
+  
+  output$cg_lb_pvals <- renderPlot({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    r <- cg_resid()
+    maxL <- suppressWarnings(as.integer(input$diag_lag))
+    if (!is.finite(maxL) || maxL < 5) maxL <- 12L
+    
+    lags <- 1:maxL
+    pvals <- sapply(lags, function(L) {
+      out <- tryCatch(Box.test(r, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+      if (is.null(out)) NA_real_ else out$p.value
+    })
+    
+    plot(lags, pvals, type = "b", pch = 16, ylim = c(0, 1),
+         main = "Ljung–Box p-values by lag", xlab = "Lag", ylab = "p-value")
+    abline(h = 0.05, col = "red", lty = 2)
+  })
+  
+  # ---- Residual tests (text)
+  output$cg_resid_tests <- renderPrint({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    r <- cg_resid()
+    
+    L <- suppressWarnings(as.integer(input$diag_lag))
+    if (!is.finite(L) || L < 1) L <- 12L
+    
+    cat("Residual tests (ChatGPT-SARIMA)\n")
+    cat("================================\n\n")
+    
+    cat("Ljung–Box test on residuals:\n")
+    print(Box.test(r, lag = L, type = "Ljung-Box"))
+    cat("\n")
+    
+    if (requireNamespace("tseries", quietly = TRUE)) {
+      cat("Jarque–Bera normality test:\n")
+      print(tseries::jarque.bera.test(r))
+      cat("\n")
+    } else {
+      cat("Jarque–Bera: package 'tseries' not installed.\n\n")
+    }
+    
+    if (requireNamespace("FinTS", quietly = TRUE)) {
+      cat("ARCH LM test (FinTS::ArchTest):\n")
+      print(FinTS::ArchTest(r, lags = L))
+      cat("\n")
+    } else {
+      cat("ARCH LM: package 'FinTS' not installed.\n\n")
+    }
+  })
+  
+  # ---- Forecast + accuracy
+  cg_forecast <- reactive({
+    req(cg_fit())
+    validate(need(requireNamespace("forecast", quietly = TRUE), "Package 'forecast' is required."))
+    
+    obj <- cg_fit()
+    test_n <- length(obj$y_test)
+    
+    if (test_n > 0) {
+      h <- test_n
+    } else {
+      h_in <- suppressWarnings(as.integer(input$cg_h))
+      if (!is.finite(h_in) || h_in < 1) h_in <- 20L
+      h <- h_in
+    }
+    
+    fc <- forecast::forecast(obj$fit, h = h)
+    list(fc = fc, h = h)
+  })
+  
+  output$cg_horizon_note <- renderPrint({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    obj <- cg_fit()
+    if (length(obj$y_test) > 0) {
+      cat("Holdout test detected. Horizon set to test length (h =", length(obj$y_test), ").\n")
+    } else {
+      cat("No test detected. Horizon uses cg_h (or default).\n")
+    }
+  })
+  
+  output$cg_forecast_plot <- renderPlot({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    plot(cg_forecast()$fc, main = "ChatGPT-SARIMA forecast")
+  })
+  
+  output$cg_forecast_table <- renderTable({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    fc <- cg_forecast()$fc
+    
+    out <- data.frame(
+      step = seq_along(fc$mean),
+      mean = as.numeric(fc$mean)
+    )
+    
+    # intervals if present
+    if (!is.null(fc$lower) && !is.null(fc$upper) && isTRUE(input$cg_show_pi)) {
+      out$lo80 <- as.numeric(fc$lower[, 1])
+      out$hi80 <- as.numeric(fc$upper[, 1])
+      out$lo95 <- as.numeric(fc$lower[, 2])
+      out$hi95 <- as.numeric(fc$upper[, 2])
+    }
+    out
+  }, digits = 6)
+  
+  output$cg_accuracy_table <- renderTable({
+    validate(need(input$fit_cg_sarima > 0, "Fit ChatGPT-SARIMA first."))
+    obj <- cg_fit()
+    if (length(obj$y_test) == 0) return(NULL)
+    
+    y_test <- obj$y_test
+    y_hat <- as.numeric(cg_forecast()$fc$mean)
+    
+    if (exists("accuracy_df", mode = "function")) {
+      accuracy_df(y_test, y_hat)
+    } else {
+      e <- y_test - y_hat
+      data.frame(
+        Metric = c("RMSE", "MAE", "MAPE"),
+        Value = c(
+          sqrt(mean(e^2, na.rm = TRUE)),
+          mean(abs(e), na.rm = TRUE),
+          mean(abs(e / y_test), na.rm = TRUE)
+        )
+      )
+    }
+  }, rownames = FALSE)
+  
+  # ---- Academic conclusion: one UI that includes everything (tables, plots, tests, equation, narrative)
+  output$cg_conclusion_ui <- renderUI({
+    validate(
+      need(input$fit_cg_sarima > 0, "Click Fit to generate the academic conclusion.")
+    )
+    req(cg_fit())
+    
+    obj <- cg_fit()
+    fit <- obj$fit
+    r   <- cg_resid()
+    
+    # ---- core IC (safe)
+    aic  <- suppressWarnings(as.numeric(fit$aic))
+    aicc <- suppressWarnings(as.numeric(fit$aicc))
+    bic  <- suppressWarnings(as.numeric(fit$bic))
+    
+    aic_txt  <- if (is.finite(aic))  cg_fmt_num(aic,  2) else "NA"
+    aicc_txt <- if (is.finite(aicc)) cg_fmt_num(aicc, 2) else "NA"
+    bic_txt  <- if (is.finite(bic))  cg_fmt_num(bic,  2) else "NA"
+    
+    # ---- coefficient summary for narrative (ROBUST)
+    sm <- tryCatch(summary(fit), error = function(e) NULL)
+    
+    co_raw <- NULL
+    if (!is.null(sm)) {
+      if (!is.null(sm$coef)) co_raw <- sm$coef
+      if (is.null(co_raw) && !is.null(sm$coefficients)) co_raw <- sm$coefficients
+    }
+    
+    co <- if (!is.null(co_raw)) {
+      df <- as.data.frame(co_raw)
+      df$term <- rownames(df)
+      rownames(df) <- NULL
+      
+      # normalize column names to detect estimate/se/stat/p
+      nm  <- names(df)
+      nm0 <- tolower(gsub("[^a-z]+", "", nm))
+      
+      pick <- function(keys) {
+        idx <- which(nm0 %in% keys)
+        if (length(idx) == 0) NA_integer_ else idx[1]
+      }
+      
+      i_est <- pick(c("estimate", "est", "coef", "value"))
+      i_se  <- pick(c("se", "stderror", "stderr"))
+      i_st  <- pick(c("tvalue", "tstat", "zvalue", "zstat", "statistic"))
+      i_p   <- pick(c("prtt", "prgt", "prgtz", "pvalue", "p"))
+      
+      out <- data.frame(
+        term  = df$term,
+        est   = if (!is.na(i_est)) suppressWarnings(as.numeric(df[[i_est]])) else NA_real_,
+        se    = if (!is.na(i_se))  suppressWarnings(as.numeric(df[[i_se]]))  else NA_real_,
+        stat  = if (!is.na(i_st))  suppressWarnings(as.numeric(df[[i_st]]))  else NA_real_,
+        p     = if (!is.na(i_p))   suppressWarnings(as.numeric(df[[i_p]]))   else NA_real_,
+        stringsAsFactors = FALSE
+      )
+      
+      out$stars <- vapply(out$p, cg_sig_stars, character(1))
+      out
+    } else {
+      data.frame(term = character(0), est = numeric(0), se = numeric(0), stat = numeric(0), p = numeric(0), stars = character(0))
+    }
+    
+    n_sig <- sum(is.finite(co$p) & co$p < 0.05)
+    
+    # ---- residual tests quick stats for narrative
+    L <- suppressWarnings(as.integer(input$diag_lag))
+    if (!is.finite(L) || L < 1) L <- 12L
+    
+    lb <- tryCatch(Box.test(r, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+    
+    jb <- if (requireNamespace("tseries", quietly = TRUE)) {
+      tryCatch(tseries::jarque.bera.test(r), error = function(e) NULL)
+    } else NULL
+    
+    arch <- if (requireNamespace("FinTS", quietly = TRUE)) {
+      tryCatch(FinTS::ArchTest(r, lags = L), error = function(e) NULL)
+    } else NULL
+    
+    # ---- accuracy quick stats (if test)
+    acc_txt <- "No holdout test set was available; out-of-sample accuracy was not computed."
+    if (length(obj$y_test) > 0) {
+      y_test <- obj$y_test
+      fc_obj <- cg_forecast()
+      y_hat  <- if (!is.null(fc_obj) && !is.null(fc_obj$fc)) as.numeric(fc_obj$fc$mean) else rep(NA_real_, length(y_test))
+      
+      if (length(y_hat) == length(y_test) && any(is.finite(y_hat))) {
+        e <- y_test - y_hat
+        rmse <- sqrt(mean(e^2, na.rm = TRUE))
+        mae  <- mean(abs(e), na.rm = TRUE)
+        acc_txt <- paste0(
+          "Out-of-sample performance (test n = ", length(y_test),
+          ") was RMSE = ", cg_fmt_num(rmse, 3),
+          " and MAE = ", cg_fmt_num(mae, 3), "."
+        )
+      } else {
+        acc_txt <- paste0(
+          "A test set was detected (n = ", length(y_test),
+          "), but forecast values were not available or not finite; accuracy could not be computed."
+        )
+      }
+    }
+    
+    # ---- typeset equation in conclusion box
+    session$onFlushed(function() {
+      session$sendCustomMessage("mathjax-typeset", "cg_conclusion_box")
+    }, once = TRUE)
+    
+    tagList(
+      tags$h3("ChatGPT-SARIMA: Academic conclusion"),
+      
+      tags$div(
+        class = "cg-h",
+        tags$h4("1. Model objective and specification"),
+        tags$p(
+          "A manually specified seasonal ARIMA (SARIMA) model was estimated to capture both non-seasonal and seasonal dependence in the series.",
+          " The final specification was ",
+          tags$b(sprintf(
+            "SARIMA(%d,%d,%d)(%d,%d,%d)[%d]%s",
+            obj$p, obj$d, obj$q, obj$P, obj$D, obj$Q, obj$s,
+            if (isTRUE(obj$include_mean)) " with mean/drift." else " without mean/drift."
+          )),
+          "."
+        ),
+        tags$p(HTML(paste0(
+          "<b>Information criteria:</b> AIC = ", aic_txt,
+          ", AICc = ", aicc_txt,
+          ", BIC = ", bic_txt, "."
+        )))
+      ),
+      
+      tags$div(
+        class = "cg-h",
+        tags$h4("2. Coefficient inference and practical interpretation"),
+        tags$p(HTML(paste0(
+          "Coefficient inference was evaluated using approximate t-tests. ",
+          "A total of <b>", n_sig, "</b> parameters were statistically significant at α = .05 (see coefficient table)."
+        ))),
+        tags$p("Interpretation should prioritize model adequacy (white-noise residuals) and forecast performance rather than isolated p-values.")
+      ),
+      
+      tags$div(
+        class = "cg-h",
+        tags$h4("3. Model equation"),
+        tags$div(
+          style = "border:1px solid #e5e5e5; border-radius:6px; background:#fcfcfc; padding:10px;",
+          uiOutput("cg_model_equation")
+        )
+      ),
+      
+      tags$div(
+        class = "cg-h",
+        tags$h4("4. Diagnostic evidence"),
+        tags$p("Residual diagnostics were examined using time-domain plots, autocorrelation diagnostics, and distributional checks."),
+        fluidRow(
+          column(6, plotOutput("cg_resid_ts", height = 220)),
+          column(6, plotOutput("cg_resid_acf", height = 220))
+        ),
+        fluidRow(
+          column(6, plotOutput("cg_resid_hist", height = 220)),
+          column(6, plotOutput("cg_resid_qq", height = 220))
+        ),
+        plotOutput("cg_lb_pvals", height = 260)
+      ),
+      
+      tags$div(
+        class = "cg-h",
+        tags$h4("5. Residual tests (formal)"),
+        tags$p(
+          "The following tests provide formal evidence regarding remaining autocorrelation (Ljung–Box), ",
+          "departures from normality (Jarque–Bera), and conditional heteroskedasticity (ARCH LM)."
+        ),
+        verbatimTextOutput("cg_resid_tests"),
+        if (!is.null(lb)) tags$p(HTML(paste0(
+          "<b>Ljung–Box:</b> Q(", lb$parameter, ") = ", cg_fmt_num(lb$statistic, 3),
+          ", p ", cg_fmt_p(lb$p.value), "."
+        ))) else NULL,
+        if (!is.null(jb)) tags$p(HTML(paste0(
+          "<b>Jarque–Bera:</b> JB = ", cg_fmt_num(jb$statistic, 3),
+          ", p ", cg_fmt_p(jb$p.value), "."
+        ))) else NULL,
+        if (!is.null(arch)) tags$p(HTML(paste0(
+          "<b>ARCH LM:</b> TR^2 = ", cg_fmt_num(arch$statistic, 3),
+          ", p ", cg_fmt_p(arch$p.value), "."
+        ))) else NULL
+      ),
+      
+      tags$div(
+        class = "cg-h",
+        tags$h4("6. Forecasting and predictive performance"),
+        tags$p(acc_txt),
+        plotOutput("cg_forecast_plot", height = 380),
+        tags$h5("Forecast table"),
+        tableOutput("cg_forecast_table"),
+        tags$h5("Accuracy table (if test set available)"),
+        tableOutput("cg_accuracy_table")
+      ),
+      
+      tags$div(
+        class = "cg-h",
+        tags$h4("7. Final conclusion"),
+        tags$p(
+          "Overall, the fitted SARIMA model constitutes an interpretable baseline for linear seasonal dependence.",
+          " If residual tests indicate non-white-noise behavior (e.g., significant Ljung–Box), the model should be refined by adjusting AR/MA orders or differencing.",
+          " If ARCH effects remain, a conditional variance model (e.g., GARCH) is recommended as an extension for volatility clustering."
+        )
+      )
+    )
+  })
+  
+  
+  
+  
+  # output$cg_conclusion_ui <- renderUI({
+  #   validate(
+  #     need(input$fit_cg_sarima > 0, "Click Fit to generate the academic conclusion.")
+  #   )
+  #   req(cg_fit())
+  # 
+  # obj <- cg_fit()
+  # fit <- obj$fit
+  # r <- cg_resid()
+  # 
+  # # core IC
+  # aic  <- as.numeric(fit$aic)
+  # aicc <- as.numeric(fit$aicc)
+  # bic  <- as.numeric(fit$bic)
+  # 
+  # 
+  # # coefficient summary for narrative
+  # sm <- summary(fit)
+  # co <- as.data.frame(sm$coef)
+  # co$term <- rownames(co); rownames(co) <- NULL
+  # names(co) <- c("est","se","t","p","term")
+  # co$stars <- vapply(co$p, cg_sig_stars, character(1))
+  # 
+  # n_sig <- sum(is.finite(co$p) & co$p < 0.05)
+  # 
+  # # residual tests quick stats for narrative
+  # L <- suppressWarnings(as.integer(input$diag_lag))
+  # if (!is.finite(L) || L < 1) L <- 12L
+  # lb <- tryCatch(Box.test(r, lag = L, type = "Ljung-Box"), error = function(e) NULL)
+  # 
+  # jb <- if (requireNamespace("tseries", quietly = TRUE)) {
+  #   tryCatch(tseries::jarque.bera.test(r), error = function(e) NULL)
+  # } else NULL
+  # 
+  # arch <- if (requireNamespace("FinTS", quietly = TRUE)) {
+  #   tryCatch(FinTS::ArchTest(r, lags = L), error = function(e) NULL)
+  # } else NULL
+  # 
+  # # accuracy quick stats (if test)
+  # acc_txt <- "No holdout test set was available; out-of-sample accuracy was not computed."
+  # if (length(obj$y_test) > 0) {
+  #   y_test <- obj$y_test
+  #   y_hat <- as.numeric(cg_forecast()$fc$mean)
+  #   e <- y_test - y_hat
+  #   rmse <- sqrt(mean(e^2, na.rm = TRUE))
+  #   mae  <- mean(abs(e), na.rm = TRUE)
+  #   acc_txt <- paste0("Out-of-sample performance (test n = ", length(y_test),
+  #                     ") was RMSE = ", cg_fmt_num(rmse, 3),
+  #                     " and MAE = ", cg_fmt_num(mae, 3), ".")
+  # }
+  # 
+  # # typeset equation in conclusion box as well (safe)
+  # session$onFlushed(function() {
+  #   session$sendCustomMessage("mathjax-typeset", "cg_conclusion_box")
+  # }, once = TRUE)
+  # 
+  # tagList(
+  #   tags$h3("ChatGPT-SARIMA: Academic conclusion"),
+  #   
+  #   tags$div(class="cg-h",
+  #            tags$h4("1. Model objective and specification"),
+  #            tags$p(
+  #              "A manually specified seasonal ARIMA (SARIMA) model was estimated to capture both non-seasonal and seasonal dependence in the series.",
+  #              " The final specification was ",
+  #              tags$b(sprintf("SARIMA(%d,%d,%d)(%d,%d,%d)[%d]%s",
+  #                             obj$p, obj$d, obj$q, obj$P, obj$D, obj$Q, obj$s,
+  #                             if (obj$include_mean) " with mean/drift." else " without mean/drift.")),
+  #              "."
+  #            ),
+  #            tags$p(HTML(paste0(
+  #              "<b>Information criteria:</b> AIC = ", cg_fmt_num(aic, 2),
+  #              ", AICc = ", cg_fmt_num(aicc, 2),
+  #              ", BIC = ", cg_fmt_num(bic, 2), "."
+  #            )))
+  #   ),
+  #   
+  #   tags$div(class="cg-h",
+  #            tags$h4("2. Coefficient inference and practical interpretation"),
+  #            tags$p(HTML(paste0(
+  #              "Coefficient inference was evaluated using approximate t-tests. ",
+  #              "A total of <b>", n_sig, "</b> parameters were statistically significant at α = .05 (see coefficient table)."
+  #            ))),
+  #            tags$p("Interpretation should prioritize model adequacy (white-noise residuals) and forecast performance rather than isolated p-values.")
+  #   ),
+  #   
+  #   tags$div(class="cg-h",
+  #            tags$h4("3. Model equation"),
+  #            tags$div(
+  #              style="border:1px solid #e5e5e5; border-radius:6px; background:#fcfcfc; padding:10px;",
+  #              uiOutput("cg_model_equation")
+  #            )
+  #   ),
+  #   
+  #   tags$div(class="cg-h",
+  #            tags$h4("4. Diagnostic evidence"),
+  #            tags$p("Residual diagnostics were examined using time-domain plots, autocorrelation diagnostics, and distributional checks."),
+  #            fluidRow(
+  #              column(6, plotOutput("cg_resid_ts", height = 220)),
+  #              column(6, plotOutput("cg_resid_acf", height = 220))
+  #            ),
+  #            fluidRow(
+  #              column(6, plotOutput("cg_resid_hist", height = 220)),
+  #              column(6, plotOutput("cg_resid_qq", height = 220))
+  #            ),
+  #            plotOutput("cg_lb_pvals", height = 260)
+  #   ),
+  #   
+  #   tags$div(class="cg-h",
+  #            tags$h4("5. Residual tests (formal)"),
+  #            tags$p(
+  #              "The following tests provide formal evidence regarding remaining autocorrelation (Ljung–Box), ",
+  #              "departures from normality (Jarque–Bera), and conditional heteroskedasticity (ARCH LM)."
+  #            ),
+  #            verbatimTextOutput("cg_resid_tests"),
+  #            if (!is.null(lb)) tags$p(HTML(paste0(
+  #              "<b>Ljung–Box:</b> Q(", lb$parameter, ") = ", cg_fmt_num(lb$statistic, 3),
+  #              ", p ", cg_fmt_p(lb$p.value), "."
+  #            ))) else NULL,
+  #            if (!is.null(jb)) tags$p(HTML(paste0(
+  #              "<b>Jarque–Bera:</b> JB = ", cg_fmt_num(jb$statistic, 3),
+  #              ", p ", cg_fmt_p(jb$p.value), "."
+  #            ))) else NULL,
+  #            if (!is.null(arch)) tags$p(HTML(paste0(
+  #              "<b>ARCH LM:</b> TR^2 = ", cg_fmt_num(arch$statistic, 3),
+  #              ", p ", cg_fmt_p(arch$p.value), "."
+  #            ))) else NULL
+  #   ),
+  #   
+  #   tags$div(class="cg-h",
+  #            tags$h4("6. Forecasting and predictive performance"),
+  #            tags$p(acc_txt),
+  #            plotOutput("cg_forecast_plot", height = 380),
+  #            tags$h5("Forecast table"),
+  #            tableOutput("cg_forecast_table"),
+  #            tags$h5("Accuracy table (if test set available)"),
+  #            tableOutput("cg_accuracy_table")
+  #   ),
+  #   
+  #   tags$div(class="cg-h",
+  #            tags$h4("7. Final conclusion"),
+  #            tags$p(
+  #              "Overall, the fitted SARIMA model constitutes an interpretable baseline for linear seasonal dependence.",
+  #              " If residual tests indicate non-white-noise behavior (e.g., significant Ljung–Box), the model should be refined by adjusting AR/MA orders or differencing.",
+  #              " If ARCH effects remain, a conditional variance model (e.g., GARCH) is recommended as an extension for volatility clustering."
+  #            )
+  #   )
+  # )
+  # })
+
   
   
   
