@@ -155,7 +155,7 @@ ui <- fluidPage(
             # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui6")),
             tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui7")),
             # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui8")),
-            tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui9")),
+            # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui9")),
             
             
             

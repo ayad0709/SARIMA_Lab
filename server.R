@@ -427,7 +427,43 @@ gg_forecast_plot <- function(obs_df, train_n, fc_df, title) {
 
 
 
-
+apply_smart_date_axis <- function(g, ddf) {
+  if (!(inherits(ddf$t, "Date") || inherits(ddf$t, "POSIXct") || inherits(ddf$t, "POSIXt"))) return(g)
+  
+  span_days <- as.numeric(max(ddf$t, na.rm = TRUE) - min(ddf$t, na.rm = TRUE))
+  
+  # choose break spacing
+  brks <- if (!is.finite(span_days) || span_days <= 0) {
+    "1 year"
+  } else if (span_days <= 90) {
+    "1 week"
+  } else if (span_days <= 365) {
+    "1 month"
+  } else if (span_days <= 3 * 365) {
+    "3 months"
+  } else if (span_days <= 10 * 365) {
+    "1 year"
+  } else {
+    "2 years"
+  }
+  
+  # choose label format by zoom level
+  fmt <- if (!is.finite(span_days)) {
+    "%Y"
+  } else if (span_days <= 90) {
+    "%d/%m/%y"   # short span → day/month/year
+  } else if (span_days <= 3 * 365) {
+    "%m/%y"      # medium span → month/year
+  } else {
+    "%Y"         # long span → year only
+  }
+  
+  if (inherits(ddf$t, "POSIXct") || inherits(ddf$t, "POSIXt")) {
+    g + ggplot2::scale_x_datetime(date_breaks = brks, date_labels = fmt)
+  } else {
+    g + ggplot2::scale_x_date(date_breaks = brks, date_labels = fmt)
+  }
+}
 
 
 
@@ -7453,6 +7489,7 @@ server <- function(input, output, session) {
   
 
   # UI wrapper: uses textInput("plot_width"), textInput("plot_height")
+  
   output$d_D_Log_ts_Choice_UI <- renderUI({
     plotOutput(
       "d_D_Log_ts_Choice",
@@ -7460,6 +7497,28 @@ server <- function(input, output, session) {
       height = getPlotDim(input$plot_height %||% "500")
     )
   })
+  
+  # output$d_D_Log_ts_Choice <- renderPlot({
+  #   req(myData_Choice(), prepared())
+  #   
+  #   ts_obj <- myData_Choice()
+  #   p <- prepared()
+  #   
+  #   # build a date-aware df for the current transformed series
+  #   ddf <- df_ts(ts_obj)   # <-- reuse the same df_ts() you already use in tsPlot_Choice
+  #   
+  #   g <- ggplot2::ggplot(ddf, ggplot2::aes(t, y)) +
+  #     ggplot2::geom_line(size = 0.9) +
+  #     ggplot2::labs(
+  #       title = "Series after d / D / log choices",
+  #       x = p$x_label,
+  #       y = "Value"
+  #     )
+  #   
+  #   g <- apply_smart_date_axis(g, ddf)  # ✅ fixes the date labels / too many ticks
+  #   add_theme(g)
+  # })
+  
   
   
   # --- ggtsdisplay of the transformed series (time plot + ACF + PACF) ---
@@ -7782,11 +7841,100 @@ server <- function(input, output, session) {
     p      <- prepared()  # for x-axis label
     freq   <- tryCatch(stats::frequency(ts_obj), error = function(e) NA_real_)
     
+    # df_ts <- function(z) {
+    #   if (inherits(z, "ts")) {
+    #     data.frame(t = as.numeric(stats::time(z)), y = as.numeric(z))
+    #   } else {
+    #     data.frame(t = seq_along(z), y = as.numeric(z))
+    #   }
+    # }
+    
+    
+    # apply_smart_date_axis <- function(g, ddf) {
+    #   if (!(inherits(ddf$t, "Date") || inherits(ddf$t, "POSIXct") || inherits(ddf$t, "POSIXt"))) return(g)
+    #   
+    #   span_days <- as.numeric(max(ddf$t, na.rm = TRUE) - min(ddf$t, na.rm = TRUE))
+    #   
+    #   brks <- if (!is.finite(span_days) || span_days <= 0) {
+    #     "1 year"
+    #   } else if (span_days <= 90) {
+    #     "1 week"
+    #   } else if (span_days <= 365) {
+    #     "1 month"
+    #   } else if (span_days <= 3 * 365) {
+    #     "3 months"
+    #   } else if (span_days <= 10 * 365) {
+    #     "1 year"
+    #   } else {
+    #     "2 years"
+    #   }
+    #   
+    #   fmt <- if (span_days <= 365) "%d-%m-%Y" else "%d-%Y"
+    #   
+    #   if (inherits(ddf$t, "POSIXct") || inherits(ddf$t, "POSIXt")) {
+    #     g + ggplot2::scale_x_datetime(date_breaks = brks, date_labels = fmt)
+    #   } else {
+    #     g + ggplot2::scale_x_date(date_breaks = brks, date_labels = fmt)
+    #   }
+    # }
+    
+    
+
+    
+    
+    
+    ts_obj <- myData_Choice()
+    p      <- prepared()  # for x-axis label
+    freq   <- tryCatch(stats::frequency(ts_obj), error = function(e) NA_real_)
+    
+    # ------------------------------------------------------------
+    # ✅ DATE-AWARE helper: build plotting df using prepared()$df$x
+    # and align it after differencing (d and D).
+    # ------------------------------------------------------------
     df_ts <- function(z) {
-      if (inherits(z, "ts")) {
-        data.frame(t = as.numeric(stats::time(z)), y = as.numeric(z))
+      
+      # base date/index from prepared()
+      x_all <- p$df$x
+      has_dates <- !is.null(x_all) &&
+        (inherits(x_all, "Date") || inherits(x_all, "POSIXct") || inherits(x_all, "POSIXt"))
+      
+      # match the scope used by myData_Choice(): full vs train
+      s <- ts_train_test()
+      train_n <- s$train_n
+      
+      if (isTRUE(input$use_train_explore) && is.finite(train_n) && train_n >= 2) {
+        x0 <- x_all[seq_len(min(train_n, length(x_all)))]
       } else {
-        data.frame(t = seq_along(z), y = as.numeric(z))
+        x0 <- x_all
+      }
+      
+      # how many rows were dropped by differencing in getMyData()
+      f0 <- as.numeric(p$freq)
+      if (!is.finite(f0) || f0 < 1) f0 <- 1
+      
+      D <- suppressWarnings(as.integer(input$DS_n))
+      d <- suppressWarnings(as.integer(input$d_n))
+      if (!is.finite(D) || D < 0) D <- 0
+      if (!is.finite(d) || d < 0) d <- 0
+      
+      drop_n <- 0L
+      if (D > 0 && f0 > 1) drop_n <- drop_n + as.integer(D * f0)
+      if (d > 0)           drop_n <- drop_n + as.integer(d)
+      
+      y <- as.numeric(z)
+      
+      if (has_dates) {
+        # align x to differenced series
+        if (length(x0) > drop_n) {
+          x_use <- x0[(drop_n + 1L):length(x0)]
+        } else {
+          x_use <- x0
+        }
+        
+        n <- min(length(x_use), length(y))
+        data.frame(t = x_use[seq_len(n)], y = y[seq_len(n)])
+      } else {
+        data.frame(t = seq_along(y), y = y)
       }
     }
     
@@ -7796,50 +7944,102 @@ server <- function(input, output, session) {
     plt <- switch(
       input$plot_type_choice,
       
+      # ==========================================================
+      # ✅ FIXED "Line": use ggplot on date-aware df + smart thinning
+      # ==========================================================
+
+
       "Line" = {
-        forecast::autoplot(
-          ts_obj,
-          size   = 1,
-          colour = input$ts_line_color %||% "#2C7FB8"
-        ) +
-          ggplot2::labs(title = "Transformed series", x = p$x_label, y = "Transformed value")
+        ddf <- df_ts(ts_obj)
+        
+        g <- ggplot2::ggplot(ddf, ggplot2::aes(t, y)) +
+          ggplot2::geom_line(
+            size   = 0.9,
+            colour = input$ts_line_color %||% "#2C7FB8"
+          ) +
+          ggplot2::labs(
+            title = "Transformed series",
+            x     = p$x_label,
+            y     = "Transformed value"
+          )
+        
+        # ✅ Apply the same smart date axis logic used everywhere else
+        apply_smart_date_axis(g, ddf)
       },
+      
+
       
       "Points" = {
-        d <- df_ts(ts_obj)
-        ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+        ddf <- df_ts(ts_obj)
+        
+        g <- ggplot2::ggplot(ddf, ggplot2::aes(t, y)) +
           ggplot2::geom_point(size = 1) +
           ggplot2::labs(title = "Points", x = p$x_label, y = "Transformed value")
+        
+        apply_smart_date_axis(g, ddf)
       },
       
+      
+      
+  
       "Line + Points" = {
-        d <- df_ts(ts_obj)
-        ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+        ddf <- df_ts(ts_obj)
+        
+        g <- ggplot2::ggplot(ddf, ggplot2::aes(t, y)) +
           ggplot2::geom_line() +
           ggplot2::geom_point(size = 0.9, alpha = 0.8) +
-          ggplot2::labs(title = "Line + Points", x = p$x_label, y = "Transformed value")
+          ggplot2::labs(
+            title = "Line + Points",
+            x     = p$x_label,
+            y     = "Transformed value"
+          )
+        
+        # ✅ Apply smart date thinning + formatting
+        apply_smart_date_axis(g, ddf)
       },
+      
+      
+ 
       
       "Smoothed (LOESS)" = {
-        d <- df_ts(ts_obj)
-        ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+        ddf <- df_ts(ts_obj)
+        
+        g <- ggplot2::ggplot(ddf, ggplot2::aes(t, y)) +
           ggplot2::geom_line(alpha = 0.4) +
           ggplot2::geom_smooth(method = "loess", se = FALSE, span = 0.2) +
-          ggplot2::labs(title = "LOESS smooth", x = p$x_label, y = "Transformed value")
+          ggplot2::labs(
+            title = "LOESS smooth",
+            x     = p$x_label,
+            y     = "Transformed value"
+          )
+        
+        # ✅ Smart date axis (same logic as Line/Points)
+        apply_smart_date_axis(g, ddf)
       },
       
+      
+      
+   
       "Moving average" = {
-        d <- df_ts(ts_obj)
-        ma <- stats::filter(d$y, rep(1/k_ma, k_ma), sides = 2)
-        d$ma <- as.numeric(ma)
-        ggplot2::ggplot(d, ggplot2::aes(t, y)) +
+        ddf <- df_ts(ts_obj)
+        
+        ma <- stats::filter(ddf$y, rep(1 / k_ma, k_ma), sides = 2)
+        ddf$ma <- as.numeric(ma)
+        
+        g <- ggplot2::ggplot(ddf, ggplot2::aes(t, y)) +
           ggplot2::geom_line(alpha = 0.4) +
           ggplot2::geom_line(ggplot2::aes(y = ma), size = 1) +
           ggplot2::labs(
             title = sprintf("Moving average (k = %d)", k_ma),
-            x = p$x_label, y = "Transformed value"
+            x     = p$x_label,
+            y     = "Transformed value"
           )
+        
+        # ✅ Keep dates readable
+        apply_smart_date_axis(g, ddf)
       },
+      
+      
       
       "Cumulative sum" = {
         d <- df_ts(ts_obj); d$cum <- cumsum(d$y)
@@ -7950,32 +8150,68 @@ server <- function(input, output, session) {
       
       
 
+      # "Time + ACF+PACF" = {
+      #   # Top: time plot
+      #   p_time <- forecast::autoplot(
+      #     ts_obj,
+      #     size   = 1,
+      #     colour = input$ts_line_color %||% "#2C7FB8"
+      #   ) +
+      #     ggplot2::labs(
+      #       title = "Time plot",
+      #       x = p$x_label,
+      #       y = "Transformed value"
+      #     )
+      # 
+      #   # Bottom: ACF + PACF
+      #   p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
+      #   p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
+      # 
+      #   # Apply theme
+      #   p_time <- add_theme(p_time)
+      #   p_acf  <- add_theme(p_acf)
+      #   p_pacf <- add_theme(p_pacf)
+      # 
+      #   # Patchwork layout (resizes correctly, no overlap)
+      #   (p_time / (p_acf | p_pacf)) +
+      #     patchwork::plot_layout(heights = c(1.3, 1))
+      # },
+      
+      
       "Time + ACF+PACF" = {
-        # Top: time plot
-        p_time <- forecast::autoplot(
-          ts_obj,
-          size   = 1,
-          colour = input$ts_line_color %||% "#2C7FB8"
-        ) +
+        
+        # --- Top: time plot (DATE-AWARE) ---
+        ddf <- df_ts(ts_obj)
+        
+        p_time <- ggplot2::ggplot(ddf, ggplot2::aes(t, y)) +
+          ggplot2::geom_line(
+            size   = 1,
+            colour = input$ts_line_color %||% "#2C7FB8"
+          ) +
           ggplot2::labs(
             title = "Time plot",
-            x = p$x_label,
-            y = "Transformed value"
+            x     = p$x_label,
+            y     = "Transformed value"
           )
-
-        # Bottom: ACF + PACF
+        
+        # ✅ Apply smart date axis thinning (only affects the time plot)
+        p_time <- apply_smart_date_axis(p_time, ddf)
+        
+        # --- Bottom: ACF + PACF (keep as-is) ---
         p_acf  <- forecast::ggAcf(ts_obj)  + ggplot2::labs(title = "ACF")
         p_pacf <- forecast::ggPacf(ts_obj) + ggplot2::labs(title = "PACF")
-
+        
         # Apply theme
         p_time <- add_theme(p_time)
         p_acf  <- add_theme(p_acf)
         p_pacf <- add_theme(p_pacf)
-
-        # Patchwork layout (resizes correctly, no overlap)
+        
+        # Patchwork layout
         (p_time / (p_acf | p_pacf)) +
           patchwork::plot_layout(heights = c(1.3, 1))
       },
+      
+      
       
       
       
@@ -14996,6 +15232,3544 @@ summary_errors <- aggregate_metrics(...)
   
   
   
+  # # --- Roadmap slider navigation (Prev/Next) ---
+  # observeEvent(input$road_prev, {
+  #   cur <- input$roadmap_step
+  #   if (is.null(cur)) cur <- 0
+  #   updateSliderInput(session, "roadmap_step", value = max(0, as.integer(cur) - 1L))
+  # }, ignoreInit = TRUE)
+  # 
+  # observeEvent(input$road_next, {
+  #   cur <- input$roadmap_step
+  #   if (is.null(cur)) cur <- 0
+  #   updateSliderInput(session, "roadmap_step", value = min(10, as.integer(cur) + 1L))
+  # }, ignoreInit = TRUE)
+  # 
+  # # =========================
+  # # Roadmap UI (controls)
+  # # =========================
+  # output$roadmap_Detailed_Fr_ui4 <- renderUI({
+  #   
+  #   tags$div(
+  #     style = "background:#f7f7f7;padding:14px;border-radius:10px;",
+  #     
+  #     tags$style(HTML("
+  #     .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:10px;padding:14px;margin-top:12px;}
+  #     .road-title {margin:0 0 8px 0;}
+  #     .road-sub {margin:0 0 12px 0; color:#555;}
+  #     .road-nav {display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+  #     .road-nav .btn {min-width:46px;}
+  #     details {background:#ffffff;border:1px solid #eaeaea;border-radius:10px;padding:10px 12px;margin:10px 0;}
+  #     details > summary {cursor:pointer;font-weight:600;}
+  #     .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:10px 12px; border-radius:8px; margin:10px 0;}
+  #     .callout.warn {border-left-color:#E45756; background:#fff7f7;}
+  #     .callout.ok {border-left-color:#72B7B2; background:#f7fffb;}
+  #     code {background:#f3f3f3; padding:0 3px; border-radius:3px;}
+  #     .progress {height:10px; margin:10px 0 0 0;}
+  #   ")),
+  #     
+  #     tags$h3(class="road-title", "Feuille de route SARIMA (version pédagogique)"),
+  #     tags$p(class="road-sub",
+  #            "Utilisez le curseur pour passer d’une étape à l’autre. Chaque étape contient : Actions → À écrire (APA) → Pièges."),
+  #     
+  #     tags$div(
+  #       class = "road-nav",
+  #       actionButton("road_prev", "◀", class = "btn btn-default"),
+  #       sliderInput(
+  #         "roadmap_step", label = NULL,
+  #         min = 0, max = 10, value = 0, step = 1, width = "520px"
+  #       ),
+  #       actionButton("road_next", "▶", class = "btn btn-default"),
+  #       tags$span(style="color:#666;", "Astuce : gardez les blocs repliés pour éviter toute scroll.")
+  #     ),
+  #     
+  #     # Progress bar (pure UI, updated via re-render of content)
+  #     shiny::uiOutput("roadmap_step_content")
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Roadmap UI (content)
+  # # =========================
+  # output$roadmap_step_content <- renderUI({
+  #   
+  #   # ========= Helpers =========
+  #   D <- function(title, ...) {
+  #     tags$details(
+  #       tags$summary(title),
+  #       tags$div(class = "road-scroll", ...)
+  #     )
+  #   }
+  #   UL <- function(...) tags$ul(...)
+  #   OL <- function(...) tags$ol(...)
+  #   P  <- function(...) tags$p(...)
+  #   B  <- function(...) tags$b(...)
+  #   C  <- function(...) tags$code(...)
+  #   H5 <- function(...) tags$h5(style="margin-top:10px;margin-bottom:6px;", ...)
+  #   
+  #   # ========= Checklist helpers (UI only) =========
+  #   # These are intentionally simple visual checklists (no reactive logic).
+  #   # Pedagogical goal: help students translate “read/explain” into
+  #   # concrete actions they can verify before moving to the next step.
+  #   CheckItem <- function(...) {
+  #     tags$li(
+  #       tags$span(class = "chkbox", "☐"),
+  #       tags$span(...)
+  #     )
+  #   }
+  #   Checklist <- function(...) {
+  #     tags$div(
+  #       class = "callout",
+  #       tags$b("Checklist étudiant"),
+  #       tags$ul(class = "chk", ...)
+  #     )
+  #   }
+  #   
+  #   
+  #   callout <- function(..., type = c("info","ok","warn")) {
+  #     type <- match.arg(type)
+  #     cls <- if (type=="ok") "callout ok" else if (type=="warn") "callout warn" else "callout"
+  #     tags$div(class = cls, ...)
+  #   }
+  #   
+  #   # ========= CSS (internal scroll so the page stays short) =========
+  #   css <- tags$style(HTML("
+  #   .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:10px;padding:14px;margin-top:12px;}
+  #   details {background:#ffffff;border:1px solid #eaeaea;border-radius:10px;padding:10px 12px;margin:10px 0;}
+  #   details > summary {cursor:pointer;font-weight:700;}
+  #   .road-scroll {max-height: 62vh; overflow-y: auto; padding-right: 10px;}
+  #   .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:10px 12px; border-radius:8px; margin:10px 0;}
+  #   .callout.warn {border-left-color:#E45756; background:#fff7f7;}
+  #   .callout.ok {border-left-color:#72B7B2; background:#f7fffb;}
+  #   code {background:#f3f3f3; padding:0 3px; border-radius:3px;}
+  #   .progress {height:10px; margin:10px 0 0 0;}
+  #   /* Checklist: checkbox-style bullets */
+  #   ul.chk {padding-left: 0; margin: 8px 0 0 0;}
+  #   ul.chk li {list-style: none; margin: 6px 0;}
+  #   .chkbox {display:inline-block; width: 18px; font-weight: 700; margin-right: 6px;}
+  # "))
+  #   
+  #   # ========= Step logic =========
+  #   cur <- input$roadmap_step
+  #   if (is.null(cur) || !is.finite(cur)) cur <- 0
+  #   cur <- as.integer(cur)
+  #   
+  #   step_names <- c(
+  #     "Aperçu & notations (glossaire + lecture du modèle)",
+  #     "Étape 0 — Définir le problème de modélisation",
+  #     "Étape 1 — Décrire les données (qualité, manquants, descriptifs)",
+  #     "Étape 2 — Explorer visuellement (EDA) : tendance/saison/outliers",
+  #     "Étape 3 — Décomposer : additif vs multiplicatif, STL, robustesse",
+  #     "Étape 4 — Stationnarité & différenciation : ADF / KPSS / PP (d, D)",
+  #     "Étape 5 — Baseline : Auto-ARIMA (point de départ, pas un dogme)",
+  #     "Étape 6 — SARIMA manuel : ACF/PACF + candidats raisonnés",
+  #     "Étape 7 — Diagnostics & comparaison : résidus + performance prévision",
+  #     "Étape 8 — Rédaction : Méthodes/Résultats (APA) + livrables propres",
+  #     "Annexes — Formules, checklists, templates, interprétations rapides"
+  #   )
+  #   
+  #   pct <- round(100 * cur / 10)
+  #   progress_ui <- tags$div(
+  #     class="progress",
+  #     tags$div(
+  #       class="progress-bar",
+  #       role="progressbar",
+  #       `aria-valuenow`=pct, `aria-valuemin`="0", `aria-valuemax`="100",
+  #       style = paste0("width:", pct, "%;")
+  #     )
+  #   )
+  #   
+  #   make_step <- function(title, actions_ui, apa_ui, pitfalls_ui, header_ui = NULL) {
+  #     tags$div(
+  #       class = "road-card",
+  #       if (!is.null(header_ui)) header_ui,
+  #       tags$h4(title),
+  #       D("1) Ce que l’étudiant fait (procédure + définitions + objectifs)", actions_ui),
+  #       D("2) Ce qu’il écrit (APA) + conclusion & signification", apa_ui),
+  #       D("3) Pièges + comment les éviter (avec interprétation)", pitfalls_ui)
+  #     )
+  #   }
+  #   
+  #   # ========= Pages =========
+  #   pages <- vector("list", length = 11)
+  #   
+  #   # (0) Aperçu
+  #   pages[[1]] <- make_step(
+  #     step_names[1],
+  #     
+  #     actions_ui = tagList(
+  #       callout(
+  #         B("Objectif global : "),
+  #         "construire un modèle SARIMA interprétable et surtout ",
+  #         B("prédictif"), " : il doit passer les diagnostics résiduels et battre un benchmark simple.",
+  #         type="ok"
+  #       ),
+  #       
+  #       Checklist(
+  #         CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir) et préciser son unité et son contexte."),
+  #         CheckItem("Déterminer la période saisonnière s à partir du contexte (par exemple 12 pour mensuel, 7 pour hebdomadaire, 4 pour trimestriel)."),
+  #         CheckItem("Lire la forme générale SARIMA et expliquer le rôle de chaque bloc : différenciation (d, D) puis composantes AR/MA (p, q, P, Q)."),
+  #         CheckItem("Définir ce que signifie ‘bon modèle’ dans ce cours : résidus proches d’un bruit blanc, performance hors-échantillon, et parcimonie."),
+  #         CheckItem("Noter le benchmark choisi (naïf/SNAIVE) pour évaluer la valeur ajoutée du SARIMA.")
+  #       ),
+  #       
+  #       Checklist(
+  #         CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir) et préciser son unité et son contexte (ex. ventes mensuelles, température quotidienne, etc.)."),
+  #         CheckItem("Déterminer la période saisonnière s à partir du contexte (ex. 12 pour mensuel, 7 pour hebdomadaire, 4 pour trimestriel) et vérifier qu’elle est cohérente avec la façon dont les données sont échantillonnées."),
+  #         CheckItem("Relire la forme générale SARIMA et expliquer, avec vos mots, le rôle des blocs : différenciation (d, D) pour stationnariser, puis composantes AR/MA (p, q, P, Q) pour modéliser la mémoire restante."),
+  #         CheckItem("Énoncer vos critères de ‘bon modèle’ : résidus ~ bruit blanc, performance hors-échantillon (train/test ou rolling-origin), et parcimonie (le plus simple qui marche)."),
+  #         CheckItem("Choisir et écrire noir sur blanc un benchmark (naïf / SNAIVE / drift) : sans ce repère, vous ne saurez pas si SARIMA apporte une vraie valeur ajoutée.")
+  #       ),
+  #       Checklist(
+  #         CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir) et préciser l’unité, la source, et le contexte."),
+  #         CheckItem("Déterminer la période saisonnière s à partir du contexte (ex. 12 pour mensuel, 7 pour hebdomadaire, 4 pour trimestriel) et vérifier qu’elle est cohérente avec les données."),
+  #         CheckItem("Expliquer avec vos mots la forme générale SARIMA : différenciations (d, D) pour stationnariser, puis termes AR/MA (p, q, P, Q) pour capturer la dépendance restante."),
+  #         CheckItem("Écrire vos critères de validation : diagnostics résiduels (ACF des résidus, Ljung–Box), performance hors-échantillon (MAE/RMSE/MASE), et parcimonie."),
+  #         CheckItem("Noter le benchmark retenu (naïf / drift / SNAIVE) afin de mesurer la valeur ajoutée du SARIMA.")
+  #       ),
+  #       
+  #       H5("Notations essentielles (définitions)"),
+  #       UL(
+  #         tags$li(B("Série temporelle"), " : suite ordonnée d’observations indexées par le temps ", C("y_t"), "."),
+  #         tags$li(B("Fréquence / période saisonnière"), " : nombre de pas par cycle saisonnier, noté ", C("s"),
+  #                 " (ex. mensuel s=12; quotidien avec saison hebdo s=7)."),
+  #         tags$li(B("Opérateur de retard (backshift)"), " : ", C("B y_t = y_{t-1}"), "."),
+  #         tags$li(B("Différenciation ordinaire"), " : ", C("∇ y_t = (1-B)y_t = y_t - y_{t-1}"),
+  #                 " ; appliquée ", C("d"), " fois → supprimer tendance/racine unitaire non saisonnière."),
+  #         tags$li(B("Différenciation saisonnière"), " : ", C("∇_s y_t = (1-B^s)y_t = y_t - y_{t-s}"),
+  #                 " ; appliquée ", C("D"), " fois → supprimer racine unitaire saisonnière."),
+  #         tags$li(B("Innovations / bruit blanc"), " : ", C("ε_t ~ w.n.(0, σ²)"),
+  #                 " signifie des chocs non autocorrélés (moyenne 0, variance constante).")
+  #       ),
+  #       
+  #       H5("Forme générale du modèle SARIMA (à comprendre, pas à mémoriser)"),
+  #       UL(
+  #         tags$li(
+  #           "Écriture compacte : ",
+  #           C("Φ(B^s) φ(B) ∇^d ∇_s^D y_t = Θ(B^s) θ(B) ε_t")
+  #         ),
+  #         tags$li(
+  #           B("Interprétation : "),
+  #           "après différenciations (d, D), on explique la dynamique restante par des composantes AR/MA ",
+  #           "non saisonnières (p,q) et saisonnières (P,Q)."
+  #         )
+  #       ),
+  #       
+  #       H5("Ce que signifie “bon modèle” (définition opérationnelle)"),
+  #       OL(
+  #         tags$li(B("Résidus ~ bruit blanc"), " : pas d’autocorrélation résiduelle (Ljung–Box non significatif)."),
+  #         tags$li(B("Performance out-of-sample"), " : MAE/RMSE meilleurs que benchmark (naïf / SNAIVE)."),
+  #         tags$li(B("Parcimonie"), " : modèle le plus simple possible à performance comparable.")
+  #       ),
+  #       
+  #       # === ADD: Glossaire étendu, critères info, estimation ===
+  #       H5("Glossaire étendu (ajouts importants)"),
+  #       UL(
+  #         tags$li(B("Polynômes AR/MA"), " : ",
+  #                 C("φ(B) = 1 - φ_1 B - ... - φ_p B^p"), ", ",
+  #                 C("θ(B) = 1 + θ_1 B + ... + θ_q B^q"), "; saisonnier ",
+  #                 C("Φ(B^s) = 1 - Φ_1 B^s - ... - Φ_P B^{Ps}"), ", ",
+  #                 C("Θ(B^s) = 1 + Θ_1 B^s + ... + Θ_Q B^{Qs}"), "."),
+  #         tags$li(B("Stabilité/causalité (AR)"), " : toutes les racines de ", C("φ(z)=0"),
+  #                 " et ", C("Φ(z^s)=0"), " sont ", B("hors"), " du cercle unité → processus stationnaire."),
+  #         tags$li(B("Inversibilité (MA)"), " : racines de ", C("θ(z)=0"), " et ", C("Θ(z^s)=0"),
+  #                 " hors du cercle unité → représentation AR(∞) bien définie."),
+  #         tags$li(B("Constante / drift"), " : une constante dans un ARIMA avec ", C("d=1"),
+  #                 " implique une ", B("pente moyenne"), " (drift) après différenciation ; le terme est souvent noté ",
+  #                 C("c"), " et la tendance moyenne vaut environ ", C("c"), " par pas."),
+  #         tags$li(B("Représentation état–espace"), " : tout ARIMA/SARIMA peut être écrit sous forme état–espace ",
+  #                 "et estimé/filtré par Kalman (utile pour manquants et lissage)."),
+  #         tags$li(B("Prévision : point vs intervalle vs densité"),
+  #                 " : point = ", C("ŷ"), "; intervalle = incertitude (80%/95%); densité = distribution prédictive complète.")
+  #       ),
+  #       H5("Critères d’information (définitions)"),
+  #       UL(
+  #         tags$li(B("AIC"), " : ", C("AIC = -2 \\log L + 2k"), " (", C("k"), " = nb paramètres estimés)."),
+  #         tags$li(B("AICc"), " : correction petits échantillons → préférable si ", C("n/k"), " n’est pas grand."),
+  #         tags$li(B("BIC"), " : ", C("BIC = -2 \\log L + k \\log n"), " ; pénalise plus la complexité (favorise parcimonie).")
+  #       ),
+  #       H5("Estimation (comment sont estimés les paramètres)"),
+  #       UL(
+  #         tags$li(B("MLE vs CSS+MLE"), " : estimation par maximum de vraisemblance (souvent via optim) ; ",
+  #                 "CSS (Conditional Sum of Squares) pour initialiser, puis MLE pour affiner."),
+  #         tags$li(B("Écarts-types et tests z"), " : reportez estimations ± SE, z et p pour l’interprétation des coefficients.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Phrase APA (modèle + notations)"),
+  #       P("« Nous avons ajusté un modèle SARIMA afin de capturer la dépendance temporelle et la saisonnalité de la série ",
+  #         C("y_t"), ". La spécification générale est ", C("Φ(B^s) φ(B) ∇^d ∇_s^D y_t = Θ(B^s) θ(B) ε_t"),
+  #         " avec ", C("ε_t"), " un bruit blanc. Le choix de (d, D) a été justifié par des tests de stationnarité (ADF/KPSS/PP) et des diagnostics. »"),
+  #       
+  #       H5("Conclusion & signification (à expliciter)"),
+  #       UL(
+  #         tags$li(B("Conclusion type : "), "« Le modèle final est adéquat »"),
+  #         tags$li(B("Signification : "), "« (i) il ne laisse pas d’information autocorrélée dans les résidus, ",
+  #                 "(ii) il généralise bien sur une fenêtre future, ",
+  #                 "(iii) il est suffisamment simple pour être stable et reproductible. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       H5("Pièges classiques"),
+  #       UL(
+  #         tags$li(B("Confondre AIC faible et bon modèle"), " : un AIC très bas avec résidus autocorrélés = modèle mal spécifié."),
+  #         tags$li(B("Oublier le benchmark"), " : sans SNAIVE/naïf, impossible de dire si SARIMA apporte réellement quelque chose."),
+  #         tags$li(B("Surcharger le modèle"), " : trop de paramètres → instabilité, intervalles de prévision peu fiables.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (1) Étape 0 — Définition du problème
+  #   pages[[2]] <- make_step(
+  #     step_names[2],
+  #     
+  #     actions_ui = tagList(
+  #       callout(
+  #         B("But : "),
+  #         "définir un problème de prévision mesurable (horizon, métriques, protocole).",
+  #         type="info"
+  #       ),
+  #       
+  #       Checklist(
+  #         CheckItem("Définir la variable y_t (cible) et la fréquence temporelle (jour, semaine, mois) sans ambiguite."),
+  #         CheckItem("Fixer l’horizon h en fonction de l’usage reel (decision, planification, stock, etc.)."),
+  #         CheckItem("Choisir un protocole d’evaluation temporelle (train/test ou rolling-origin) et expliquer pourquoi."),
+  #         CheckItem("Choisir des metriques (MAE + RMSE recommande) et justifier leur interpretation."),
+  #         CheckItem("Decider si une transformation (log / Box-Cox) est necessaire et noter la raison.")
+  #       ),
+  #       
+  #       H5("Définitions (ce que chaque terme veut dire)"),
+  #       UL(
+  #         tags$li(B("Série réponse"), " ", C("y_t"), " : variable à prédire (univariée)."),
+  #         tags$li(B("Horizon"), " ", C("h"), " : nombre de pas à prévoir (ex. h=12 mois)."),
+  #         tags$li(B("Origine de prévision"), " : dernier temps observé à partir duquel on prévoit."),
+  #         tags$li(B("Protocole train/test"), " : séparation temporelle (jamais mélanger le futur dans l’entraînement)."),
+  #         tags$li(B("Rolling-origin / validation temporelle"), " : on répète des prévisions à différentes origines pour estimer la performance moyenne."),
+  #         tags$li(B("SARIMA vs SARIMAX"), " : SARIMA n’utilise pas de variables explicatives ; SARIMAX inclut des régressions exogènes.")
+  #       ),
+  #       
+  #       H5("Choisir les métriques (définitions + quand utiliser)"),
+  #       UL(
+  #         tags$li(B("MAE"), " : moyenne des erreurs absolues ", C("mean(|y-ŷ|)"),
+  #                 " → robuste, facile à interpréter (unité de y)."),
+  #         tags$li(B("RMSE"), " : racine de l’erreur quadratique moyenne ", C("sqrt(mean((y-ŷ)^2))"),
+  #                 " → pénalise plus les grosses erreurs."),
+  #         tags$li(B("MAPE"), " : ", C("mean(|(y-ŷ)/y|)"),
+  #                 " → éviter si y proche de 0 (explose)."),
+  #         tags$li(B("sMAPE"), " : alternative plus stable près de 0 : ", C("mean(2|y-ŷ|/(|y|+|ŷ|))"), ".")
+  #       ),
+  #       
+  #       H5("Transformation (définitions + justification)"),
+  #       UL(
+  #         tags$li(B("Niveaux"), " : modèle sur les valeurs brutes."),
+  #         tags$li(B("Log-niveaux"), " : utile si la variance augmente avec le niveau ; convertit souvent multiplicatif → additif."),
+  #         tags$li(B("Box–Cox"), " : transformation paramétrique (λ) pour stabiliser variance et améliorer normalité : ",
+  #                 C("y^(λ) = (y^λ - 1)/λ"), " (λ≠0), et log si λ=0.")
+  #       ),
+  #       
+  #       H5("Procédure minimale (checklist)"),
+  #       OL(
+  #         tags$li("Fixer fréquence et période saisonnière s."),
+  #         tags$li("Fixer horizon h et fenêtres train/test (ou rolling-origin)."),
+  #         tags$li("Choisir MAE + RMSE (recommandé) ; documenter les raisons."),
+  #         tags$li("Décider transformation (aucune/log/Box–Cox) et justifier.")
+  #       ),
+  #       
+  #       # === ADD: précisions pratiques, métriques complémentaires, transformations ===
+  #       H5("Précisions supplémentaires (définitions pratiques)"),
+  #       UL(
+  #         tags$li(B("Horizon multi-pas"), " : ", C("h>1"),
+  #                 " → la performance peut décroître avec l’horizon ; rapporter MAE/RMSE par h si possible."),
+  #         tags$li(B("Fenêtre d’entraînement"), " : ", B("expansive"), " (on ne jette jamais d’anciens points) ",
+  #                 "ou ", B("glissante"), " (fenêtre fixe) ; documenter le choix."),
+  #         tags$li(B("Reproductibilité"), " : fixer les graines aléatoires, consigner versions des packages, chemins de données."),
+  #         tags$li(B("Prévision hiérarchique"), " (annexe) : si agrégations (mois→trimestres), noter la cohérence temporelle.")
+  #       ),
+  #       H5("Métriques supplémentaires (quand utiles)"),
+  #       UL(
+  #         tags$li(B("MASE"), " : erreur absolue mise à l’échelle par le naïf saisonnier → comparable entre séries."),
+  #         tags$li(B("WAPE"), " : ", C("sum(|y-ŷ|)/sum(|y|)"), " ; lisible comme % d’erreur agrégée."),
+  #         tags$li(B("Pinball loss (quantiles)"), " : si vous prédisez des quantiles (IC asymétriques).")
+  #       ),
+  #       H5("Transformations complémentaires"),
+  #       UL(
+  #         tags$li(B("Yeo–Johnson"), " : alternative à Box–Cox qui gère les valeurs ≤ 0."),
+  #         tags$li(B("Stabilisation de variance"), " : vérifier relation niveau–variance (nuage points moyenne locale vs ET).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — modèle de phrase complet"),
+  #       P("« Nous avons modélisé la série temporelle univariée ", C("y_t"),
+  #         " observée à une fréquence [..] (période saisonnière s=[..]). ",
+  #         "L’objectif était de produire des prévisions à horizon ", C("h"), "=[..]. ",
+  #         "La performance a été évaluée sur une fenêtre future selon [split temporel / rolling-origin] ",
+  #         "à l’aide de [MAE, RMSE]. Une transformation [aucune / log / Box–Cox] a été appliquée afin de [stabiliser la variance / linéariser la saisonnalité]. »"),
+  #       
+  #       H5("Conclusion & signification (comment l’expliquer)"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Notre problème est bien défini (h, métriques, protocole). »"),
+  #         tags$li(B("Signification : "), "« Toute comparaison de modèles devient juste : même horizon, même protocole, mêmes métriques. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Fuite temporelle"), " : utiliser des informations du futur (mauvais split) → performance artificiellement élevée."),
+  #         tags$li(B("Métrique mal choisie"), " : MAPE avec y≈0 → conclusions fausses."),
+  #         tags$li(B("Horizon incohérent"), " : un modèle bon à h=1 peut être mauvais à h=12 ; fixer l’horizon selon l’usage réel.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (2) Étape 1 — Description des données
+  #   pages[[3]] <- make_step(
+  #     step_names[3],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "décrire la qualité des données et rendre le pipeline reproductible.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Verifier que l’index temporel est regulier (pas manquants/dupliques, ordre correct)."),
+  #         CheckItem("Rapporter n, date debut/fin, frequence, et la couverture temporelle."),
+  #         CheckItem("Quantifier les manquants (k et %) et choisir une strategie (interpolation, saisonniere, Kalman) avec justification."),
+  #         CheckItem("Produire un resume statistique (moyenne, mediane, ET, min/max) et un resume saisonnier (par mois/semaine)."),
+  #         CheckItem("Documenter toute correction (doublons, valeurs aberrantes evidentes) pour garantir la reproductibilite.")
+  #       ),
+  #       
+  #       H5("Ce qu’il faut rapporter (définitions)"),
+  #       UL(
+  #         tags$li(B("n"), " : nombre total d’observations disponibles."),
+  #         tags$li(B("Couverture"), " : date début/fin."),
+  #         tags$li(B("Fréquence"), " : périodicité (mensuel/hebdo/quotidien)."),
+  #         tags$li(B("Manquants"), " : nombre k et pourcentage k/n.")
+  #       ),
+  #       
+  #       H5("Valeurs manquantes : types + implications"),
+  #       UL(
+  #         tags$li(B("MCAR"), " (Missing Completely At Random) : manquants indépendants → imputation plus défendable."),
+  #         tags$li(B("MAR"), " (At Random conditionnel) : dépend d’autres infos → imputation possible mais à justifier."),
+  #         tags$li(B("MNAR"), " (Not At Random) : dépend de la valeur elle-même → risque de biais important.")
+  #       ),
+  #       
+  #       H5("Stratégies de traitement (quand et pourquoi)"),
+  #       UL(
+  #         tags$li(B("Interpolation linéaire"), " : si manquants rares et pas de ruptures."),
+  #         tags$li(B("Interpolation saisonnière"), " : si saisonnalité stable (ex. remplacer par moyenne du même mois)."),
+  #         tags$li(B("Modèle d’état / Kalman"), " : si on veut une imputation plus probabiliste."),
+  #         tags$li(B("Suppression"), " : seulement si extrêmement rare et sans impact sur la continuité.")
+  #       ),
+  #       
+  #       H5("Descriptifs pertinents (au-delà de la moyenne)"),
+  #       UL(
+  #         tags$li("Moyenne, médiane, ET, min/max (niveau)."),
+  #         tags$li("Asymétrie (skewness) / kurtosis si utile."),
+  #         tags$li("Résumé saisonnier (ex. moyenne par mois), pour documenter saisonnalité.")
+  #       ),
+  #       
+  #       # === ADD: qualité index & manquants pratiques ===
+  #       H5("Qualité de l’index temporel (définitions)"),
+  #       UL(
+  #         tags$li(B("Régularité"), " : pas de pas manqué/dupliqué ; cadence constante."),
+  #         tags$li(B("Fuseau/DST"), " : données horaires → attention aux heures manquantes/dupliquées (passage DST)."),
+  #         tags$li(B("Doublons et horodatages hors ordre"), " : à corriger avant tout calcul d’ACF.")
+  #       ),
+  #       H5("Manquants — remarques pratiques"),
+  #       UL(
+  #         tags$li(B("Kalman/StructTS"), " : imputation probabiliste cohérente avec la dynamique ARIMA."),
+  #         tags$li(B("Imputation “saison identique”"), " : moyenne/médiane du même mois/jour si saisonnalité stable."),
+  #         tags$li(B("Zéros structurels"), " : distinguer “zéro” réel de manquant imputé à 0 (documenter).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Résultats (APA) — description"),
+  #       P("« La série contient ", C("n"), "=[..] observations couvrant [..] à [..] à une fréquence [..]. ",
+  #         "Les valeurs manquantes représentaient [..]% (k=[..]) et ont été traitées par [..], ",
+  #         "choisie car [manquants rares / saisonnalité stable / continuité nécessaire]. ",
+  #         "La série présentait une moyenne de [..] (ET=[..]) et une médiane [..]. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Les données sont suffisamment propres pour SARIMA » (ou non)."),
+  #         tags$li(B("Signification : "),
+  #                 "si l’index est régulier et que les manquants sont gérés explicitement, ",
+  #                 "les hypothèses du modèle (espacement régulier) deviennent plausibles.")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Imputation silencieuse"), " : toujours documenter méthode + raison."),
+  #         tags$li(B("Timestamps irréguliers"), " : SARIMA suppose une grille régulière ; corriger avant toute estimation."),
+  #         tags$li(B("Changement de définition de la variable"), " : ex. changement de mesure → rupture structurelle à traiter.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (3) Étape 2 — EDA
+  #   pages[[4]] <- make_step(
+  #     step_names[4],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "comprendre la structure (tendance/saison/ruptures/outliers) avant d’ajuster SARIMA.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Tracer la serie y_t et annoter tendance, saisonnalite, ruptures possibles et changements de variance."),
+  #         CheckItem("Construire au moins un graphique saisonnier (seasonal plot ou subseries) pour comprendre la forme par saison."),
+  #         CheckItem("Identifier les outliers (dates) et formuler une hypothese (evenement reel vs erreur)."),
+  #         CheckItem("Decider et documenter le traitement des outliers (conserver/corriger/imputer) et tester l’impact sur l’analyse."),
+  #         CheckItem("Noter ce que l’EDA implique pour la suite: transformation possible, differenciation probable, et presence de ruptures.")
+  #       ),
+  #       
+  #       H5("Définitions utiles (ce qu’on cherche)"),
+  #       UL(
+  #         tags$li(B("Tendance"), " : évolution de long terme (déterministe ou stochastique)."),
+  #         tags$li(B("Saisonnalité"), " : motif périodique de période s (ex. 12)."),
+  #         tags$li(B("Rupture structurelle"), " : changement durable de niveau/tendance/variance (ex. politique, crise)."),
+  #         tags$li(B("Outlier"), " : valeur atypique ponctuelle ; peut être réelle (fêtes) ou erreur.")
+  #       ),
+  #       
+  #       H5("Graphiques recommandés + leur but"),
+  #       UL(
+  #         tags$li(B("Courbe y_t"), " : voir tendance, variance, ruptures."),
+  #         tags$li(B("Seasonal plot"), " : comparer la forme saisonnière d’une année à l’autre."),
+  #         tags$li(B("Boxplots par saison"), " : détecter asymétrie/outliers par mois/semaine."),
+  #         tags$li(B("ACF brute"), " (optionnel) : repérer dépendances fortes et saisonnalité.")
+  #       ),
+  #       
+  #       H5("Outliers : procédure raisonnable"),
+  #       OL(
+  #         tags$li("Repérer visuellement (dates)."),
+  #         tags$li("Proposer une hypothèse (événement réel ? erreur ?)."),
+  #         tags$li("Décider : conserver / corriger / imputer (et justifier)."),
+  #         tags$li("Documenter l’impact (le modèle change-t-il beaucoup ?).")
+  #       ),
+  #       
+  #       # === ADD: outils EDA supplémentaires & typologie outliers ===
+  #       H5("Outils EDA supplémentaires"),
+  #       UL(
+  #         tags$li(B("Périodogramme / spectre"), " : met en évidence des fréquences saisonnières inattendues."),
+  #         tags$li(B("Seasonal subseries plot"), " : visualise la forme saisonnière par mois/semaine."),
+  #         tags$li(B("Nuage niveau–variance"), " : aide au choix log/Box–Cox (variance croît avec le niveau ?).")
+  #       ),
+  #       H5("Types d’outliers (interventions)"),
+  #       UL(
+  #         tags$li(B("AO"), " : Additive Outlier (pic ponctuel)."),
+  #         tags$li(B("IO"), " : Innovation Outlier (choc qui diffuse)."),
+  #         tags$li(B("LS"), " : Level Shift (changement de niveau)."),
+  #         tags$li(B("TC"), " : Temporary Change (effet transitoire).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Résultats (APA) — EDA"),
+  #       P("« L’inspection visuelle a mis en évidence une tendance [..] et une saisonnalité récurrente de période s=[..]. ",
+  #         "La variance semblait [constante / croissante avec le niveau], motivant [aucune transformation / log / Box–Cox]. ",
+  #         "Des valeurs atypiques autour de [dates] ont été [conservées/traitées] car [événement réel / erreur probable]. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« La structure (tendance/saison/variance/outliers) est comprise »"),
+  #         tags$li(B("Signification : "),
+  #                 "cela guide directement le choix transformation + différenciations (d, D) et évite d’ajuster un SARIMA “à l’aveugle”.")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Confondre saisonnalité et tendance"), " : une moyenne croissante ET une saisonnalité stable sont deux composantes distinctes."),
+  #         tags$li(B("Retirer des points réels"), " : si l’outlier correspond à un événement récurrent (fêtes), il doit rester."),
+  #         tags$li(B("Ignorer une rupture"), " : un SARIMA “moyenne” une structure qui a changé → mauvais futur.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (4) Étape 3 — Décomposition
+  #   pages[[5]] <- make_step(
+  #     step_names[5],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "séparer tendance/saison/bruit pour motiver la forme (additive vs multiplicative).", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Comparer visuellement une hypothese additive vs multiplicative (amplitude saisonniere constante vs proportionnelle au niveau)."),
+  #         CheckItem("Tester l’idee de transformation log/Box-Cox si la variance augmente avec le niveau."),
+  #         CheckItem("Realiser une decomposition (classique ou STL) et commenter la tendance, la saisonnalite et le residu."),
+  #         CheckItem("Verifier si la saisonnalite semble stable ou evolutive (argument pour STL)."),
+  #         CheckItem("Ecrire clairement ce que la decomposition suggere pour d, D, et pour l’echelle de modelisation.")
+  #       ),
+  #       
+  #       H5("Décomposition : définitions"),
+  #       UL(
+  #         tags$li(B("Additive"), " : ", C("y_t = T_t + S_t + e_t"),
+  #                 " (amplitude saisonnière ~ constante)."),
+  #         tags$li(B("Multiplicative"), " : ", C("y_t = T_t × S_t × e_t"),
+  #                 " (amplitude saisonnière augmente avec le niveau)."),
+  #         tags$li(B("Log"), " : si multiplicatif, log transforme souvent en additif : ",
+  #                 C("log(y_t) = log(T_t) + log(S_t) + log(e_t)"), "."),
+  #         tags$li(B("STL"), " : Seasonal-Trend decomposition using Loess ; flexible, possible robuste aux outliers.")
+  #       ),
+  #       
+  #       H5("Pourquoi STL ? (objectif détaillé)"),
+  #       UL(
+  #         tags$li("Quand la saisonnalité change lentement au fil du temps (non parfaitement répétitive)."),
+  #         tags$li("Quand on veut réduire l’influence des outliers sur l’estimation saison/tendance."),
+  #         tags$li("Quand on veut une lecture pédagogique claire (tendance vs saison vs résidu).")
+  #       ),
+  #       
+  #       H5("Ce que la décomposition ne remplace pas"),
+  #       UL(
+  #         tags$li("Elle ne prouve pas la stationnarité : SARIMA exige une série stationnaire après différenciation."),
+  #         tags$li("Elle ne choisit pas automatiquement (p,q,P,Q) : ACF/PACF + diagnostics restent nécessaires.")
+  #       ),
+  #       
+  #       # === ADD: paramètres STL & règles pratiques ===
+  #       H5("Paramètres STL (lecture pédagogique)"),
+  #       UL(
+  #         tags$li(B("s.window"), " : lissage saisonnier (", C("periodic"), " = saison constante; entier = évolutive)."),
+  #         tags$li(B("t.window"), " : lissage de la tendance (fenêtre LOESS)."),
+  #         tags$li(B("robust"), " : réduit l’influence des outliers (itérations avec poids).")
+  #       ),
+  #       H5("Additif vs multiplicatif (règle pratique)"),
+  #       UL(
+  #         tags$li("Amplitude saisonnière ~ proportionnelle au niveau → penser ", B("log"), " ou modèle multiplicatif."),
+  #         tags$li("Amplitude ~ constante → additif sur niveaux.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — Décomposition"),
+  #       P("« Nous avons étudié une structure additive vs multiplicative en évaluant si l’amplitude saisonnière variait avec le niveau. ",
+  #         "Comme [..], nous avons retenu [modèle additif / transformation log] et réalisé une décomposition via [classique / STL]. ",
+  #         "STL a été privilégiée pour sa flexibilité (saisonnalité évolutive) et sa robustesse aux valeurs atypiques. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le choix additif/multiplicatif est justifié »"),
+  #         tags$li(B("Signification : "),
+  #                 "on évite des résidus hétéroscédastiques et on améliore la stabilité de l’estimation SARIMA.")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Décomposition ≠ stationnarité"), " : après décomposition, on doit encore tester/choisir d et D."),
+  #         tags$li(B("Oublier l’échelle"), " : si vous modélisez log(y), les prévisions doivent être reconverties (avec prudence)."),
+  #         tags$li(B("Confondre bruit et structure"), " : des motifs résiduels persistants suggèrent que la saison/tendance n’a pas été correctement capturée.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (5) Étape 4 — Stationnarité (très détaillé : ADF/KPSS/PP + …)
+  #   pages[[6]] <- make_step(
+  #     step_names[6],
+  #     
+  #     actions_ui = tagList(
+  #       callout(
+  #         B("Idée centrale : "),
+  #         
+  #         Checklist(
+  #           CheckItem("Definir stationnarite avec vos mots (moyenne/variance constantes, dependance qui ne change pas dans le temps)."),
+  #           CheckItem("Executer ADF, KPSS et PP sur la serie brute et noter les hypotheses H0/Ha de chaque test."),
+  #           CheckItem("Proposer d et D de maniere progressive (essayer d=1 puis D=1 si besoin) et re-tester apres chaque transformation."),
+  #           CheckItem("Surveiller les signes de sur-differenciation (ACF lag1 tres negative, variance gonflee, dynamique artificielle)."),
+  #           CheckItem("Justifier le choix final (d, D, s) par convergence: tests + graphiques + ACF/PACF.")
+  #         ),
+  #         "SARIMA suppose que la série devient (au moins) stationnaire ",
+  #         B("après différenciation"), ". Les tests ADF/PP/KPSS servent à justifier (d, D).",
+  #         type="ok"
+  #       ),
+  #       
+  #       H5("Définition : stationnarité (ce que cela veut dire)"),
+  #       UL(
+  #         tags$li(B("Stationnarité faible (covariance-stationnaire)"), " : moyenne constante, variance constante, ",
+  #                 "et autocovariance dépend uniquement du retard (pas de t)."),
+  #         tags$li(B("Non-stationnarité"), " : tendance stochastique (racine unitaire), variance changeante, ou saisonnalité non traitée."),
+  #         tags$li(B("Racine unitaire"), " : choc permanent (effet ne s’éteint pas), typique d’un processus I(1).")
+  #       ),
+  #       
+  #       H5("Différenciation : rôle (d vs D)"),
+  #       UL(
+  #         tags$li(B("d"), " enlève la racine unitaire non saisonnière / tendance stochastique : ", C("(1-B)^d"), "."),
+  #         tags$li(B("D"), " enlève la racine unitaire saisonnière : ", C("(1-B^s)^D"), "."),
+  #         tags$li(B("Règle pratique"), " : d ∈ {0,1,2} (souvent 0–1) ; D ∈ {0,1} (rarement 2).")
+  #       ),
+  #       
+  #       H5("Test ADF (Augmented Dickey–Fuller) — définition & objectif"),
+  #       UL(
+  #         tags$li(B("But"), " : tester si la série contient une racine unitaire (non-stationnaire) en présence d’autocorrélation."),
+  #         tags$li(B("Régression (intuition)"), " : on teste si le coefficient de ", C("y_{t-1}"),
+  #                 " est compatible avec une racine unitaire après ajout de retards de Δy pour “absorber” l’autocorrélation."),
+  #         tags$li(B("Hypothèses"), " : ",
+  #                 B("H0"), " = racine unitaire (non-stationnaire) ; ",
+  #                 B("Ha"), " = stationnaire (autour d’une moyenne ou d’une tendance selon la spécification)."),
+  #         tags$li(B("Interprétation p-value"), " : p petit → rejet H0 → stationnarité (au sens ADF). p grand → on ne rejette pas → différenciation probablement nécessaire.")
+  #       ),
+  #       
+  #       H5("Test KPSS — définition & objectif (inverse de l’ADF)"),
+  #       UL(
+  #         tags$li(B("But"), " : tester si la série est stationnaire (niveau ou tendance)."),
+  #         tags$li(B("Hypothèses"), " : ",
+  #                 B("H0"), " = stationnaire ; ",
+  #                 B("Ha"), " = non-stationnaire (racine unitaire / stationnarité violée)."),
+  #         tags$li(B("Interprétation"), " : p petit → rejet H0 → non-stationnaire. p grand → compatible stationnarité.")
+  #       ),
+  #       
+  #       H5("Test PP (Phillips–Perron) — définition & objectif"),
+  #       UL(
+  #         tags$li(B("But"), " : test de racine unitaire comme ADF, mais corrige l’autocorrélation et l’hétéroscédasticité autrement (correction non-paramétrique)."),
+  #         tags$li(B("Hypothèses"), " : ",
+  #                 B("H0"), " = racine unitaire ; ",
+  #                 B("Ha"), " = stationnaire."),
+  #         tags$li(B("Pourquoi utile"), " : complément de robustesse ; si ADF et PP convergent, confiance accrue.")
+  #       ),
+  #       
+  #       H5("Comment conclure en combinant ADF/KPSS/PP (logique complète)"),
+  #       OL(
+  #         tags$li(B("Stationnarité forte : "), "ADF/PP rejettent H0 (p petit) ET KPSS ne rejette pas (p grand)."),
+  #         tags$li(B("Non-stationnarité forte : "), "ADF/PP ne rejettent pas (p grand) ET KPSS rejette (p petit)."),
+  #         tags$li(B("Conflit : "), "les tests divergent → regarder graphiques, ACF, résultats après une différence, et justifier par convergence d’indices (pas une seule p-value).")
+  #       ),
+  #       
+  #       H5("Procédure recommandée (pas à pas)"),
+  #       OL(
+  #         tags$li("Fixer ", B("s"), " (période saisonnière) à partir du contexte et de l’EDA."),
+  #         tags$li("Tester ADF/KPSS/PP sur la série brute."),
+  #         tags$li("Essayer d=1 si nécessaire, retester."),
+  #         tags$li("Essayer D=1 si saisonnalité/racine saisonnière, retester."),
+  #         tags$li("S’arrêter dès que stationnarité “raisonnable” ; éviter sur-différenciation.")
+  #       ),
+  #       
+  #       H5("Sur-différenciation : définition + symptômes"),
+  #       UL(
+  #         tags$li(B("Définition"), " : appliquer trop de différences → on introduit une dynamique artificielle."),
+  #         tags$li(B("Symptômes fréquents"), " : ACF au lag 1 très négative, variance gonflée, prévisions erratiques, paramètres instables."),
+  #         tags$li(B("Conséquence"), " : intervalles de prévision plus larges et modèle moins fiable.")
+  #       ),
+  #       
+  #       # === ADD: tests/bonnes pratiques complémentaires ===
+  #       H5("Tests et notions complémentaires"),
+  #       UL(
+  #         tags$li(B("Tendance déterministe vs racine unitaire"),
+  #                 " : on peut préférer un ARIMA avec ", C("d=0"), " et une tendance ", B("déterministe"),
+  #                 " (régression + ARMA sur résidus) si la tendance semble stable."),
+  #         tags$li(B("Racine unitaire saisonnière (HEGY)"), " : (annexe) test dédié aux racines à ", C("±1, ±i"), " pour ",
+  #                 C("s=4,12"), " ; utile si la saisonnalité stochastique domine."),
+  #         tags$li(B("Zivot–Andrews"), " : (annexe) racine unitaire avec rupture endogène possible.")
+  #       ),
+  #       H5("Bonnes pratiques de différenciation"),
+  #       UL(
+  #         tags$li(B("Au plus une différence"), " : commencer par ", C("d=1"), " ou ", C("D=1"),
+  #                 " ; ", B("éviter"), " ", C("d=2"), " sauf preuves fortes."),
+  #         tags$li(B("Sur-différenciation : "), "ACF lag 1 très négative, variance gonflée, MA artificiel → revenir en arrière.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — Tests & choix de (d, D)"),
+  #       P("« La stationnarité a été évaluée à l’aide des tests ADF, KPSS et PP afin de trianguler l’évidence, ces tests ayant des hypothèses nulles différentes. ",
+  #         "Les résultats ont été examinés sur la série originale puis après différenciations ordinaires et saisonnières. ",
+  #         "Sur la base de l’ensemble des indices (tests + diagnostics visuels), nous avons retenu d=[..] et D=[..] avec s=[..], ",
+  #         "afin d’obtenir une série approximativement stationnaire adaptée à l’estimation SARIMA, tout en évitant la sur-différenciation. »"),
+  #       
+  #       H5("Conclusion test (prête à remplir) + signification"),
+  #       UL(
+  #         tags$li(B("ADF : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+  #                 " H0 (racine unitaire). ",
+  #                 B("Signification : "),
+  #                 "si rejet → la série est compatible stationnarité (au sens ADF) ; sinon → différenciation probablement nécessaire."),
+  #         tags$li(B("KPSS : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+  #                 " H0 (stationnarité). ",
+  #                 B("Signification : "),
+  #                 "si rejet → non-stationnarité (donc d/D à augmenter ou transformation/rupture à traiter)."),
+  #         tags$li(B("PP : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+  #                 " H0 (racine unitaire). ",
+  #                 B("Signification : "),
+  #                 "confirme ou nuance ADF ; convergence ADF+PP renforce la conclusion.")
+  #       ),
+  #       
+  #       H5("Conclusion finale (d, D) + ce que cela implique pour SARIMA"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Nous retenons d=[..], D=[..], s=[..]. »"),
+  #         tags$li(B("Signification : "),
+  #                 "« le SARIMA sera estimé sur la série différenciée ; les paramètres AR/MA décrivent la dynamique ",
+  #                 "restante après retrait de la tendance et/ou de la saisonnalité non stationnaire. »")
+  #       ),
+  #       
+  #       # === ADD: points à expliciter
+  #       H5("À expliciter (rappel)"),
+  #       UL(
+  #         tags$li("Préciser si une constante/drift est incluse et à quel niveau (avant/après différenciation)."),
+  #         tags$li("Documenter toute rupture suspectée et ses conséquences sur le choix de ", C("d, D"), ".")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Choisir d et D “par habitude”"), " : toujours justifier par tests + EDA."),
+  #         tags$li(B("Ignorer une rupture structurelle"), " : les tests peuvent “crier non-stationnaire” alors qu’un changement de régime est en cause."),
+  #         tags$li(B("Interpréter p-value comme preuve absolue"), " : ce sont des indices ; en conflit, on s’appuie sur convergence des preuves.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (6) Étape 5 — Auto-ARIMA baseline
+  #   pages[[7]] <- make_step(
+  #     step_names[7],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "obtenir un point de départ compétitif, puis vérifier/affiner.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Executer auto-ARIMA avec des bornes raisonnables sur p,q,P,Q et noter le critere (AICc) utilise."),
+  #         CheckItem("Enregistrer le modele baseline (ordres + presence drift/constante) pour comparaison ulterieure."),
+  #         CheckItem("Verifier diagnostics residuels (ACF residus, Ljung-Box) avant de le considerer ‘acceptable’."),
+  #         CheckItem("Evaluer la performance sur la fenetre test (MAE/RMSE) et comparer au benchmark naif/SNAIVE."),
+  #         CheckItem("Decider si vous cherchez une version plus parcimonieuse (BIC plus faible ou meme performance avec moins de parametres).")
+  #       ),
+  #       
+  #       H5("Définition : auto-ARIMA (ce que fait réellement l’algorithme)"),
+  #       UL(
+  #         tags$li("Explore un ensemble de modèles candidats (p,q,P,Q) sous contraintes."),
+  #         tags$li("Choisit souvent via minimisation ", B("AICc"),
+  #                 " (AIC corrigé petits échantillons)."),
+  #         tags$li("Peut utiliser recherche stepwise (rapide) ou plus exhaustive (plus coûteuse).")
+  #       ),
+  #       
+  #       H5("Pourquoi AICc ? (objectif)"),
+  #       UL(
+  #         tags$li("Compromis entre qualité d’ajustement et complexité (pénalise les paramètres)."),
+  #         tags$li("AICc est préférable à AIC quand n n’est pas très grand par rapport au nombre de paramètres.")
+  #       ),
+  #       
+  #       H5("Procédure propre"),
+  #       OL(
+  #         tags$li("Fixer d/D (ou laisser recommander via ndiffs/nsdiffs, mais valider)."),
+  #         tags$li("Fixer bornes max p/q/P/Q ; documenter."),
+  #         tags$li("Sauvegarder le modèle baseline (pour comparaison)."),
+  #         tags$li("Vérifier diagnostics résiduels + performance sur test.")
+  #       ),
+  #       
+  #       # === ADD: détails de recherche & critères multiples ===
+  #       H5("Détails de recherche"),
+  #       UL(
+  #         tags$li(B("Stepwise vs exhaustive"), " : stepwise = rapide, peut rater un optimum global ; exhaustive = coûteux mais plus fiable."),
+  #         tags$li(B("Contraintes"), " : imposer ", C("p,q,P,Q \u2264"), " bornes raisonnables ; forcer stabilité/inversibilité."),
+  #         tags$li(B("drift/constante"), " : tester versions avec et sans drift lorsque ", C("d=1"), ".")
+  #       ),
+  #       H5("Critères multiples"),
+  #       UL(
+  #         tags$li("Comparer AICc ", B("et"), " BIC ; en cas de quasi-égalité → choisir le plus parcimonieux.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — baseline"),
+  #       P("« Un modèle SARIMA de référence a été sélectionné via une procédure auto-ARIMA basée sur un critère d’information (minimisation de l’AICc) parmi des ordres candidats sous contraintes [..]. ",
+  #         "La spécification obtenue a été utilisée comme baseline, puis comparée à des modèles manuels plus parcimonieux sur la base des diagnostics et de la performance de prévision. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Auto-ARIMA fournit une baseline solide »"),
+  #         tags$li(B("Signification : "), "« on a un repère : tout modèle final doit faire au moins aussi bien. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Modèle “trop complexe”"), " : stepwise peut sélectionner des ordres élevés → instabilité, interprétation difficile."),
+  #         tags$li(B("AICc excellent mais résidus mauvais"), " : diagnostics priment."),
+  #         tags$li(B("Oublier la parcimonie"), " : si deux modèles prédisent pareil, garder le plus simple.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (7) Étape 6 — SARIMA manuel
+  #   pages[[8]] <- make_step(
+  #     step_names[8],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "proposer un petit ensemble raisonné de candidats via ACF/PACF.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Tracer ACF/PACF de la serie differenciee (apres choix d et D) et identifier les pics significatifs."),
+  #         CheckItem("Proposer un petit ensemble de candidats (3 a 8) en justifiant p,q,P,Q par les motifs ACF/PACF (y compris aux multiples de s)."),
+  #         CheckItem("Ajuster chaque candidat, relever AICc/BIC, et verifier stabilite/inversibilite si possible."),
+  #         CheckItem("Comparer sur diagnostics residuels ET performance predictive (pas seulement AICc)."),
+  #         CheckItem("Garder le modele le plus simple qui passe diagnostics et bat le benchmark.")
+  #       ),
+  #       
+  #       H5("Définitions : ACF / PACF (ce que mesurent ces courbes)"),
+  #       UL(
+  #         tags$li(B("ACF"), " : corrélation entre ", C("y_t"), " et ", C("y_{t-k}"),
+  #                 " → suggère MA(q) si coupure nette vers q."),
+  #         tags$li(B("PACF"), " : corrélation “pure” au retard k une fois les retards <k contrôlés ",
+  #                 "→ suggère AR(p) si coupure nette vers p.")
+  #       ),
+  #       
+  #       H5("Heuristiques (non saisonnier)"),
+  #       UL(
+  #         tags$li(B("AR(p)"), " : PACF se coupe ~p ; ACF décroît."),
+  #         tags$li(B("MA(q)"), " : ACF se coupe ~q ; PACF décroît."),
+  #         tags$li(B("ARMA"), " : ACF et PACF décroissent (pas de coupure franche).")
+  #       ),
+  #       
+  #       H5("Heuristiques saisonnières (multiples de s)"),
+  #       UL(
+  #         tags$li(B("SAR(P)"), " : pics PACF à s, 2s, ..."),
+  #         tags$li(B("SMA(Q)"), " : pics ACF à s, 2s, ...")
+  #       ),
+  #       
+  #       H5("Procédure recommandée (petit nombre de modèles)"),
+  #       OL(
+  #         tags$li("Construire 3 à 8 candidats (parcimonieux)."),
+  #         tags$li("Ajuster et comparer AICc/BIC."),
+  #         tags$li("Vérifier stabilité/inversibilité."),
+  #         tags$li("Retenir ceux qui passent diagnostics + prévision.")
+  #       ),
+  #       
+  #       # === ADD: conception de candidats & lecture fine ===
+  #       H5("Conception de candidats (rappels utiles)"),
+  #       UL(
+  #         tags$li(B("Limiter le set"), " : 3–8 modèles max, justifiés par ACF/PACF."),
+  #         tags$li(B("Stabilité/inversibilité"), " : vérifier racines des polynômes AR/MA (hors cercle unité)."),
+  #         tags$li(B("drift/constante"), " : inclure/exclure et comparer au niveau AICc/BIC + diagnostics.")
+  #       ),
+  #       H5("Lecture fine ACF/PACF"),
+  #       UL(
+  #         tags$li("Pics à ", C("s, 2s, 3s"), " dans l’ACF → penser ", B("SMA(Q)"), "."),
+  #         tags$li("Pics à ", C("s, 2s"), " dans la PACF → penser ", B("SAR(P)"), "."),
+  #         tags$li("Queue AR (décroissance géométrique) vs coupure MA (après q).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — sélection manuelle"),
+  #       P("« Les structures candidates ont été proposées sur la base des schémas ACF/PACF de la série différenciée. ",
+  #         "Des autocorrélations aux multiples de s indiquaient des termes saisonniers, tandis que la dynamique de court terme guidait les ordres non saisonniers. ",
+  #         "Un ensemble restreint de modèles (n=[..]) a été ajusté et comparé via AICc/BIC et diagnostics résiduels, en privilégiant la parcimonie. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le modèle final est soutenu par la structure ACF/PACF et les diagnostics. »"),
+  #         tags$li(B("Signification : "), "« on réduit le risque de sur-ajustement en limitant les candidats. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Brute-force massif"), " : tester 200 modèles puis choisir le plus petit AICc = data snooping."),
+  #         tags$li(B("Surinterpréter ACF/PACF"), " : ce sont des guides, pas des preuves."),
+  #         tags$li(B("Ignorer l’inversibilité/stabilité"), " : paramètres instables → prévisions incohérentes.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (8) Étape 7 — Diagnostics & comparaison
+  #   pages[[9]] <- make_step(
+  #     step_names[9],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "valider que le modèle explique toute la dépendance et prédit bien.", type="ok"),
+  #       
+  #       Checklist(
+  #         CheckItem("Examiner les residus: courbe temporelle, ACF residus, et Ljung-Box a plusieurs lags L."),
+  #         CheckItem("Verifier qu’il n’y a pas de structure residuelle (p-value Ljung-Box non significative) et ajuster si necessaire."),
+  #         CheckItem("Evaluer la prediction hors-echantillon (MAE/RMSE/MASE) avec le meme horizon et le meme protocole pour tous les modeles."),
+  #         CheckItem("Comparer explicitement au benchmark (naif/SNAIVE) et conclure sur la valeur ajoutee."),
+  #         CheckItem("Documenter toute violation (ARCH, rupture, non-normalite) et expliquer l’impact sur IC et interpretation.")
+  #       ),
+  #       
+  #       H5("Diagnostics résiduels : définitions & buts"),
+  #       UL(
+  #         tags$li(B("Résidus"), " : ", C("e_t = y_t - ŷ_t"),
+  #                 " (ou résidus d’innovation selon l’implémentation)."),
+  #         tags$li(B("Bruit blanc"), " : absence d’autocorrélation résiduelle → le modèle a capturé la structure temporelle."),
+  #         tags$li(B("Ljung–Box"), " : test global d’autocorrélation des résidus jusqu’à un lag L.")
+  #       ),
+  #       
+  #       H5("Test de Ljung–Box (définition + interprétation)"),
+  #       UL(
+  #         tags$li(B("But"), " : tester si les autocorrélations résiduelles jusqu’à L sont globalement nulles."),
+  #         tags$li(B("Hypothèses"), " : ", B("H0"), " = pas d’autocorrélation résiduelle ; ", B("Ha"), " = autocorrélation résiduelle présente."),
+  #         tags$li(B("Conclusion"), " : p petit → rejet H0 → modèle incomplet (ajuster p/q/P/Q ou d/D)."),
+  #         tags$li(B("Signification pratique"), " : si autocorrélation résiduelle reste, vos intervalles/prévisions sont souvent trop optimistes.")
+  #       ),
+  #       
+  #       H5("Normalité & hétéroscédasticité (à quoi ça sert vraiment)"),
+  #       UL(
+  #         tags$li(B("Normalité"), " : utile pour l’interprétation probabiliste (IC) ; pas toujours critique si objectif = point forecast."),
+  #         tags$li(B("ARCH / variance changeante"), " : peut rendre les IC sous-estimés ; si fort, envisager modèles de variance (GARCH) selon le cours.")
+  #       ),
+  #       
+  #       H5("Évaluation prévision (définition + protocole)"),
+  #       UL(
+  #         tags$li(B("Split temporel"), " : entraîner sur le passé, tester sur le futur."),
+  #         tags$li(B("Rolling-origin"), " : répéter sur plusieurs origines → estimation plus robuste."),
+  #         tags$li(B("Benchmark"), " : naїf / drift / SNAIVE. Un SARIMA utile doit battre au moins SNAIVE à l’horizon cible.")
+  #       ),
+  #       
+  #       # === ADD: diagnostics additionnels & comparaison ===
+  #       H5("Diagnostics additionnels"),
+  #       UL(
+  #         tags$li(B("Box–Pierce vs Ljung–Box"), " : préférer Ljung–Box (meilleure petite taille)."),
+  #         tags$li(B("Normalité résiduelle"), " : Q–Q plot, Jarque–Bera ; utile pour IC mais secondaire si but = point forecast."),
+  #         tags$li(B("Hétéroscédasticité / ARCH"), " : tester ACF des résidus au carré ; si fort → discuter modèles de variance (annexe)."),
+  #         tags$li(B("Significativité des coefficients"), " : rapporter est., SE, z, p ; supprimer termes non significatifs si performance constante.")
+  #       ),
+  #       H5("Comparaison de modèles"),
+  #       UL(
+  #         tags$li(B("Tableau récapitulatif"), " : AICc/BIC, Ljung–Box (p), MAE/RMSE/MASE, nb de paramètres."),
+  #         tags$li(B("Test de Diebold–Mariano"), " : (annexe) comparer formellement 2 séries d’erreurs prédictives.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Résultats (APA) — diagnostics"),
+  #       P("« Les diagnostics résiduels indiquaient un comportement proche du bruit blanc : l’ACF des résidus ne montrait pas de pics substantiels et le test de Ljung–Box était [non significatif/significatif] au seuil α=[..]. ",
+  #         "La performance de prévision sur la fenêtre d’évaluation donnait MAE=[..] et RMSE=[..], surpassant le benchmark [..]. »"),
+  #       
+  #       H5("Conclusion & signification (diagnostics + performance)"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le modèle est acceptable » si Ljung–Box non significatif ET benchmark battu."),
+  #         tags$li(B("Signification : "),
+  #                 "« le modèle capte la structure temporelle (résidus ~ bruit) et apporte un gain prédictif réel (out-of-sample). »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Bon AIC mais Ljung–Box significatif"), " : modèle incomplet → ne pas valider."),
+  #         tags$li(B("Se focaliser sur la normalité"), " : priorité = absence d’autocorrélation résiduelle."),
+  #         tags$li(B("Comparer des modèles sur des horizons différents"), " : toujours même h, même protocole.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (9) Étape 8 — Rédaction
+  #   pages[[10]] <- make_step(
+  #     step_names[10],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "écrire un rapport clair, reproductible, aligné aux étapes 0–7.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Rediger une section Methodes qui suit exactement le pipeline: donnees -> EDA -> stationnarite -> selection -> diagnostics -> prevision."),
+  #         CheckItem("Inclure figures indispensables: serie, decomposition, ACF/PACF, residus, previsions + intervalles."),
+  #         CheckItem("Inclure un tableau de comparaison (AICc/BIC, Ljung-Box, MAE/RMSE, benchmark, nb parametres)."),
+  #         CheckItem("Preciser l’echelle (niveau/log/Box-Cox) et expliquer toute reconversion des previsions."),
+  #         CheckItem("Ajouter un encadre limites + pistes (ruptures, SARIMAX, GARCH) et assurer la reproductibilite (versions).")
+  #       ),
+  #       
+  #       H5("Structure APA recommandée (définition)"),
+  #       UL(
+  #         tags$li(B("Méthodes"), " : ce que vous avez fait et pourquoi (données → EDA → stationnarité → modèles → évaluation)."),
+  #         tags$li(B("Résultats"), " : ce que vous avez observé (stats, figures, tests, métriques, modèle final)."),
+  #         tags$li(B("Discussion"), " (optionnel) : limites (ruptures, horizon, incertitudes) + pistes (SARIMAX/GARCH).")
+  #       ),
+  #       
+  #       H5("Pack livrable propre (checklist)"),
+  #       UL(
+  #         tags$li("Notebook/script reproductible (import → nettoyage → EDA → tests → modèles → diagnostics → prévisions)."),
+  #         tags$li("Figures : série, décomposition, ACF/PACF, résidus (ACF + Ljung–Box), prévisions + IC."),
+  #         tags$li("Tableau : candidats vs AICc/BIC vs Ljung–Box vs MAE/RMSE vs benchmark.")
+  #       ),
+  #       
+  #       # === ADD: rapporter correctement les prévisions ===
+  #       H5("Rapporter correctement les prévisions"),
+  #       UL(
+  #         tags$li(B("Niveau de couverture"), " : préciser 80% et/ou 95% ; indiquer si log-échelle a été reconvertie."),
+  #         tags$li(B("Biais de reconversion (log→niveau)"), " : mentionner correction ",
+  #                 C("exp(\\hat{y}) \\times exp(\\hat{\\sigma}^2/2)"), " si utilisée."),
+  #         tags$li(B("Reproductibilité"), " : versions R/packages, seed, chemin des données, date d’extraction.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Phrase finale (APA) — modèle final + interprétation"),
+  #       P("« Sur la base de l’adéquation diagnostique et de la performance prédictive, le modèle final retenu était SARIMA((p,d,q)(P,D,Q)_s). ",
+  #         "Les résidus étant compatibles avec un bruit blanc, nous concluons que la structure temporelle principale a été capturée. ",
+  #         "Les prévisions produites à horizon h=[..] améliorent le benchmark [..] selon MAE/RMSE, ce qui soutient l’usage du modèle pour l’application ciblée. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le rapport est aligné, justifié, reproductible. »"),
+  #         tags$li(B("Signification : "),
+  #                 "« un lecteur externe peut reproduire vos résultats et comprendre chaque choix (transformation, d/D, sélection, diagnostics). »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Ne pas relier choix → preuves"), " : chaque décision doit être liée à EDA/tests/diagnostics."),
+  #         tags$li(B("Trop de texte, pas assez de figures"), " : en séries temporelles, les figures sont des résultats."),
+  #         tags$li(B("Oublier de préciser l’échelle"), " : niveau vs log vs Box–Cox et reconversion des prévisions.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (10) Annexes
+  #   pages[[11]] <- make_step(
+  #     step_names[11],
+  #     
+  #     actions_ui = tagList(
+  #       Checklist(
+  #         CheckItem("Reconnaitre et pouvoir ecrire les trois benchmarks (naif, drift, SNAIVE) et expliquer quand chacun est approprie."),
+  #         CheckItem("Savoir lire rapidement un resultat ADF/KPSS/PP et traduire la conclusion en choix de d et D."),
+  #         CheckItem("Savoir expliquer ce que signifie Ljung-Box significatif (structure residuelle) et quelle action entreprendre."),
+  #         CheckItem("Memoriser les formules utiles (AIC/AICc/BIC, Ljung-Box, operateurs de differenciation) et leur interpretation."),
+  #         CheckItem("Identifier quand il faut sortir du cadre SARIMA (exogenes, multiples saisonnalites, ruptures, variance conditionnelle).")
+  #       ),
+  #       
+  #       H5("Benchmarks (définitions)"),
+  #       UL(
+  #         tags$li(B("Naïf"), " : ", C("ŷ_{t+1|t} = y_t"), " (persistance)."),
+  #         tags$li(B("Drift"), " : extrapolation linéaire moyenne."),
+  #         tags$li(B("SNAIVE"), " : répète la dernière valeur de la même saison : ", C("ŷ_{t+h|t} = y_{t+h-s}"), ".")
+  #       ),
+  #       
+  #       H5("Règles d’interprétation ultra rapides"),
+  #       UL(
+  #         tags$li(B("ADF/PP rejettent"), " + ", B("KPSS ne rejette pas"), " → stationnarité plausible."),
+  #         tags$li(B("ADF/PP ne rejettent pas"), " + ", B("KPSS rejette"), " → différenciation nécessaire."),
+  #         tags$li(B("Ljung–Box significatif"), " → il reste de la structure → réviser le modèle.")
+  #       ),
+  #       
+  #       # === ADD: formules utiles & pistes avancées ===
+  #       H5("Formules utiles (mémo)"),
+  #       UL(
+  #         tags$li(B("Critères d’info"), " : ",
+  #                 C("AIC=-2\\log L+2k"), ", ",
+  #                 C("AICc= AIC + \\frac{2k(k+1)}{n-k-1}"), ", ",
+  #                 C("BIC=-2\\log L+k\\log n"), "."),
+  #         tags$li(B("MASE"), " : ", C("\\frac{\\frac{1}{T}\\sum_{t}|e_t|}{\\frac{1}{T-s}\\sum_{t}|y_t-y_{t-s}|}"), " (pour périodicité ", C("s"), ")."),
+  #         tags$li(B("Ljung–Box"), " : ", C("Q^* = n(n+2)\\sum_{k=1}^{L} \\frac{\\hat{\\rho}_k^2}{n-k}"),
+  #                 " ~ ", C("\\chi^2"), " sous ", C("H_0"), " avec ddl ≈ ", C("L - p - q - (P+Q)"), "."),
+  #         tags$li(B("Backshift & diff."), " : ",
+  #                 C("\\nabla=(1-B)"), ", ", C("\\nabla_s=(1-B^s)"), ", ",
+  #                 C("\\nabla^d \\nabla_s^D y_t"), " pour stationnariser.")
+  #       ),
+  #       H5("Pistes avancées (pour l’enseignant)"),
+  #       UL(
+  #         tags$li(B("SARIMAX / régression dynamique"), " : variables exogènes, pré-blanchiment, fonctions de transfert."),
+  #         tags$li(B("Ruptures/Interventions"), " : dummies LS/TC, estimation avec régresseurs."),
+  #         tags$li(B("Multiples saisonnalités"), " : TBATS/ETS-MS si présence de s multiples.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Template “Conclusion tests → choix (d,D)” (copier-coller)"),
+  #       P("« Les tests ADF/PP et KPSS ont été interprétés conjointement. ",
+  #         "Comme [ADF/PP: rejettent/ne rejettent pas] la racine unitaire et [KPSS: rejette/ne rejette pas] la stationnarité, ",
+  #         "nous concluons que la série est [stationnaire/non-stationnaire] au sens des diagnostics combinés. ",
+  #         "Nous retenons donc d=[..] et D=[..] (s=[..]) pour obtenir une série stationnaire pour l’estimation SARIMA. »"),
+  #       
+  #       H5("Signification (traduction simple)"),
+  #       UL(
+  #         tags$li("« d et D disent combien de fois on doit “retirer” une tendance et une saisonnalité non stationnaire. »"),
+  #         tags$li("« Ensuite, p/q/P/Q décrivent la dépendance restante (mémoire) dans la série transformée. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Croire qu’un test “décide” seul"), " : toujours trianguler avec EDA + ACF + comportement après différenciation."),
+  #         tags$li(B("Oublier la finalité"), " : prévision (out-of-sample) + diagnostics passent avant l’esthétique d’un AIC."),
+  #         tags$li(B("Ne pas documenter"), " : un bon modèle non documenté = inutilisable dans un cours/rapport.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # ========= Output =========
+  #   tagList(
+  #     css,
+  #     tags$h4(style="margin-top:12px;", paste0("Page ", cur, "/10 — ", step_names[cur + 1L])),
+  #     progress_ui,
+  #     pages[[cur + 1L]]
+  #   )
+  # })
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # # --- Roadmap slider navigation (Prev/Next) ---
+  # observeEvent(input$road_prev, {
+  #   cur <- input$roadmap_step
+  #   if (is.null(cur)) cur <- 0
+  #   updateSliderInput(session, "roadmap_step", value = max(0, as.integer(cur) - 1L))
+  # }, ignoreInit = TRUE)
+  # 
+  # observeEvent(input$road_next, {
+  #   cur <- input$roadmap_step
+  #   if (is.null(cur)) cur <- 0
+  #   updateSliderInput(session, "roadmap_step", value = min(10, as.integer(cur) + 1L))
+  # }, ignoreInit = TRUE)
+  # 
+  # # =========================
+  # # Roadmap UI (controls)
+  # # =========================
+  # output$roadmap_Detailed_Fr_ui4 <- renderUI({
+  #   
+  #   tags$div(
+  #     style = "background:#f7f7f7;padding:14px;border-radius:10px;",
+  #     
+  #     tags$style(HTML("
+  #     .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:10px;padding:14px;margin-top:12px;}
+  #     .road-title {margin:0 0 8px 0;}
+  #     .road-sub {margin:0 0 12px 0; color:#555;}
+  #     .road-nav {display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+  #     .road-nav .btn {min-width:46px;}
+  #     details {background:#ffffff;border:1px solid #eaeaea;border-radius:10px;padding:10px 12px;margin:10px 0;}
+  #     details > summary {cursor:pointer;font-weight:600;}
+  #     .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:10px 12px; border-radius:8px; margin:10px 0;}
+  #     .callout.warn {border-left-color:#E45756; background:#fff7f7;}
+  #     .callout.ok {border-left-color:#72B7B2; background:#f7fffb;}
+  #     code {background:#f3f3f3; padding:0 3px; border-radius:3px;}
+  #     .progress {height:10px; margin:10px 0 0 0;}
+  #   ")),
+  #     
+  #     tags$h3(class="road-title", "Feuille de route SARIMA (version pédagogique)"),
+  #     tags$p(class="road-sub",
+  #            "Utilisez le curseur pour passer d’une étape à l’autre. Chaque étape contient : Actions → À écrire (APA) → Pièges."),
+  #     
+  #     tags$div(
+  #       class = "road-nav",
+  #       actionButton("road_prev", "◀", class = "btn btn-default"),
+  #       sliderInput(
+  #         "roadmap_step", label = NULL,
+  #         min = 0, max = 10, value = 0, step = 1, width = "520px"
+  #       ),
+  #       actionButton("road_next", "▶", class = "btn btn-default"),
+  #       tags$span(style="color:#666;", "Astuce : gardez les blocs repliés pour éviter toute scroll.")
+  #     ),
+  #     
+  #     # Progress bar (pure UI, updated via re-render of content)
+  #     shiny::uiOutput("roadmap_step_content")
+  #   )
+  # })
+  # 
+  # # =========================
+  # # Roadmap UI (content)
+  # # =========================
+  # output$roadmap_step_content <- renderUI({
+  #   
+  #   # ========= Helpers =========
+  #   D <- function(title, ...) {
+  #     tags$details(
+  #       tags$summary(title),
+  #       tags$div(class = "road-scroll", ...)
+  #     )
+  #   }
+  #   UL <- function(...) tags$ul(...)
+  #   OL <- function(...) tags$ol(...)
+  #   P  <- function(...) tags$p(...)
+  #   B  <- function(...) tags$b(...)
+  #   C  <- function(...) tags$code(...)
+  #   H5 <- function(...) tags$h5(style="margin-top:10px;margin-bottom:6px;", ...)
+  #   
+  #   # ========= Checklist helpers (UI only) =========
+  #   # These are intentionally simple visual checklists (no reactive logic).
+  #   # Pedagogical goal: help students translate “read/explain” into
+  #   # concrete actions they can verify before moving to the next step.
+  #   CheckItem <- function(...) {
+  #     tags$li(
+  #       tags$span(class = "chkbox", "☐"),
+  #       tags$span(...)
+  #     )
+  #   }
+  #   Checklist <- function(...) {
+  #     tags$div(
+  #       class = "callout",
+  #       tags$b("Checklist étudiant"),
+  #       tags$ul(class = "chk", ...)
+  #     )
+  #   }
+  #   
+  #   
+  #   callout <- function(..., type = c("info","ok","warn")) {
+  #     type <- match.arg(type)
+  #     cls <- if (type=="ok") "callout ok" else if (type=="warn") "callout warn" else "callout"
+  #     tags$div(class = cls, ...)
+  #   }
+  #   
+  #   # ========= CSS (internal scroll so the page stays short) =========
+  #   css <- tags$style(HTML("
+  #   .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:10px;padding:14px;margin-top:12px;}
+  #   details {background:#ffffff;border:1px solid #eaeaea;border-radius:10px;padding:10px 12px;margin:10px 0;}
+  #   details > summary {cursor:pointer;font-weight:700;}
+  #   .road-scroll {max-height: 62vh; overflow-y: auto; padding-right: 10px;}
+  #   .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:10px 12px; border-radius:8px; margin:10px 0;}
+  #   .callout.warn {border-left-color:#E45756; background:#fff7f7;}
+  #   .callout.ok {border-left-color:#72B7B2; background:#f7fffb;}
+  #   code {background:#f3f3f3; padding:0 3px; border-radius:3px;}
+  #   .progress {height:10px; margin:10px 0 0 0;}
+  #   /* Checklist: checkbox-style bullets */
+  #   ul.chk {padding-left: 0; margin: 8px 0 0 0;}
+  #   ul.chk li {list-style: none; margin: 6px 0;}
+  #   .chkbox {display:inline-block; width: 18px; font-weight: 700; margin-right: 6px;}
+  # "))
+  #   
+  #   # ========= Step logic =========
+  #   cur <- input$roadmap_step
+  #   if (is.null(cur) || !is.finite(cur)) cur <- 0
+  #   cur <- as.integer(cur)
+  #   
+  #   step_names <- c(
+  #     "Aperçu & notations (glossaire + lecture du modèle)",
+  #     "Étape 0 — Définir le problème de modélisation",
+  #     "Étape 1 — Décrire les données (qualité, manquants, descriptifs)",
+  #     "Étape 2 — Explorer visuellement (EDA) : tendance/saison/outliers",
+  #     "Étape 3 — Décomposer : additif vs multiplicatif, STL, robustesse",
+  #     "Étape 4 — Stationnarité & différenciation : ADF / KPSS / PP (d, D)",
+  #     "Étape 5 — Baseline : Auto-ARIMA (point de départ, pas un dogme)",
+  #     "Étape 6 — SARIMA manuel : ACF/PACF + candidats raisonnés",
+  #     "Étape 7 — Diagnostics & comparaison : résidus + performance prévision",
+  #     "Étape 8 — Rédaction : Méthodes/Résultats (APA) + livrables propres",
+  #     "Annexes — Formules, checklists, templates, interprétations rapides"
+  #   )
+  #   
+  #   pct <- round(100 * cur / 10)
+  #   progress_ui <- tags$div(
+  #     class="progress",
+  #     tags$div(
+  #       class="progress-bar",
+  #       role="progressbar",
+  #       `aria-valuenow`=pct, `aria-valuemin`="0", `aria-valuemax`="100",
+  #       style = paste0("width:", pct, "%;")
+  #     )
+  #   )
+  #   
+  #   make_step <- function(title, actions_ui, apa_ui, pitfalls_ui, header_ui = NULL) {
+  #     tags$div(
+  #       class = "road-card",
+  #       if (!is.null(header_ui)) header_ui,
+  #       tags$h4(title),
+  #       D("1) Ce que l’étudiant fait (procédure + définitions + objectifs)", actions_ui),
+  #       D("2) Ce qu’il écrit (APA) + conclusion & signification", apa_ui),
+  #       D("3) Pièges + comment les éviter (avec interprétation)", pitfalls_ui)
+  #     )
+  #   }
+  #   
+  #   # ========= Pages =========
+  #   pages <- vector("list", length = 11)
+  #   
+  #   # (0) Aperçu
+  #   pages[[1]] <- make_step(
+  #     step_names[1],
+  #     
+  #     actions_ui = tagList(
+  #       callout(
+  #         B("Objectif global : "),
+  #         "construire un modèle SARIMA interprétable et surtout ",
+  #         B("prédictif"), " : il doit passer les diagnostics résiduels et battre un benchmark simple.",
+  #         type="ok"
+  #       ),
+  #       
+  #       Checklist(
+  #         CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir), préciser son unité, sa source et le contexte d’application (ex. ventes mensuelles, débit quotidien, température horaire)."),
+  #         CheckItem("Fixer la période saisonnière s à partir du contexte et vérifier qu’elle est cohérente avec l’échantillonnage (ex. s=12 pour mensuel, s=7 pour hebdomadaire, s=4 pour trimestriel)."),
+  #         CheckItem("Lire la forme générale du SARIMA et expliquer le rôle de chaque bloc : différenciation (d, D) pour stationnariser, puis composantes AR/MA (p, q, P, Q) pour modéliser la dépendance restante."),
+  #         CheckItem("Énoncer des critères de validation explicites : résidus ≈ bruit blanc (ACF résidus + Ljung–Box), performance hors‑échantillon (train/test ou rolling-origin) et parcimonie (le plus simple qui marche)."),
+  #         CheckItem("Choisir un benchmark (naïf / drift / SNAIVE), l’écrire noir sur blanc et expliquer pourquoi il est pertinent : sans repère, on ne peut pas juger la valeur ajoutée d’un SARIMA.")
+  #       ),
+  #       
+  #       
+  #       H5("Notations essentielles (définitions)"),
+  #       UL(
+  #         tags$li(B("Série temporelle"), " : suite ordonnée d’observations indexées par le temps ", C("y_t"), "."),
+  #         tags$li(B("Fréquence / période saisonnière"), " : nombre de pas par cycle saisonnier, noté ", C("s"),
+  #                 " (ex. mensuel s=12; quotidien avec saison hebdo s=7)."),
+  #         tags$li(B("Opérateur de retard (backshift)"), " : ", C("B y_t = y_{t-1}"), "."),
+  #         tags$li(B("Différenciation ordinaire"), " : ", C("∇ y_t = (1-B)y_t = y_t - y_{t-1}"),
+  #                 " ; appliquée ", C("d"), " fois → supprimer tendance/racine unitaire non saisonnière."),
+  #         tags$li(B("Différenciation saisonnière"), " : ", C("∇_s y_t = (1-B^s)y_t = y_t - y_{t-s}"),
+  #                 " ; appliquée ", C("D"), " fois → supprimer racine unitaire saisonnière."),
+  #         tags$li(B("Innovations / bruit blanc"), " : ", C("ε_t ~ w.n.(0, σ²)"),
+  #                 " signifie des chocs non autocorrélés (moyenne 0, variance constante).")
+  #       ),
+  #       
+  #       H5("Forme générale du modèle SARIMA (à comprendre, pas à mémoriser)"),
+  #       UL(
+  #         tags$li(
+  #           "Écriture compacte : ",
+  #           C("Φ(B^s) φ(B) ∇^d ∇_s^D y_t = Θ(B^s) θ(B) ε_t")
+  #         ),
+  #         tags$li(
+  #           B("Interprétation : "),
+  #           "après différenciations (d, D), on explique la dynamique restante par des composantes AR/MA ",
+  #           "non saisonnières (p,q) et saisonnières (P,Q)."
+  #         )
+  #       ),
+  #       
+  #       H5("Ce que signifie “bon modèle” (définition opérationnelle)"),
+  #       OL(
+  #         tags$li(B("Résidus ~ bruit blanc"), " : pas d’autocorrélation résiduelle (Ljung–Box non significatif)."),
+  #         tags$li(B("Performance out-of-sample"), " : MAE/RMSE meilleurs que benchmark (naïf / SNAIVE)."),
+  #         tags$li(B("Parcimonie"), " : modèle le plus simple possible à performance comparable.")
+  #       ),
+  #       
+  #       # === ADD: Glossaire étendu, critères info, estimation ===
+  #       H5("Glossaire étendu (ajouts importants)"),
+  #       UL(
+  #         tags$li(B("Polynômes AR/MA"), " : ",
+  #                 C("φ(B) = 1 - φ_1 B - ... - φ_p B^p"), ", ",
+  #                 C("θ(B) = 1 + θ_1 B + ... + θ_q B^q"), "; saisonnier ",
+  #                 C("Φ(B^s) = 1 - Φ_1 B^s - ... - Φ_P B^{Ps}"), ", ",
+  #                 C("Θ(B^s) = 1 + Θ_1 B^s + ... + Θ_Q B^{Qs}"), "."),
+  #         tags$li(B("Stabilité/causalité (AR)"), " : toutes les racines de ", C("φ(z)=0"),
+  #                 " et ", C("Φ(z^s)=0"), " sont ", B("hors"), " du cercle unité → processus stationnaire."),
+  #         tags$li(B("Inversibilité (MA)"), " : racines de ", C("θ(z)=0"), " et ", C("Θ(z^s)=0"),
+  #                 " hors du cercle unité → représentation AR(∞) bien définie."),
+  #         tags$li(B("Constante / drift"), " : une constante dans un ARIMA avec ", C("d=1"),
+  #                 " implique une ", B("pente moyenne"), " (drift) après différenciation ; le terme est souvent noté ",
+  #                 C("c"), " et la tendance moyenne vaut environ ", C("c"), " par pas."),
+  #         tags$li(B("Représentation état–espace"), " : tout ARIMA/SARIMA peut être écrit sous forme état–espace ",
+  #                 "et estimé/filtré par Kalman (utile pour manquants et lissage)."),
+  #         tags$li(B("Prévision : point vs intervalle vs densité"),
+  #                 " : point = ", C("ŷ"), "; intervalle = incertitude (80%/95%); densité = distribution prédictive complète.")
+  #       ),
+  #       H5("Critères d’information (définitions)"),
+  #       UL(
+  #         tags$li(B("AIC"), " : ", C("AIC = -2 \\log L + 2k"), " (", C("k"), " = nb paramètres estimés)."),
+  #         tags$li(B("AICc"), " : correction petits échantillons → préférable si ", C("n/k"), " n’est pas grand."),
+  #         tags$li(B("BIC"), " : ", C("BIC = -2 \\log L + k \\log n"), " ; pénalise plus la complexité (favorise parcimonie).")
+  #       ),
+  #       H5("Estimation (comment sont estimés les paramètres)"),
+  #       UL(
+  #         tags$li(B("MLE vs CSS+MLE"), " : estimation par maximum de vraisemblance (souvent via optim) ; ",
+  #                 "CSS (Conditional Sum of Squares) pour initialiser, puis MLE pour affiner."),
+  #         tags$li(B("Écarts-types et tests z"), " : reportez estimations ± SE, z et p pour l’interprétation des coefficients.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Phrase APA (modèle + notations)"),
+  #       P("« Nous avons ajusté un modèle SARIMA afin de capturer la dépendance temporelle et la saisonnalité de la série ",
+  #         C("y_t"), ". La spécification générale est ", C("Φ(B^s) φ(B) ∇^d ∇_s^D y_t = Θ(B^s) θ(B) ε_t"),
+  #         " avec ", C("ε_t"), " un bruit blanc. Le choix de (d, D) a été justifié par des tests de stationnarité (ADF/KPSS/PP) et des diagnostics. »"),
+  #       
+  #       H5("Conclusion & signification (à expliciter)"),
+  #       UL(
+  #         tags$li(B("Conclusion type : "), "« Le modèle final est adéquat »"),
+  #         tags$li(B("Signification : "), "« (i) il ne laisse pas d’information autocorrélée dans les résidus, ",
+  #                 "(ii) il généralise bien sur une fenêtre future, ",
+  #                 "(iii) il est suffisamment simple pour être stable et reproductible. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       H5("Pièges classiques"),
+  #       UL(
+  #         tags$li(B("Confondre AIC faible et bon modèle"), " : un AIC très bas avec résidus autocorrélés = modèle mal spécifié."),
+  #         tags$li(B("Oublier le benchmark"), " : sans SNAIVE/naïf, impossible de dire si SARIMA apporte réellement quelque chose."),
+  #         tags$li(B("Surcharger le modèle"), " : trop de paramètres → instabilité, intervalles de prévision peu fiables.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (1) Étape 0 — Définition du problème
+  #   pages[[2]] <- make_step(
+  #     step_names[2],
+  #     
+  #     actions_ui = tagList(
+  #       callout(
+  #         B("But : "),
+  #         "définir un problème de prévision mesurable (horizon, métriques, protocole).",
+  #         type="info"
+  #       ),
+  #       
+  #       Checklist(
+  #         CheckItem("Définir la variable y_t (cible) et la fréquence temporelle (jour, semaine, mois) sans ambiguite."),
+  #         CheckItem("Fixer l’horizon h en fonction de l’usage reel (decision, planification, stock, etc.)."),
+  #         CheckItem("Choisir un protocole d’evaluation temporelle (train/test ou rolling-origin) et expliquer pourquoi."),
+  #         CheckItem("Choisir des metriques (MAE + RMSE recommande) et justifier leur interpretation."),
+  #         CheckItem("Decider si une transformation (log / Box-Cox) est necessaire et noter la raison.")
+  #       ),
+  #       
+  #       H5("Définitions (ce que chaque terme veut dire)"),
+  #       UL(
+  #         tags$li(B("Série réponse"), " ", C("y_t"), " : variable à prédire (univariée)."),
+  #         tags$li(B("Horizon"), " ", C("h"), " : nombre de pas à prévoir (ex. h=12 mois)."),
+  #         tags$li(B("Origine de prévision"), " : dernier temps observé à partir duquel on prévoit."),
+  #         tags$li(B("Protocole train/test"), " : séparation temporelle (jamais mélanger le futur dans l’entraînement)."),
+  #         tags$li(B("Rolling-origin / validation temporelle"), " : on répète des prévisions à différentes origines pour estimer la performance moyenne."),
+  #         tags$li(B("SARIMA vs SARIMAX"), " : SARIMA n’utilise pas de variables explicatives ; SARIMAX inclut des régressions exogènes.")
+  #       ),
+  #       
+  #       H5("Choisir les métriques (définitions + quand utiliser)"),
+  #       UL(
+  #         tags$li(B("MAE"), " : moyenne des erreurs absolues ", C("mean(|y-ŷ|)"),
+  #                 " → robuste, facile à interpréter (unité de y)."),
+  #         tags$li(B("RMSE"), " : racine de l’erreur quadratique moyenne ", C("sqrt(mean((y-ŷ)^2))"),
+  #                 " → pénalise plus les grosses erreurs."),
+  #         tags$li(B("MAPE"), " : ", C("mean(|(y-ŷ)/y|)"),
+  #                 " → éviter si y proche de 0 (explose)."),
+  #         tags$li(B("sMAPE"), " : alternative plus stable près de 0 : ", C("mean(2|y-ŷ|/(|y|+|ŷ|))"), ".")
+  #       ),
+  #       
+  #       H5("Transformation (définitions + justification)"),
+  #       UL(
+  #         tags$li(B("Niveaux"), " : modèle sur les valeurs brutes."),
+  #         tags$li(B("Log-niveaux"), " : utile si la variance augmente avec le niveau ; convertit souvent multiplicatif → additif."),
+  #         tags$li(B("Box–Cox"), " : transformation paramétrique (λ) pour stabiliser variance et améliorer normalité : ",
+  #                 C("y^(λ) = (y^λ - 1)/λ"), " (λ≠0), et log si λ=0.")
+  #       ),
+  #       
+  #       H5("Procédure minimale (checklist)"),
+  #       OL(
+  #         tags$li("Fixer fréquence et période saisonnière s."),
+  #         tags$li("Fixer horizon h et fenêtres train/test (ou rolling-origin)."),
+  #         tags$li("Choisir MAE + RMSE (recommandé) ; documenter les raisons."),
+  #         tags$li("Décider transformation (aucune/log/Box–Cox) et justifier.")
+  #       ),
+  #       
+  #       # === ADD: précisions pratiques, métriques complémentaires, transformations ===
+  #       H5("Précisions supplémentaires (définitions pratiques)"),
+  #       UL(
+  #         tags$li(B("Horizon multi-pas"), " : ", C("h>1"),
+  #                 " → la performance peut décroître avec l’horizon ; rapporter MAE/RMSE par h si possible."),
+  #         tags$li(B("Fenêtre d’entraînement"), " : ", B("expansive"), " (on ne jette jamais d’anciens points) ",
+  #                 "ou ", B("glissante"), " (fenêtre fixe) ; documenter le choix."),
+  #         tags$li(B("Reproductibilité"), " : fixer les graines aléatoires, consigner versions des packages, chemins de données."),
+  #         tags$li(B("Prévision hiérarchique"), " (annexe) : si agrégations (mois→trimestres), noter la cohérence temporelle.")
+  #       ),
+  #       H5("Métriques supplémentaires (quand utiles)"),
+  #       UL(
+  #         tags$li(B("MASE"), " : erreur absolue mise à l’échelle par le naïf saisonnier → comparable entre séries."),
+  #         tags$li(B("WAPE"), " : ", C("sum(|y-ŷ|)/sum(|y|)"), " ; lisible comme % d’erreur agrégée."),
+  #         tags$li(B("Pinball loss (quantiles)"), " : si vous prédisez des quantiles (IC asymétriques).")
+  #       ),
+  #       H5("Transformations complémentaires"),
+  #       UL(
+  #         tags$li(B("Yeo–Johnson"), " : alternative à Box–Cox qui gère les valeurs ≤ 0."),
+  #         tags$li(B("Stabilisation de variance"), " : vérifier relation niveau–variance (nuage points moyenne locale vs ET).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — modèle de phrase complet"),
+  #       P("« Nous avons modélisé la série temporelle univariée ", C("y_t"),
+  #         " observée à une fréquence [..] (période saisonnière s=[..]). ",
+  #         "L’objectif était de produire des prévisions à horizon ", C("h"), "=[..]. ",
+  #         "La performance a été évaluée sur une fenêtre future selon [split temporel / rolling-origin] ",
+  #         "à l’aide de [MAE, RMSE]. Une transformation [aucune / log / Box–Cox] a été appliquée afin de [stabiliser la variance / linéariser la saisonnalité]. »"),
+  #       
+  #       H5("Conclusion & signification (comment l’expliquer)"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Notre problème est bien défini (h, métriques, protocole). »"),
+  #         tags$li(B("Signification : "), "« Toute comparaison de modèles devient juste : même horizon, même protocole, mêmes métriques. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Fuite temporelle"), " : utiliser des informations du futur (mauvais split) → performance artificiellement élevée."),
+  #         tags$li(B("Métrique mal choisie"), " : MAPE avec y≈0 → conclusions fausses."),
+  #         tags$li(B("Horizon incohérent"), " : un modèle bon à h=1 peut être mauvais à h=12 ; fixer l’horizon selon l’usage réel.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (2) Étape 1 — Description des données
+  #   pages[[3]] <- make_step(
+  #     step_names[3],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "décrire la qualité des données et rendre le pipeline reproductible.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Verifier que l’index temporel est regulier (pas manquants/dupliques, ordre correct)."),
+  #         CheckItem("Rapporter n, date debut/fin, frequence, et la couverture temporelle."),
+  #         CheckItem("Quantifier les manquants (k et %) et choisir une strategie (interpolation, saisonniere, Kalman) avec justification."),
+  #         CheckItem("Produire un resume statistique (moyenne, mediane, ET, min/max) et un resume saisonnier (par mois/semaine)."),
+  #         CheckItem("Documenter toute correction (doublons, valeurs aberrantes evidentes) pour garantir la reproductibilite.")
+  #       ),
+  #       
+  #       H5("Ce qu’il faut rapporter (définitions)"),
+  #       UL(
+  #         tags$li(B("n"), " : nombre total d’observations disponibles."),
+  #         tags$li(B("Couverture"), " : date début/fin."),
+  #         tags$li(B("Fréquence"), " : périodicité (mensuel/hebdo/quotidien)."),
+  #         tags$li(B("Manquants"), " : nombre k et pourcentage k/n.")
+  #       ),
+  #       
+  #       H5("Valeurs manquantes : types + implications"),
+  #       UL(
+  #         tags$li(B("MCAR"), " (Missing Completely At Random) : manquants indépendants → imputation plus défendable."),
+  #         tags$li(B("MAR"), " (At Random conditionnel) : dépend d’autres infos → imputation possible mais à justifier."),
+  #         tags$li(B("MNAR"), " (Not At Random) : dépend de la valeur elle-même → risque de biais important.")
+  #       ),
+  #       
+  #       H5("Stratégies de traitement (quand et pourquoi)"),
+  #       UL(
+  #         tags$li(B("Interpolation linéaire"), " : si manquants rares et pas de ruptures."),
+  #         tags$li(B("Interpolation saisonnière"), " : si saisonnalité stable (ex. remplacer par moyenne du même mois)."),
+  #         tags$li(B("Modèle d’état / Kalman"), " : si on veut une imputation plus probabiliste."),
+  #         tags$li(B("Suppression"), " : seulement si extrêmement rare et sans impact sur la continuité.")
+  #       ),
+  #       
+  #       H5("Descriptifs pertinents (au-delà de la moyenne)"),
+  #       UL(
+  #         tags$li("Moyenne, médiane, ET, min/max (niveau)."),
+  #         tags$li("Asymétrie (skewness) / kurtosis si utile."),
+  #         tags$li("Résumé saisonnier (ex. moyenne par mois), pour documenter saisonnalité.")
+  #       ),
+  #       
+  #       # === ADD: qualité index & manquants pratiques ===
+  #       H5("Qualité de l’index temporel (définitions)"),
+  #       UL(
+  #         tags$li(B("Régularité"), " : pas de pas manqué/dupliqué ; cadence constante."),
+  #         tags$li(B("Fuseau/DST"), " : données horaires → attention aux heures manquantes/dupliquées (passage DST)."),
+  #         tags$li(B("Doublons et horodatages hors ordre"), " : à corriger avant tout calcul d’ACF.")
+  #       ),
+  #       H5("Manquants — remarques pratiques"),
+  #       UL(
+  #         tags$li(B("Kalman/StructTS"), " : imputation probabiliste cohérente avec la dynamique ARIMA."),
+  #         tags$li(B("Imputation “saison identique”"), " : moyenne/médiane du même mois/jour si saisonnalité stable."),
+  #         tags$li(B("Zéros structurels"), " : distinguer “zéro” réel de manquant imputé à 0 (documenter).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Résultats (APA) — description"),
+  #       P("« La série contient ", C("n"), "=[..] observations couvrant [..] à [..] à une fréquence [..]. ",
+  #         "Les valeurs manquantes représentaient [..]% (k=[..]) et ont été traitées par [..], ",
+  #         "choisie car [manquants rares / saisonnalité stable / continuité nécessaire]. ",
+  #         "La série présentait une moyenne de [..] (ET=[..]) et une médiane [..]. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Les données sont suffisamment propres pour SARIMA » (ou non)."),
+  #         tags$li(B("Signification : "),
+  #                 "si l’index est régulier et que les manquants sont gérés explicitement, ",
+  #                 "les hypothèses du modèle (espacement régulier) deviennent plausibles.")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Imputation silencieuse"), " : toujours documenter méthode + raison."),
+  #         tags$li(B("Timestamps irréguliers"), " : SARIMA suppose une grille régulière ; corriger avant toute estimation."),
+  #         tags$li(B("Changement de définition de la variable"), " : ex. changement de mesure → rupture structurelle à traiter.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (3) Étape 2 — EDA
+  #   pages[[4]] <- make_step(
+  #     step_names[4],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "comprendre la structure (tendance/saison/ruptures/outliers) avant d’ajuster SARIMA.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Tracer la serie y_t et annoter tendance, saisonnalite, ruptures possibles et changements de variance."),
+  #         CheckItem("Construire au moins un graphique saisonnier (seasonal plot ou subseries) pour comprendre la forme par saison."),
+  #         CheckItem("Identifier les outliers (dates) et formuler une hypothese (evenement reel vs erreur)."),
+  #         CheckItem("Decider et documenter le traitement des outliers (conserver/corriger/imputer) et tester l’impact sur l’analyse."),
+  #         CheckItem("Noter ce que l’EDA implique pour la suite: transformation possible, differenciation probable, et presence de ruptures.")
+  #       ),
+  #       
+  #       H5("Définitions utiles (ce qu’on cherche)"),
+  #       UL(
+  #         tags$li(B("Tendance"), " : évolution de long terme (déterministe ou stochastique)."),
+  #         tags$li(B("Saisonnalité"), " : motif périodique de période s (ex. 12)."),
+  #         tags$li(B("Rupture structurelle"), " : changement durable de niveau/tendance/variance (ex. politique, crise)."),
+  #         tags$li(B("Outlier"), " : valeur atypique ponctuelle ; peut être réelle (fêtes) ou erreur.")
+  #       ),
+  #       
+  #       H5("Graphiques recommandés + leur but"),
+  #       UL(
+  #         tags$li(B("Courbe y_t"), " : voir tendance, variance, ruptures."),
+  #         tags$li(B("Seasonal plot"), " : comparer la forme saisonnière d’une année à l’autre."),
+  #         tags$li(B("Boxplots par saison"), " : détecter asymétrie/outliers par mois/semaine."),
+  #         tags$li(B("ACF brute"), " (optionnel) : repérer dépendances fortes et saisonnalité.")
+  #       ),
+  #       
+  #       H5("Outliers : procédure raisonnable"),
+  #       OL(
+  #         tags$li("Repérer visuellement (dates)."),
+  #         tags$li("Proposer une hypothèse (événement réel ? erreur ?)."),
+  #         tags$li("Décider : conserver / corriger / imputer (et justifier)."),
+  #         tags$li("Documenter l’impact (le modèle change-t-il beaucoup ?).")
+  #       ),
+  #       
+  #       # === ADD: outils EDA supplémentaires & typologie outliers ===
+  #       H5("Outils EDA supplémentaires"),
+  #       UL(
+  #         tags$li(B("Périodogramme / spectre"), " : met en évidence des fréquences saisonnières inattendues."),
+  #         tags$li(B("Seasonal subseries plot"), " : visualise la forme saisonnière par mois/semaine."),
+  #         tags$li(B("Nuage niveau–variance"), " : aide au choix log/Box–Cox (variance croît avec le niveau ?).")
+  #       ),
+  #       H5("Types d’outliers (interventions)"),
+  #       UL(
+  #         tags$li(B("AO"), " : Additive Outlier (pic ponctuel)."),
+  #         tags$li(B("IO"), " : Innovation Outlier (choc qui diffuse)."),
+  #         tags$li(B("LS"), " : Level Shift (changement de niveau)."),
+  #         tags$li(B("TC"), " : Temporary Change (effet transitoire).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Résultats (APA) — EDA"),
+  #       P("« L’inspection visuelle a mis en évidence une tendance [..] et une saisonnalité récurrente de période s=[..]. ",
+  #         "La variance semblait [constante / croissante avec le niveau], motivant [aucune transformation / log / Box–Cox]. ",
+  #         "Des valeurs atypiques autour de [dates] ont été [conservées/traitées] car [événement réel / erreur probable]. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« La structure (tendance/saison/variance/outliers) est comprise »"),
+  #         tags$li(B("Signification : "),
+  #                 "cela guide directement le choix transformation + différenciations (d, D) et évite d’ajuster un SARIMA “à l’aveugle”.")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Confondre saisonnalité et tendance"), " : une moyenne croissante ET une saisonnalité stable sont deux composantes distinctes."),
+  #         tags$li(B("Retirer des points réels"), " : si l’outlier correspond à un événement récurrent (fêtes), il doit rester."),
+  #         tags$li(B("Ignorer une rupture"), " : un SARIMA “moyenne” une structure qui a changé → mauvais futur.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (4) Étape 3 — Décomposition
+  #   pages[[5]] <- make_step(
+  #     step_names[5],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "séparer tendance/saison/bruit pour motiver la forme (additive vs multiplicative).", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Comparer visuellement une hypothese additive vs multiplicative (amplitude saisonniere constante vs proportionnelle au niveau)."),
+  #         CheckItem("Tester l’idee de transformation log/Box-Cox si la variance augmente avec le niveau."),
+  #         CheckItem("Realiser une decomposition (classique ou STL) et commenter la tendance, la saisonnalite et le residu."),
+  #         CheckItem("Verifier si la saisonnalite semble stable ou evolutive (argument pour STL)."),
+  #         CheckItem("Ecrire clairement ce que la decomposition suggere pour d, D, et pour l’echelle de modelisation.")
+  #       ),
+  #       
+  #       H5("Décomposition : définitions"),
+  #       UL(
+  #         tags$li(B("Additive"), " : ", C("y_t = T_t + S_t + e_t"),
+  #                 " (amplitude saisonnière ~ constante)."),
+  #         tags$li(B("Multiplicative"), " : ", C("y_t = T_t × S_t × e_t"),
+  #                 " (amplitude saisonnière augmente avec le niveau)."),
+  #         tags$li(B("Log"), " : si multiplicatif, log transforme souvent en additif : ",
+  #                 C("log(y_t) = log(T_t) + log(S_t) + log(e_t)"), "."),
+  #         tags$li(B("STL"), " : Seasonal-Trend decomposition using Loess ; flexible, possible robuste aux outliers.")
+  #       ),
+  #       
+  #       H5("Pourquoi STL ? (objectif détaillé)"),
+  #       UL(
+  #         tags$li("Quand la saisonnalité change lentement au fil du temps (non parfaitement répétitive)."),
+  #         tags$li("Quand on veut réduire l’influence des outliers sur l’estimation saison/tendance."),
+  #         tags$li("Quand on veut une lecture pédagogique claire (tendance vs saison vs résidu).")
+  #       ),
+  #       
+  #       H5("Ce que la décomposition ne remplace pas"),
+  #       UL(
+  #         tags$li("Elle ne prouve pas la stationnarité : SARIMA exige une série stationnaire après différenciation."),
+  #         tags$li("Elle ne choisit pas automatiquement (p,q,P,Q) : ACF/PACF + diagnostics restent nécessaires.")
+  #       ),
+  #       
+  #       # === ADD: paramètres STL & règles pratiques ===
+  #       H5("Paramètres STL (lecture pédagogique)"),
+  #       UL(
+  #         tags$li(B("s.window"), " : lissage saisonnier (", C("periodic"), " = saison constante; entier = évolutive)."),
+  #         tags$li(B("t.window"), " : lissage de la tendance (fenêtre LOESS)."),
+  #         tags$li(B("robust"), " : réduit l’influence des outliers (itérations avec poids).")
+  #       ),
+  #       H5("Additif vs multiplicatif (règle pratique)"),
+  #       UL(
+  #         tags$li("Amplitude saisonnière ~ proportionnelle au niveau → penser ", B("log"), " ou modèle multiplicatif."),
+  #         tags$li("Amplitude ~ constante → additif sur niveaux.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — Décomposition"),
+  #       P("« Nous avons étudié une structure additive vs multiplicative en évaluant si l’amplitude saisonnière variait avec le niveau. ",
+  #         "Comme [..], nous avons retenu [modèle additif / transformation log] et réalisé une décomposition via [classique / STL]. ",
+  #         "STL a été privilégiée pour sa flexibilité (saisonnalité évolutive) et sa robustesse aux valeurs atypiques. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le choix additif/multiplicatif est justifié »"),
+  #         tags$li(B("Signification : "),
+  #                 "on évite des résidus hétéroscédastiques et on améliore la stabilité de l’estimation SARIMA.")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Décomposition ≠ stationnarité"), " : après décomposition, on doit encore tester/choisir d et D."),
+  #         tags$li(B("Oublier l’échelle"), " : si vous modélisez log(y), les prévisions doivent être reconverties (avec prudence)."),
+  #         tags$li(B("Confondre bruit et structure"), " : des motifs résiduels persistants suggèrent que la saison/tendance n’a pas été correctement capturée.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (5) Étape 4 — Stationnarité (très détaillé : ADF/KPSS/PP + …)
+  #   pages[[6]] <- make_step(
+  #     step_names[6],
+  #     
+  #     actions_ui = tagList(
+  #       callout(
+  #         B("Idée centrale : "),
+  #         "Dans un SARIMA, on n’essaie pas de modéliser directement une série ‘qui dérive’ : on cherche d’abord à obtenir une série stationnaire (au moins approximativement) via la différenciation. Les tests ADF, PP et KPSS ne sont pas des “juges” absolus, mais des indices complémentaires qui aident à justifier les choix (d, D) de façon argumentée.",
+  #         type = "ok"
+  #       ),
+  #       
+  #       Checklist(
+  #         CheckItem("Définir la stationnarité avec vos mots (moyenne/variance stables; dépendance qui ne change pas au cours du temps)."),
+  #         CheckItem("Appliquer ADF, KPSS et PP sur la série brute, puis écrire clairement H0 et Ha pour chacun (ils ne testent pas la même chose)."),
+  #         CheckItem("Proposer d et D de manière progressive (essayer d=1 puis D=1 si nécessaire) et re-tester après chaque transformation."),
+  #         CheckItem("Surveiller les signes de sur‑différenciation (ACF lag 1 très négative, variance gonflée, dynamique artificielle)."),
+  #         CheckItem("Justifier le choix final (d, D, s) par convergence : tests + graphiques + ACF/PACF, pas par une seule p‑value.")
+  #       ),
+  #       
+  #       
+  #       H5("Définition : stationnarité (ce que cela veut dire)"),
+  #       UL(
+  #         tags$li(B("Stationnarité faible (covariance-stationnaire)"), " : moyenne constante, variance constante, ",
+  #                 "et autocovariance dépend uniquement du retard (pas de t)."),
+  #         tags$li(B("Non-stationnarité"), " : tendance stochastique (racine unitaire), variance changeante, ou saisonnalité non traitée."),
+  #         tags$li(B("Racine unitaire"), " : choc permanent (effet ne s’éteint pas), typique d’un processus I(1).")
+  #       ),
+  #       
+  #       H5("Différenciation : rôle (d vs D)"),
+  #       UL(
+  #         tags$li(B("d"), " enlève la racine unitaire non saisonnière / tendance stochastique : ", C("(1-B)^d"), "."),
+  #         tags$li(B("D"), " enlève la racine unitaire saisonnière : ", C("(1-B^s)^D"), "."),
+  #         tags$li(B("Règle pratique"), " : d ∈ {0,1,2} (souvent 0–1) ; D ∈ {0,1} (rarement 2).")
+  #       ),
+  #       
+  #       H5("Test ADF (Augmented Dickey–Fuller) — définition & objectif"),
+  #       UL(
+  #         tags$li(B("But"), " : tester si la série contient une racine unitaire (non-stationnaire) en présence d’autocorrélation."),
+  #         tags$li(B("Régression (intuition)"), " : on teste si le coefficient de ", C("y_{t-1}"),
+  #                 " est compatible avec une racine unitaire après ajout de retards de Δy pour “absorber” l’autocorrélation."),
+  #         tags$li(B("Hypothèses"), " : ",
+  #                 B("H0"), " = racine unitaire (non-stationnaire) ; ",
+  #                 B("Ha"), " = stationnaire (autour d’une moyenne ou d’une tendance selon la spécification)."),
+  #         tags$li(B("Interprétation p-value"), " : p petit → rejet H0 → stationnarité (au sens ADF). p grand → on ne rejette pas → différenciation probablement nécessaire.")
+  #       ),
+  #       
+  #       H5("Test KPSS — définition & objectif (inverse de l’ADF)"),
+  #       UL(
+  #         tags$li(B("But"), " : tester si la série est stationnaire (niveau ou tendance)."),
+  #         tags$li(B("Hypothèses"), " : ",
+  #                 B("H0"), " = stationnaire ; ",
+  #                 B("Ha"), " = non-stationnaire (racine unitaire / stationnarité violée)."),
+  #         tags$li(B("Interprétation"), " : p petit → rejet H0 → non-stationnaire. p grand → compatible stationnarité.")
+  #       ),
+  #       
+  #       H5("Test PP (Phillips–Perron) — définition & objectif"),
+  #       UL(
+  #         tags$li(B("But"), " : test de racine unitaire comme ADF, mais corrige l’autocorrélation et l’hétéroscédasticité autrement (correction non-paramétrique)."),
+  #         tags$li(B("Hypothèses"), " : ",
+  #                 B("H0"), " = racine unitaire ; ",
+  #                 B("Ha"), " = stationnaire."),
+  #         tags$li(B("Pourquoi utile"), " : complément de robustesse ; si ADF et PP convergent, confiance accrue.")
+  #       ),
+  #       
+  #       H5("Comment conclure en combinant ADF/KPSS/PP (logique complète)"),
+  #       OL(
+  #         tags$li(B("Stationnarité forte : "), "ADF/PP rejettent H0 (p petit) ET KPSS ne rejette pas (p grand)."),
+  #         tags$li(B("Non-stationnarité forte : "), "ADF/PP ne rejettent pas (p grand) ET KPSS rejette (p petit)."),
+  #         tags$li(B("Conflit : "), "les tests divergent → regarder graphiques, ACF, résultats après une différence, et justifier par convergence d’indices (pas une seule p-value).")
+  #       ),
+  #       
+  #       H5("Procédure recommandée (pas à pas)"),
+  #       OL(
+  #         tags$li("Fixer ", B("s"), " (période saisonnière) à partir du contexte et de l’EDA."),
+  #         tags$li("Tester ADF/KPSS/PP sur la série brute."),
+  #         tags$li("Essayer d=1 si nécessaire, retester."),
+  #         tags$li("Essayer D=1 si saisonnalité/racine saisonnière, retester."),
+  #         tags$li("S’arrêter dès que stationnarité “raisonnable” ; éviter sur-différenciation.")
+  #       ),
+  #       
+  #       H5("Sur-différenciation : définition + symptômes"),
+  #       UL(
+  #         tags$li(B("Définition"), " : appliquer trop de différences → on introduit une dynamique artificielle."),
+  #         tags$li(B("Symptômes fréquents"), " : ACF au lag 1 très négative, variance gonflée, prévisions erratiques, paramètres instables."),
+  #         tags$li(B("Conséquence"), " : intervalles de prévision plus larges et modèle moins fiable.")
+  #       ),
+  #       
+  #       # === ADD: tests/bonnes pratiques complémentaires ===
+  #       H5("Tests et notions complémentaires"),
+  #       UL(
+  #         tags$li(B("Tendance déterministe vs racine unitaire"),
+  #                 " : on peut préférer un ARIMA avec ", C("d=0"), " et une tendance ", B("déterministe"),
+  #                 " (régression + ARMA sur résidus) si la tendance semble stable."),
+  #         tags$li(B("Racine unitaire saisonnière (HEGY)"), " : (annexe) test dédié aux racines à ", C("±1, ±i"), " pour ",
+  #                 C("s=4,12"), " ; utile si la saisonnalité stochastique domine."),
+  #         tags$li(B("Zivot–Andrews"), " : (annexe) racine unitaire avec rupture endogène possible.")
+  #       ),
+  #       H5("Bonnes pratiques de différenciation"),
+  #       UL(
+  #         tags$li(B("Au plus une différence"), " : commencer par ", C("d=1"), " ou ", C("D=1"),
+  #                 " ; ", B("éviter"), " ", C("d=2"), " sauf preuves fortes."),
+  #         tags$li(B("Sur-différenciation : "), "ACF lag 1 très négative, variance gonflée, MA artificiel → revenir en arrière.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — Tests & choix de (d, D)"),
+  #       P("« La stationnarité a été évaluée à l’aide des tests ADF, KPSS et PP afin de trianguler l’évidence, ces tests ayant des hypothèses nulles différentes. ",
+  #         "Les résultats ont été examinés sur la série originale puis après différenciations ordinaires et saisonnières. ",
+  #         "Sur la base de l’ensemble des indices (tests + diagnostics visuels), nous avons retenu d=[..] et D=[..] avec s=[..], ",
+  #         "afin d’obtenir une série approximativement stationnaire adaptée à l’estimation SARIMA, tout en évitant la sur-différenciation. »"),
+  #       
+  #       H5("Conclusion test (prête à remplir) + signification"),
+  #       UL(
+  #         tags$li(B("ADF : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+  #                 " H0 (racine unitaire). ",
+  #                 B("Signification : "),
+  #                 "si rejet → la série est compatible stationnarité (au sens ADF) ; sinon → différenciation probablement nécessaire."),
+  #         tags$li(B("KPSS : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+  #                 " H0 (stationnarité). ",
+  #                 B("Signification : "),
+  #                 "si rejet → non-stationnarité (donc d/D à augmenter ou transformation/rupture à traiter)."),
+  #         tags$li(B("PP : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+  #                 " H0 (racine unitaire). ",
+  #                 B("Signification : "),
+  #                 "confirme ou nuance ADF ; convergence ADF+PP renforce la conclusion.")
+  #       ),
+  #       
+  #       H5("Conclusion finale (d, D) + ce que cela implique pour SARIMA"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Nous retenons d=[..], D=[..], s=[..]. »"),
+  #         tags$li(B("Signification : "),
+  #                 "« le SARIMA sera estimé sur la série différenciée ; les paramètres AR/MA décrivent la dynamique ",
+  #                 "restante après retrait de la tendance et/ou de la saisonnalité non stationnaire. »")
+  #       ),
+  #       
+  #       # === ADD: points à expliciter
+  #       H5("À expliciter (rappel)"),
+  #       UL(
+  #         tags$li("Préciser si une constante/drift est incluse et à quel niveau (avant/après différenciation)."),
+  #         tags$li("Documenter toute rupture suspectée et ses conséquences sur le choix de ", C("d, D"), ".")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Choisir d et D “par habitude”"), " : toujours justifier par tests + EDA."),
+  #         tags$li(B("Ignorer une rupture structurelle"), " : les tests peuvent “crier non-stationnaire” alors qu’un changement de régime est en cause."),
+  #         tags$li(B("Interpréter p-value comme preuve absolue"), " : ce sont des indices ; en conflit, on s’appuie sur convergence des preuves.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (6) Étape 5 — Auto-ARIMA baseline
+  #   pages[[7]] <- make_step(
+  #     step_names[7],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "obtenir un point de départ compétitif, puis vérifier/affiner.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Executer auto-ARIMA avec des bornes raisonnables sur p,q,P,Q et noter le critere (AICc) utilise."),
+  #         CheckItem("Enregistrer le modele baseline (ordres + presence drift/constante) pour comparaison ulterieure."),
+  #         CheckItem("Verifier diagnostics residuels (ACF residus, Ljung-Box) avant de le considerer ‘acceptable’."),
+  #         CheckItem("Evaluer la performance sur la fenetre test (MAE/RMSE) et comparer au benchmark naif/SNAIVE."),
+  #         CheckItem("Decider si vous cherchez une version plus parcimonieuse (BIC plus faible ou meme performance avec moins de parametres).")
+  #       ),
+  #       
+  #       H5("Définition : auto-ARIMA (ce que fait réellement l’algorithme)"),
+  #       UL(
+  #         tags$li("Explore un ensemble de modèles candidats (p,q,P,Q) sous contraintes."),
+  #         tags$li("Choisit souvent via minimisation ", B("AICc"),
+  #                 " (AIC corrigé petits échantillons)."),
+  #         tags$li("Peut utiliser recherche stepwise (rapide) ou plus exhaustive (plus coûteuse).")
+  #       ),
+  #       
+  #       H5("Pourquoi AICc ? (objectif)"),
+  #       UL(
+  #         tags$li("Compromis entre qualité d’ajustement et complexité (pénalise les paramètres)."),
+  #         tags$li("AICc est préférable à AIC quand n n’est pas très grand par rapport au nombre de paramètres.")
+  #       ),
+  #       
+  #       H5("Procédure propre"),
+  #       OL(
+  #         tags$li("Fixer d/D (ou laisser recommander via ndiffs/nsdiffs, mais valider)."),
+  #         tags$li("Fixer bornes max p/q/P/Q ; documenter."),
+  #         tags$li("Sauvegarder le modèle baseline (pour comparaison)."),
+  #         tags$li("Vérifier diagnostics résiduels + performance sur test.")
+  #       ),
+  #       
+  #       # === ADD: détails de recherche & critères multiples ===
+  #       H5("Détails de recherche"),
+  #       UL(
+  #         tags$li(B("Stepwise vs exhaustive"), " : stepwise = rapide, peut rater un optimum global ; exhaustive = coûteux mais plus fiable."),
+  #         tags$li(B("Contraintes"), " : imposer ", C("p,q,P,Q \u2264"), " bornes raisonnables ; forcer stabilité/inversibilité."),
+  #         tags$li(B("drift/constante"), " : tester versions avec et sans drift lorsque ", C("d=1"), ".")
+  #       ),
+  #       H5("Critères multiples"),
+  #       UL(
+  #         tags$li("Comparer AICc ", B("et"), " BIC ; en cas de quasi-égalité → choisir le plus parcimonieux.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — baseline"),
+  #       P("« Un modèle SARIMA de référence a été sélectionné via une procédure auto-ARIMA basée sur un critère d’information (minimisation de l’AICc) parmi des ordres candidats sous contraintes [..]. ",
+  #         "La spécification obtenue a été utilisée comme baseline, puis comparée à des modèles manuels plus parcimonieux sur la base des diagnostics et de la performance de prévision. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Auto-ARIMA fournit une baseline solide »"),
+  #         tags$li(B("Signification : "), "« on a un repère : tout modèle final doit faire au moins aussi bien. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Modèle “trop complexe”"), " : stepwise peut sélectionner des ordres élevés → instabilité, interprétation difficile."),
+  #         tags$li(B("AICc excellent mais résidus mauvais"), " : diagnostics priment."),
+  #         tags$li(B("Oublier la parcimonie"), " : si deux modèles prédisent pareil, garder le plus simple.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (7) Étape 6 — SARIMA manuel
+  #   pages[[8]] <- make_step(
+  #     step_names[8],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "proposer un petit ensemble raisonné de candidats via ACF/PACF.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Tracer ACF/PACF de la serie differenciee (apres choix d et D) et identifier les pics significatifs."),
+  #         CheckItem("Proposer un petit ensemble de candidats (3 a 8) en justifiant p,q,P,Q par les motifs ACF/PACF (y compris aux multiples de s)."),
+  #         CheckItem("Ajuster chaque candidat, relever AICc/BIC, et verifier stabilite/inversibilite si possible."),
+  #         CheckItem("Comparer sur diagnostics residuels ET performance predictive (pas seulement AICc)."),
+  #         CheckItem("Garder le modele le plus simple qui passe diagnostics et bat le benchmark.")
+  #       ),
+  #       
+  #       H5("Définitions : ACF / PACF (ce que mesurent ces courbes)"),
+  #       UL(
+  #         tags$li(B("ACF"), " : corrélation entre ", C("y_t"), " et ", C("y_{t-k}"),
+  #                 " → suggère MA(q) si coupure nette vers q."),
+  #         tags$li(B("PACF"), " : corrélation “pure” au retard k une fois les retards <k contrôlés ",
+  #                 "→ suggère AR(p) si coupure nette vers p.")
+  #       ),
+  #       
+  #       H5("Heuristiques (non saisonnier)"),
+  #       UL(
+  #         tags$li(B("AR(p)"), " : PACF se coupe ~p ; ACF décroît."),
+  #         tags$li(B("MA(q)"), " : ACF se coupe ~q ; PACF décroît."),
+  #         tags$li(B("ARMA"), " : ACF et PACF décroissent (pas de coupure franche).")
+  #       ),
+  #       
+  #       H5("Heuristiques saisonnières (multiples de s)"),
+  #       UL(
+  #         tags$li(B("SAR(P)"), " : pics PACF à s, 2s, ..."),
+  #         tags$li(B("SMA(Q)"), " : pics ACF à s, 2s, ...")
+  #       ),
+  #       
+  #       H5("Procédure recommandée (petit nombre de modèles)"),
+  #       OL(
+  #         tags$li("Construire 3 à 8 candidats (parcimonieux)."),
+  #         tags$li("Ajuster et comparer AICc/BIC."),
+  #         tags$li("Vérifier stabilité/inversibilité."),
+  #         tags$li("Retenir ceux qui passent diagnostics + prévision.")
+  #       ),
+  #       
+  #       # === ADD: conception de candidats & lecture fine ===
+  #       H5("Conception de candidats (rappels utiles)"),
+  #       UL(
+  #         tags$li(B("Limiter le set"), " : 3–8 modèles max, justifiés par ACF/PACF."),
+  #         tags$li(B("Stabilité/inversibilité"), " : vérifier racines des polynômes AR/MA (hors cercle unité)."),
+  #         tags$li(B("drift/constante"), " : inclure/exclure et comparer au niveau AICc/BIC + diagnostics.")
+  #       ),
+  #       H5("Lecture fine ACF/PACF"),
+  #       UL(
+  #         tags$li("Pics à ", C("s, 2s, 3s"), " dans l’ACF → penser ", B("SMA(Q)"), "."),
+  #         tags$li("Pics à ", C("s, 2s"), " dans la PACF → penser ", B("SAR(P)"), "."),
+  #         tags$li("Queue AR (décroissance géométrique) vs coupure MA (après q).")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Méthodes (APA) — sélection manuelle"),
+  #       P("« Les structures candidates ont été proposées sur la base des schémas ACF/PACF de la série différenciée. ",
+  #         "Des autocorrélations aux multiples de s indiquaient des termes saisonniers, tandis que la dynamique de court terme guidait les ordres non saisonniers. ",
+  #         "Un ensemble restreint de modèles (n=[..]) a été ajusté et comparé via AICc/BIC et diagnostics résiduels, en privilégiant la parcimonie. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le modèle final est soutenu par la structure ACF/PACF et les diagnostics. »"),
+  #         tags$li(B("Signification : "), "« on réduit le risque de sur-ajustement en limitant les candidats. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Brute-force massif"), " : tester 200 modèles puis choisir le plus petit AICc = data snooping."),
+  #         tags$li(B("Surinterpréter ACF/PACF"), " : ce sont des guides, pas des preuves."),
+  #         tags$li(B("Ignorer l’inversibilité/stabilité"), " : paramètres instables → prévisions incohérentes.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (8) Étape 7 — Diagnostics & comparaison
+  #   pages[[9]] <- make_step(
+  #     step_names[9],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "valider que le modèle explique toute la dépendance et prédit bien.", type="ok"),
+  #       
+  #       Checklist(
+  #         CheckItem("Examiner les residus: courbe temporelle, ACF residus, et Ljung-Box a plusieurs lags L."),
+  #         CheckItem("Verifier qu’il n’y a pas de structure residuelle (p-value Ljung-Box non significative) et ajuster si necessaire."),
+  #         CheckItem("Evaluer la prediction hors-echantillon (MAE/RMSE/MASE) avec le meme horizon et le meme protocole pour tous les modeles."),
+  #         CheckItem("Comparer explicitement au benchmark (naif/SNAIVE) et conclure sur la valeur ajoutee."),
+  #         CheckItem("Documenter toute violation (ARCH, rupture, non-normalite) et expliquer l’impact sur IC et interpretation.")
+  #       ),
+  #       
+  #       H5("Diagnostics résiduels : définitions & buts"),
+  #       UL(
+  #         tags$li(B("Résidus"), " : ", C("e_t = y_t - ŷ_t"),
+  #                 " (ou résidus d’innovation selon l’implémentation)."),
+  #         tags$li(B("Bruit blanc"), " : absence d’autocorrélation résiduelle → le modèle a capturé la structure temporelle."),
+  #         tags$li(B("Ljung–Box"), " : test global d’autocorrélation des résidus jusqu’à un lag L.")
+  #       ),
+  #       
+  #       H5("Test de Ljung–Box (définition + interprétation)"),
+  #       UL(
+  #         tags$li(B("But"), " : tester si les autocorrélations résiduelles jusqu’à L sont globalement nulles."),
+  #         tags$li(B("Hypothèses"), " : ", B("H0"), " = pas d’autocorrélation résiduelle ; ", B("Ha"), " = autocorrélation résiduelle présente."),
+  #         tags$li(B("Conclusion"), " : p petit → rejet H0 → modèle incomplet (ajuster p/q/P/Q ou d/D)."),
+  #         tags$li(B("Signification pratique"), " : si autocorrélation résiduelle reste, vos intervalles/prévisions sont souvent trop optimistes.")
+  #       ),
+  #       
+  #       H5("Normalité & hétéroscédasticité (à quoi ça sert vraiment)"),
+  #       UL(
+  #         tags$li(B("Normalité"), " : utile pour l’interprétation probabiliste (IC) ; pas toujours critique si objectif = point forecast."),
+  #         tags$li(B("ARCH / variance changeante"), " : peut rendre les IC sous-estimés ; si fort, envisager modèles de variance (GARCH) selon le cours.")
+  #       ),
+  #       
+  #       H5("Évaluation prévision (définition + protocole)"),
+  #       UL(
+  #         tags$li(B("Split temporel"), " : entraîner sur le passé, tester sur le futur."),
+  #         tags$li(B("Rolling-origin"), " : répéter sur plusieurs origines → estimation plus robuste."),
+  #         tags$li(B("Benchmark"), " : naїf / drift / SNAIVE. Un SARIMA utile doit battre au moins SNAIVE à l’horizon cible.")
+  #       ),
+  #       
+  #       # === ADD: diagnostics additionnels & comparaison ===
+  #       H5("Diagnostics additionnels"),
+  #       UL(
+  #         tags$li(B("Box–Pierce vs Ljung–Box"), " : préférer Ljung–Box (meilleure petite taille)."),
+  #         tags$li(B("Normalité résiduelle"), " : Q–Q plot, Jarque–Bera ; utile pour IC mais secondaire si but = point forecast."),
+  #         tags$li(B("Hétéroscédasticité / ARCH"), " : tester ACF des résidus au carré ; si fort → discuter modèles de variance (annexe)."),
+  #         tags$li(B("Significativité des coefficients"), " : rapporter est., SE, z, p ; supprimer termes non significatifs si performance constante.")
+  #       ),
+  #       H5("Comparaison de modèles"),
+  #       UL(
+  #         tags$li(B("Tableau récapitulatif"), " : AICc/BIC, Ljung–Box (p), MAE/RMSE/MASE, nb de paramètres."),
+  #         tags$li(B("Test de Diebold–Mariano"), " : (annexe) comparer formellement 2 séries d’erreurs prédictives.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Résultats (APA) — diagnostics"),
+  #       P("« Les diagnostics résiduels indiquaient un comportement proche du bruit blanc : l’ACF des résidus ne montrait pas de pics substantiels et le test de Ljung–Box était [non significatif/significatif] au seuil α=[..]. ",
+  #         "La performance de prévision sur la fenêtre d’évaluation donnait MAE=[..] et RMSE=[..], surpassant le benchmark [..]. »"),
+  #       
+  #       H5("Conclusion & signification (diagnostics + performance)"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le modèle est acceptable » si Ljung–Box non significatif ET benchmark battu."),
+  #         tags$li(B("Signification : "),
+  #                 "« le modèle capte la structure temporelle (résidus ~ bruit) et apporte un gain prédictif réel (out-of-sample). »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Bon AIC mais Ljung–Box significatif"), " : modèle incomplet → ne pas valider."),
+  #         tags$li(B("Se focaliser sur la normalité"), " : priorité = absence d’autocorrélation résiduelle."),
+  #         tags$li(B("Comparer des modèles sur des horizons différents"), " : toujours même h, même protocole.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (9) Étape 8 — Rédaction
+  #   pages[[10]] <- make_step(
+  #     step_names[10],
+  #     
+  #     actions_ui = tagList(
+  #       callout(B("But : "), "écrire un rapport clair, reproductible, aligné aux étapes 0–7.", type="info"),
+  #       
+  #       Checklist(
+  #         CheckItem("Rediger une section Methodes qui suit exactement le pipeline: donnees -> EDA -> stationnarite -> selection -> diagnostics -> prevision."),
+  #         CheckItem("Inclure figures indispensables: serie, decomposition, ACF/PACF, residus, previsions + intervalles."),
+  #         CheckItem("Inclure un tableau de comparaison (AICc/BIC, Ljung-Box, MAE/RMSE, benchmark, nb parametres)."),
+  #         CheckItem("Preciser l’echelle (niveau/log/Box-Cox) et expliquer toute reconversion des previsions."),
+  #         CheckItem("Ajouter un encadre limites + pistes (ruptures, SARIMAX, GARCH) et assurer la reproductibilite (versions).")
+  #       ),
+  #       
+  #       H5("Structure APA recommandée (définition)"),
+  #       UL(
+  #         tags$li(B("Méthodes"), " : ce que vous avez fait et pourquoi (données → EDA → stationnarité → modèles → évaluation)."),
+  #         tags$li(B("Résultats"), " : ce que vous avez observé (stats, figures, tests, métriques, modèle final)."),
+  #         tags$li(B("Discussion"), " (optionnel) : limites (ruptures, horizon, incertitudes) + pistes (SARIMAX/GARCH).")
+  #       ),
+  #       
+  #       H5("Pack livrable propre (checklist)"),
+  #       UL(
+  #         tags$li("Notebook/script reproductible (import → nettoyage → EDA → tests → modèles → diagnostics → prévisions)."),
+  #         tags$li("Figures : série, décomposition, ACF/PACF, résidus (ACF + Ljung–Box), prévisions + IC."),
+  #         tags$li("Tableau : candidats vs AICc/BIC vs Ljung–Box vs MAE/RMSE vs benchmark.")
+  #       ),
+  #       
+  #       # === ADD: rapporter correctement les prévisions ===
+  #       H5("Rapporter correctement les prévisions"),
+  #       UL(
+  #         tags$li(B("Niveau de couverture"), " : préciser 80% et/ou 95% ; indiquer si log-échelle a été reconvertie."),
+  #         tags$li(B("Biais de reconversion (log→niveau)"), " : mentionner correction ",
+  #                 C("exp(\\hat{y}) \\times exp(\\hat{\\sigma}^2/2)"), " si utilisée."),
+  #         tags$li(B("Reproductibilité"), " : versions R/packages, seed, chemin des données, date d’extraction.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Phrase finale (APA) — modèle final + interprétation"),
+  #       P("« Sur la base de l’adéquation diagnostique et de la performance prédictive, le modèle final retenu était SARIMA((p,d,q)(P,D,Q)_s). ",
+  #         "Les résidus étant compatibles avec un bruit blanc, nous concluons que la structure temporelle principale a été capturée. ",
+  #         "Les prévisions produites à horizon h=[..] améliorent le benchmark [..] selon MAE/RMSE, ce qui soutient l’usage du modèle pour l’application ciblée. »"),
+  #       
+  #       H5("Conclusion & signification"),
+  #       UL(
+  #         tags$li(B("Conclusion : "), "« Le rapport est aligné, justifié, reproductible. »"),
+  #         tags$li(B("Signification : "),
+  #                 "« un lecteur externe peut reproduire vos résultats et comprendre chaque choix (transformation, d/D, sélection, diagnostics). »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Ne pas relier choix → preuves"), " : chaque décision doit être liée à EDA/tests/diagnostics."),
+  #         tags$li(B("Trop de texte, pas assez de figures"), " : en séries temporelles, les figures sont des résultats."),
+  #         tags$li(B("Oublier de préciser l’échelle"), " : niveau vs log vs Box–Cox et reconversion des prévisions.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # (10) Annexes
+  #   pages[[11]] <- make_step(
+  #     step_names[11],
+  #     
+  #     actions_ui = tagList(
+  #       Checklist(
+  #         CheckItem("Reconnaitre et pouvoir ecrire les trois benchmarks (naif, drift, SNAIVE) et expliquer quand chacun est approprie."),
+  #         CheckItem("Savoir lire rapidement un resultat ADF/KPSS/PP et traduire la conclusion en choix de d et D."),
+  #         CheckItem("Savoir expliquer ce que signifie Ljung-Box significatif (structure residuelle) et quelle action entreprendre."),
+  #         CheckItem("Memoriser les formules utiles (AIC/AICc/BIC, Ljung-Box, operateurs de differenciation) et leur interpretation."),
+  #         CheckItem("Identifier quand il faut sortir du cadre SARIMA (exogenes, multiples saisonnalites, ruptures, variance conditionnelle).")
+  #       ),
+  #       
+  #       H5("Benchmarks (définitions)"),
+  #       UL(
+  #         tags$li(B("Naïf"), " : ", C("ŷ_{t+1|t} = y_t"), " (persistance)."),
+  #         tags$li(B("Drift"), " : extrapolation linéaire moyenne."),
+  #         tags$li(B("SNAIVE"), " : répète la dernière valeur de la même saison : ", C("ŷ_{t+h|t} = y_{t+h-s}"), ".")
+  #       ),
+  #       
+  #       H5("Règles d’interprétation ultra rapides"),
+  #       UL(
+  #         tags$li(B("ADF/PP rejettent"), " + ", B("KPSS ne rejette pas"), " → stationnarité plausible."),
+  #         tags$li(B("ADF/PP ne rejettent pas"), " + ", B("KPSS rejette"), " → différenciation nécessaire."),
+  #         tags$li(B("Ljung–Box significatif"), " → il reste de la structure → réviser le modèle.")
+  #       ),
+  #       
+  #       # === ADD: formules utiles & pistes avancées ===
+  #       H5("Formules utiles (mémo)"),
+  #       UL(
+  #         tags$li(B("Critères d’info"), " : ",
+  #                 C("AIC=-2\\log L+2k"), ", ",
+  #                 C("AICc= AIC + \\frac{2k(k+1)}{n-k-1}"), ", ",
+  #                 C("BIC=-2\\log L+k\\log n"), "."),
+  #         tags$li(B("MASE"), " : ", C("\\frac{\\frac{1}{T}\\sum_{t}|e_t|}{\\frac{1}{T-s}\\sum_{t}|y_t-y_{t-s}|}"), " (pour périodicité ", C("s"), ")."),
+  #         tags$li(B("Ljung–Box"), " : ", C("Q^* = n(n+2)\\sum_{k=1}^{L} \\frac{\\hat{\\rho}_k^2}{n-k}"),
+  #                 " ~ ", C("\\chi^2"), " sous ", C("H_0"), " avec ddl ≈ ", C("L - p - q - (P+Q)"), "."),
+  #         tags$li(B("Backshift & diff."), " : ",
+  #                 C("\\nabla=(1-B)"), ", ", C("\\nabla_s=(1-B^s)"), ", ",
+  #                 C("\\nabla^d \\nabla_s^D y_t"), " pour stationnariser.")
+  #       ),
+  #       H5("Pistes avancées (pour l’enseignant)"),
+  #       UL(
+  #         tags$li(B("SARIMAX / régression dynamique"), " : variables exogènes, pré-blanchiment, fonctions de transfert."),
+  #         tags$li(B("Ruptures/Interventions"), " : dummies LS/TC, estimation avec régresseurs."),
+  #         tags$li(B("Multiples saisonnalités"), " : TBATS/ETS-MS si présence de s multiples.")
+  #       )
+  #     ),
+  #     
+  #     apa_ui = tagList(
+  #       H5("Template “Conclusion tests → choix (d,D)” (copier-coller)"),
+  #       P("« Les tests ADF/PP et KPSS ont été interprétés conjointement. ",
+  #         "Comme [ADF/PP: rejettent/ne rejettent pas] la racine unitaire et [KPSS: rejette/ne rejette pas] la stationnarité, ",
+  #         "nous concluons que la série est [stationnaire/non-stationnaire] au sens des diagnostics combinés. ",
+  #         "Nous retenons donc d=[..] et D=[..] (s=[..]) pour obtenir une série stationnaire pour l’estimation SARIMA. »"),
+  #       
+  #       H5("Signification (traduction simple)"),
+  #       UL(
+  #         tags$li("« d et D disent combien de fois on doit “retirer” une tendance et une saisonnalité non stationnaire. »"),
+  #         tags$li("« Ensuite, p/q/P/Q décrivent la dépendance restante (mémoire) dans la série transformée. »")
+  #       )
+  #     ),
+  #     
+  #     pitfalls_ui = tagList(
+  #       UL(
+  #         tags$li(B("Croire qu’un test “décide” seul"), " : toujours trianguler avec EDA + ACF + comportement après différenciation."),
+  #         tags$li(B("Oublier la finalité"), " : prévision (out-of-sample) + diagnostics passent avant l’esthétique d’un AIC."),
+  #         tags$li(B("Ne pas documenter"), " : un bon modèle non documenté = inutilisable dans un cours/rapport.")
+  #       )
+  #     )
+  #   )
+  #   
+  #   # ========= Output =========
+  #   tagList(
+  #     css,
+  #     tags$h4(style="margin-top:12px;", paste0("Page ", cur, "/10 — ", step_names[cur + 1L])),
+  #     progress_ui,
+  #     pages[[cur + 1L]]
+  #   )
+  # })
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+#'   # --- Roadmap slider navigation (Prev/Next) ---
+#'   observeEvent(input$road_prev, {
+#'     cur <- input$roadmap_step
+#'     if (is.null(cur)) cur <- 0
+#'     updateSliderInput(session, "roadmap_step", value = max(0, as.integer(cur) - 1L))
+#'   }, ignoreInit = TRUE)
+#'   
+#'   observeEvent(input$road_next, {
+#'     cur <- input$roadmap_step
+#'     if (is.null(cur)) cur <- 0
+#'     updateSliderInput(session, "roadmap_step", value = min(10, as.integer(cur) + 1L))
+#'   }, ignoreInit = TRUE)
+#'   
+#'   # =========================
+#'   # Roadmap UI (controls)
+#'   # =========================
+#'   output$roadmap_Detailed_Fr_ui4 <- renderUI({
+#'     
+#'     tags$div(
+#'       class = "road-shell",
+#'       style = "background:#f7f7f7;padding:14px;border-radius:10px;",
+#'       
+#'       tags$style(HTML("
+#' .road-shell {background:#f7f7f7;padding:14px;border-radius:12px;border:1px solid #ececec;}
+#'       .road-title {margin:0 0 6px 0;font-size:22px;font-weight:800;letter-spacing:.2px;}
+#'       .road-sub {margin:0 0 12px 0;color:#555;line-height:1.45;}
+#'       .road-nav {display:flex;gap:10px;align-items:center;flex-wrap:wrap;position:sticky;top:0;z-index:50;background:#f7f7f7;padding:10px 0 8px 0;border-bottom:1px solid #ececec;}
+#'       .road-nav .btn {min-width:46px;border-radius:10px;padding:6px 12px;}
+#'       .road-nav .btn:focus {outline:none;box-shadow:0 0 0 3px rgba(76,120,168,.25);}
+#'       .road-nav .form-group {margin-bottom:0;}
+#'       /* Slider polish (Shiny uses ionRangeSlider) */
+#'       .road-shell .irs--shiny .irs-bar {background:#4C78A8;}
+#'       .road-shell .irs--shiny .irs-handle>i:first-child {background:#4C78A8;}
+#'       .road-shell .irs--shiny .irs-from,
+#'       .road-shell .irs--shiny .irs-to,
+#'       .road-shell .irs--shiny .irs-single {background:#4C78A8;}
+#'       @media (max-width: 900px) {
+#'         .road-nav {gap:8px;}
+#'         .road-nav .irs {width:100% !important;}
+#'         .road-nav .form-group {width:100%;}
+#'       }
+#'       .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:16px;margin-top:14px;box-shadow:0 2px 10px rgba(0,0,0,.03);}
+#'       .step-header {display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;}
+#'       .step-badge {display:inline-block;font-weight:800;font-size:12px;letter-spacing:.3px;text-transform:uppercase;padding:4px 10px;border-radius:999px;background:#eef4fb;color:#254b74;border:1px solid #d9e7f6;}
+#'       .step-hint {color:#666;font-size:12px;}
+#'       details {background:#ffffff;border:1px solid #eaeaea;border-radius:12px;padding:0;margin:10px 0;overflow:hidden;}
+#'       details > summary {cursor:pointer;font-weight:700;padding:10px 12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;background:linear-gradient(180deg,#ffffff 0%,#fbfbfb 100%);}
+#'       details > summary::-webkit-details-marker {display:none;}
+#'       details > summary:after {content:'▸';font-size:16px;color:#666;transform:rotate(0deg);transition:transform .12s ease;}
+#'       details[open] > summary:after {transform:rotate(90deg);}
+#'       details:hover {border-color:#dcdcdc;}
+#'       details[open] {border-color:#d9e7f6;box-shadow:0 2px 10px rgba(76,120,168,.08);}
+#'       .callout {border-left:5px solid #4C78A8;background:#fafafa;padding:12px 12px;border-radius:10px;margin:10px 0;}
+#'       .callout.warn {border-left-color:#E45756;background:#fff7f7;}
+#'       .callout.ok {border-left-color:#72B7B2;background:#f7fffb;}
+#'       .callout.checklist {border-left-color:#F2CF5B;background:#fffdf4;}
+#'       .checklist-title {display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+#'       .checklist-icon {font-weight:800;}
+#'       code {background:#f3f3f3;padding:0 4px;border-radius:4px;}
+#'       .progress {height:10px;border-radius:999px;background:#ececec;overflow:hidden;margin:10px 0 0 0;}
+#'       .progress-bar {border-radius:999px;}
+#' ")),
+#'       
+#'       tags$h3(class="road-title", "Feuille de route SARIMA (version pédagogique)"),
+#'       tags$p(class="road-sub",
+#'              "Utilisez le curseur pour passer d’une étape à l’autre. Chaque étape contient : Actions → À écrire (APA) → Pièges."),
+#'       
+#'       tags$div(
+#'         class = "road-nav",
+#'         actionButton("road_prev", "◀", class = "btn btn-default"),
+#'         sliderInput(
+#'           "roadmap_step", label = NULL,
+#'           min = 0, max = 10, value = 0, step = 1, width = "520px"
+#'         ),
+#'         actionButton("road_next", "▶", class = "btn btn-default"),
+#'         tags$span(style="color:#666;", "Astuce : gardez les blocs repliés pour éviter toute scroll.")
+#'       ),
+#'       
+#'       # Progress bar (pure UI, updated via re-render of content)
+#'       shiny::uiOutput("roadmap_step_content")
+#'     )
+#'   })
+#'   
+#'   # =========================
+#'   # Roadmap UI (content)
+#'   # =========================
+#'   output$roadmap_step_content <- renderUI({
+#'     
+#'     # ========= Helpers =========
+#'     D <- function(title, ...) {
+#'       tags$details(
+#'         tags$summary(title),
+#'         tags$div(class = "road-scroll", ...)
+#'       )
+#'     }
+#'     UL <- function(...) tags$ul(...)
+#'     OL <- function(...) tags$ol(...)
+#'     P  <- function(...) tags$p(...)
+#'     B  <- function(...) tags$b(...)
+#'     C  <- function(...) tags$code(...)
+#'     H5 <- function(...) tags$h5(style="margin-top:10px;margin-bottom:6px;", ...)
+#'     
+#'     # ========= Checklist helpers (UI only) =========
+#'     # These are intentionally simple visual checklists (no reactive logic).
+#'     # Pedagogical goal: help students translate “read/explain” into
+#'     # concrete actions they can verify before moving to the next step.
+#'     CheckItem <- function(...) {
+#'       tags$li(
+#'         tags$span(class = "chkbox", "☐"),
+#'         tags$span(...)
+#'       )
+#'     }
+#'     Checklist <- function(...) {
+#'       tags$div(
+#'         class = "callout checklist",
+#'         tags$div(
+#'           class = "checklist-title",
+#'           tags$span(class = "checklist-icon", "☑"),
+#'           tags$b("Checklist étudiant")
+#'         ),
+#'         tags$ul(class = "chk", ...)
+#'       )
+#'     }
+#'     
+#'     callout <- function(..., type = c("info","ok","warn")) {
+#'       type <- match.arg(type)
+#'       cls <- if (type=="ok") "callout ok" else if (type=="warn") "callout warn" else "callout"
+#'       tags$div(class = cls, ...)
+#'     }
+#'     
+#'     # ========= CSS (internal scroll so the page stays short) =========
+#'     css <- tags$style(HTML("
+#' .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:16px;margin-top:14px;box-shadow:0 2px 10px rgba(0,0,0,.03);}
+#'     .step-header {display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;}
+#'     .step-badge {display:inline-block;font-weight:800;font-size:12px;letter-spacing:.3px;text-transform:uppercase;padding:4px 10px;border-radius:999px;background:#eef4fb;color:#254b74;border:1px solid #d9e7f6;}
+#'     .step-hint {color:#666;font-size:12px;}
+#'     details {background:#ffffff;border:1px solid #eaeaea;border-radius:12px;padding:0;margin:10px 0;overflow:hidden;}
+#'     details > summary {cursor:pointer;font-weight:700;padding:10px 12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;background:linear-gradient(180deg,#ffffff 0%,#fbfbfb 100%);}
+#'     details > summary::-webkit-details-marker {display:none;}
+#'     details > summary:after {content:'▸';font-size:16px;color:#666;transform:rotate(0deg);transition:transform .12s ease;}
+#'     details[open] > summary:after {transform:rotate(90deg);}
+#'     details:hover {border-color:#dcdcdc;}
+#'     details[open] {border-color:#d9e7f6;box-shadow:0 2px 10px rgba(76,120,168,.08);}
+#'     .road-scroll {max-height: 62vh; overflow-y: auto; padding:10px 12px 12px 12px; padding-right: 14px;}
+#'     .road-scroll::-webkit-scrollbar {width: 10px;}
+#'     .road-scroll::-webkit-scrollbar-thumb {background: #e0e0e0; border-radius: 999px; border: 3px solid #fff;}
+#'     .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:12px 12px; border-radius:10px; margin:10px 0;}
+#'     .callout.warn {border-left-color:#E45756; background:#fff7f7;}
+#'     .callout.ok {border-left-color:#72B7B2; background:#f7fffb;}
+#'     .callout.checklist {border-left-color:#F2CF5B; background:#fffdf4;}
+#'     .checklist-title {display:flex; align-items:center; gap:8px; margin-bottom:6px;}
+#'     .checklist-icon {font-weight:800;}
+#'     code {background:#f3f3f3; padding:0 4px; border-radius:4px;}
+#'     .progress {height:10px; border-radius:999px; background:#ececec; overflow:hidden; margin:10px 0 0 0;}
+#'     .progress-bar {border-radius:999px;}
+#'     /* Checklist: checkbox-style bullets */
+#'     ul.chk {padding-left: 0; margin: 8px 0 0 0;}
+#'     ul.chk li {list-style: none; margin: 7px 0; display:flex; align-items:flex-start; gap:8px;}
+#'     .chkbox {display:inline-block; width: 18px; font-weight: 800; margin-top: 1px;}
+#' "))
+#'     
+#'     # ========= Step logic =========
+#'     cur <- input$roadmap_step
+#'     if (is.null(cur) || !is.finite(cur)) cur <- 0
+#'     cur <- as.integer(cur)
+#'     
+#'     step_names <- c(
+#'       "Aperçu & notations (glossaire + lecture du modèle)",
+#'       "Étape 0 — Définir le problème de modélisation",
+#'       "Étape 1 — Décrire les données (qualité, manquants, descriptifs)",
+#'       "Étape 2 — Explorer visuellement (EDA) : tendance/saison/outliers",
+#'       "Étape 3 — Décomposer : additif vs multiplicatif, STL, robustesse",
+#'       "Étape 4 — Stationnarité & différenciation : ADF / KPSS / PP (d, D)",
+#'       "Étape 5 — Baseline : Auto-ARIMA (point de départ, pas un dogme)",
+#'       "Étape 6 — SARIMA manuel : ACF/PACF + candidats raisonnés",
+#'       "Étape 7 — Diagnostics & comparaison : résidus + performance prévision",
+#'       "Étape 8 — Rédaction : Méthodes/Résultats (APA) + livrables propres",
+#'       "Annexes — Formules, checklists, templates, interprétations rapides"
+#'     )
+#'     
+#'     pct <- round(100 * cur / 10)
+#'     progress_ui <- tags$div(
+#'       class="progress",
+#'       tags$div(
+#'         class="progress-bar",
+#'         role="progressbar",
+#'         `aria-valuenow`=pct, `aria-valuemin`="0", `aria-valuemax`="100",
+#'         style = paste0("width:", pct, "%;")
+#'       )
+#'     )
+#'     
+#'     make_step <- function(title, actions_ui, apa_ui, pitfalls_ui, header_ui = NULL) {
+#'       step_badge <- if (isTRUE(cur == 0L)) "Aperçu" else paste0("Étape ", cur, "/10")
+#'       tags$div(
+#'         class = "road-card",
+#'         if (!is.null(header_ui)) header_ui,
+#'         tags$div(
+#'           class = "step-header",
+#'           tags$span(class = "step-badge", step_badge),
+#'           tags$span(class = "step-hint", "Dépliez un bloc à la fois : Actions → APA → Pièges.")
+#'         ),
+#'         tags$h4(title),
+#'         D("1) Ce que l’étudiant fait (procédure + définitions + objectifs)", actions_ui),
+#'         D("2) Ce qu’il écrit (APA) + conclusion & signification", apa_ui),
+#'         D("3) Pièges + comment les éviter (avec interprétation)", pitfalls_ui)
+#'       )
+#'     }
+#'     
+#'     # ========= Pages =========
+#'     pages <- vector("list", length = 11)
+#'     
+#'     # (0) Aperçu
+#'     pages[[1]] <- make_step(
+#'       step_names[1],
+#'       
+#'       actions_ui = tagList(
+#'         callout(
+#'           B("Objectif global : "),
+#'           "construire un modèle SARIMA interprétable et surtout ",
+#'           B("prédictif"), " : il doit passer les diagnostics résiduels et battre un benchmark simple.",
+#'           type="ok"
+#'         ),
+#'         
+#'         Checklist(
+#'           CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir), préciser son unité, sa source et le contexte d’application (ex. ventes mensuelles, débit quotidien, température horaire)."),
+#'           CheckItem("Fixer la période saisonnière s à partir du contexte et vérifier qu’elle est cohérente avec l’échantillonnage (ex. s=12 pour mensuel, s=7 pour hebdomadaire, s=4 pour trimestriel)."),
+#'           CheckItem("Lire la forme générale du SARIMA et expliquer le rôle de chaque bloc : différenciation (d, D) pour stationnariser, puis composantes AR/MA (p, q, P, Q) pour modéliser la dépendance restante."),
+#'           CheckItem("Énoncer des critères de validation explicites : résidus ≈ bruit blanc (ACF résidus + Ljung–Box), performance hors‑échantillon (train/test ou rolling-origin) et parcimonie (le plus simple qui marche)."),
+#'           CheckItem("Choisir un benchmark (naïf / drift / SNAIVE), l’écrire noir sur blanc et expliquer pourquoi il est pertinent : sans repère, on ne peut pas juger la valeur ajoutée d’un SARIMA.")
+#'         ),
+#'         
+#'         
+#'         H5("Notations essentielles (définitions)"),
+#'         UL(
+#'           tags$li(B("Série temporelle"), " : suite ordonnée d’observations indexées par le temps ", C("y_t"), "."),
+#'           tags$li(B("Fréquence / période saisonnière"), " : nombre de pas par cycle saisonnier, noté ", C("s"),
+#'                   " (ex. mensuel s=12; quotidien avec saison hebdo s=7)."),
+#'           tags$li(B("Opérateur de retard (backshift)"), " : ", C("B y_t = y_{t-1}"), "."),
+#'           tags$li(B("Différenciation ordinaire"), " : ", C("∇ y_t = (1-B)y_t = y_t - y_{t-1}"),
+#'                   " ; appliquée ", C("d"), " fois → supprimer tendance/racine unitaire non saisonnière."),
+#'           tags$li(B("Différenciation saisonnière"), " : ", C("∇_s y_t = (1-B^s)y_t = y_t - y_{t-s}"),
+#'                   " ; appliquée ", C("D"), " fois → supprimer racine unitaire saisonnière."),
+#'           tags$li(B("Innovations / bruit blanc"), " : ", C("ε_t ~ w.n.(0, σ²)"),
+#'                   " signifie des chocs non autocorrélés (moyenne 0, variance constante).")
+#'         ),
+#'         
+#'         H5("Forme générale du modèle SARIMA (à comprendre, pas à mémoriser)"),
+#'         UL(
+#'           tags$li(
+#'             "Écriture compacte : ",
+#'             C("Φ(B^s) φ(B) ∇^d ∇_s^D y_t = Θ(B^s) θ(B) ε_t")
+#'           ),
+#'           tags$li(
+#'             B("Interprétation : "),
+#'             "après différenciations (d, D), on explique la dynamique restante par des composantes AR/MA ",
+#'             "non saisonnières (p,q) et saisonnières (P,Q)."
+#'           )
+#'         ),
+#'         
+#'         H5("Ce que signifie “bon modèle” (définition opérationnelle)"),
+#'         OL(
+#'           tags$li(B("Résidus ~ bruit blanc"), " : pas d’autocorrélation résiduelle (Ljung–Box non significatif)."),
+#'           tags$li(B("Performance out-of-sample"), " : MAE/RMSE meilleurs que benchmark (naïf / SNAIVE)."),
+#'           tags$li(B("Parcimonie"), " : modèle le plus simple possible à performance comparable.")
+#'         ),
+#'         
+#'         # === ADD: Glossaire étendu, critères info, estimation ===
+#'         H5("Glossaire étendu (ajouts importants)"),
+#'         UL(
+#'           tags$li(B("Polynômes AR/MA"), " : ",
+#'                   C("φ(B) = 1 - φ_1 B - ... - φ_p B^p"), ", ",
+#'                   C("θ(B) = 1 + θ_1 B + ... + θ_q B^q"), "; saisonnier ",
+#'                   C("Φ(B^s) = 1 - Φ_1 B^s - ... - Φ_P B^{Ps}"), ", ",
+#'                   C("Θ(B^s) = 1 + Θ_1 B^s + ... + Θ_Q B^{Qs}"), "."),
+#'           tags$li(B("Stabilité/causalité (AR)"), " : toutes les racines de ", C("φ(z)=0"),
+#'                   " et ", C("Φ(z^s)=0"), " sont ", B("hors"), " du cercle unité → processus stationnaire."),
+#'           tags$li(B("Inversibilité (MA)"), " : racines de ", C("θ(z)=0"), " et ", C("Θ(z^s)=0"),
+#'                   " hors du cercle unité → représentation AR(∞) bien définie."),
+#'           tags$li(B("Constante / drift"), " : une constante dans un ARIMA avec ", C("d=1"),
+#'                   " implique une ", B("pente moyenne"), " (drift) après différenciation ; le terme est souvent noté ",
+#'                   C("c"), " et la tendance moyenne vaut environ ", C("c"), " par pas."),
+#'           tags$li(B("Représentation état–espace"), " : tout ARIMA/SARIMA peut être écrit sous forme état–espace ",
+#'                   "et estimé/filtré par Kalman (utile pour manquants et lissage)."),
+#'           tags$li(B("Prévision : point vs intervalle vs densité"),
+#'                   " : point = ", C("ŷ"), "; intervalle = incertitude (80%/95%); densité = distribution prédictive complète.")
+#'         ),
+#'         H5("Critères d’information (définitions)"),
+#'         UL(
+#'           tags$li(B("AIC"), " : ", C("AIC = -2 \\log L + 2k"), " (", C("k"), " = nb paramètres estimés)."),
+#'           tags$li(B("AICc"), " : correction petits échantillons → préférable si ", C("n/k"), " n’est pas grand."),
+#'           tags$li(B("BIC"), " : ", C("BIC = -2 \\log L + k \\log n"), " ; pénalise plus la complexité (favorise parcimonie).")
+#'         ),
+#'         H5("Estimation (comment sont estimés les paramètres)"),
+#'         UL(
+#'           tags$li(B("MLE vs CSS+MLE"), " : estimation par maximum de vraisemblance (souvent via optim) ; ",
+#'                   "CSS (Conditional Sum of Squares) pour initialiser, puis MLE pour affiner."),
+#'           tags$li(B("Écarts-types et tests z"), " : reportez estimations ± SE, z et p pour l’interprétation des coefficients.")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Phrase APA (modèle + notations)"),
+#'         P("« Nous avons ajusté un modèle SARIMA afin de capturer la dépendance temporelle et la saisonnalité de la série ",
+#'           C("y_t"), ". La spécification générale est ", C("Φ(B^s) φ(B) ∇^d ∇_s^D y_t = Θ(B^s) θ(B) ε_t"),
+#'           " avec ", C("ε_t"), " un bruit blanc. Le choix de (d, D) a été justifié par des tests de stationnarité (ADF/KPSS/PP) et des diagnostics. »"),
+#'         
+#'         H5("Conclusion & signification (à expliciter)"),
+#'         UL(
+#'           tags$li(B("Conclusion type : "), "« Le modèle final est adéquat »"),
+#'           tags$li(B("Signification : "), "« (i) il ne laisse pas d’information autocorrélée dans les résidus, ",
+#'                   "(ii) il généralise bien sur une fenêtre future, ",
+#'                   "(iii) il est suffisamment simple pour être stable et reproductible. »")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         H5("Pièges classiques"),
+#'         UL(
+#'           tags$li(B("Confondre AIC faible et bon modèle"), " : un AIC très bas avec résidus autocorrélés = modèle mal spécifié."),
+#'           tags$li(B("Oublier le benchmark"), " : sans SNAIVE/naïf, impossible de dire si SARIMA apporte réellement quelque chose."),
+#'           tags$li(B("Surcharger le modèle"), " : trop de paramètres → instabilité, intervalles de prévision peu fiables.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (1) Étape 0 — Définition du problème
+#'     pages[[2]] <- make_step(
+#'       step_names[2],
+#'       
+#'       actions_ui = tagList(
+#'         callout(
+#'           B("But : "),
+#'           "définir un problème de prévision mesurable (horizon, métriques, protocole).",
+#'           type="info"
+#'         ),
+#'         
+#'         Checklist(
+#'           CheckItem("Définir la variable y_t (cible) et la fréquence temporelle (jour, semaine, mois) sans ambiguite."),
+#'           CheckItem("Fixer l’horizon h en fonction de l’usage reel (decision, planification, stock, etc.)."),
+#'           CheckItem("Choisir un protocole d’evaluation temporelle (train/test ou rolling-origin) et expliquer pourquoi."),
+#'           CheckItem("Choisir des metriques (MAE + RMSE recommande) et justifier leur interpretation."),
+#'           CheckItem("Decider si une transformation (log / Box-Cox) est necessaire et noter la raison.")
+#'         ),
+#'         
+#'         H5("Définitions (ce que chaque terme veut dire)"),
+#'         UL(
+#'           tags$li(B("Série réponse"), " ", C("y_t"), " : variable à prédire (univariée)."),
+#'           tags$li(B("Horizon"), " ", C("h"), " : nombre de pas à prévoir (ex. h=12 mois)."),
+#'           tags$li(B("Origine de prévision"), " : dernier temps observé à partir duquel on prévoit."),
+#'           tags$li(B("Protocole train/test"), " : séparation temporelle (jamais mélanger le futur dans l’entraînement)."),
+#'           tags$li(B("Rolling-origin / validation temporelle"), " : on répète des prévisions à différentes origines pour estimer la performance moyenne."),
+#'           tags$li(B("SARIMA vs SARIMAX"), " : SARIMA n’utilise pas de variables explicatives ; SARIMAX inclut des régressions exogènes.")
+#'         ),
+#'         
+#'         H5("Choisir les métriques (définitions + quand utiliser)"),
+#'         UL(
+#'           tags$li(B("MAE"), " : moyenne des erreurs absolues ", C("mean(|y-ŷ|)"),
+#'                   " → robuste, facile à interpréter (unité de y)."),
+#'           tags$li(B("RMSE"), " : racine de l’erreur quadratique moyenne ", C("sqrt(mean((y-ŷ)^2))"),
+#'                   " → pénalise plus les grosses erreurs."),
+#'           tags$li(B("MAPE"), " : ", C("mean(|(y-ŷ)/y|)"),
+#'                   " → éviter si y proche de 0 (explose)."),
+#'           tags$li(B("sMAPE"), " : alternative plus stable près de 0 : ", C("mean(2|y-ŷ|/(|y|+|ŷ|))"), ".")
+#'         ),
+#'         
+#'         H5("Transformation (définitions + justification)"),
+#'         UL(
+#'           tags$li(B("Niveaux"), " : modèle sur les valeurs brutes."),
+#'           tags$li(B("Log-niveaux"), " : utile si la variance augmente avec le niveau ; convertit souvent multiplicatif → additif."),
+#'           tags$li(B("Box–Cox"), " : transformation paramétrique (λ) pour stabiliser variance et améliorer normalité : ",
+#'                   C("y^(λ) = (y^λ - 1)/λ"), " (λ≠0), et log si λ=0.")
+#'         ),
+#'         
+#'         H5("Procédure minimale (checklist)"),
+#'         OL(
+#'           tags$li("Fixer fréquence et période saisonnière s."),
+#'           tags$li("Fixer horizon h et fenêtres train/test (ou rolling-origin)."),
+#'           tags$li("Choisir MAE + RMSE (recommandé) ; documenter les raisons."),
+#'           tags$li("Décider transformation (aucune/log/Box–Cox) et justifier.")
+#'         ),
+#'         
+#'         # === ADD: précisions pratiques, métriques complémentaires, transformations ===
+#'         H5("Précisions supplémentaires (définitions pratiques)"),
+#'         UL(
+#'           tags$li(B("Horizon multi-pas"), " : ", C("h>1"),
+#'                   " → la performance peut décroître avec l’horizon ; rapporter MAE/RMSE par h si possible."),
+#'           tags$li(B("Fenêtre d’entraînement"), " : ", B("expansive"), " (on ne jette jamais d’anciens points) ",
+#'                   "ou ", B("glissante"), " (fenêtre fixe) ; documenter le choix."),
+#'           tags$li(B("Reproductibilité"), " : fixer les graines aléatoires, consigner versions des packages, chemins de données."),
+#'           tags$li(B("Prévision hiérarchique"), " (annexe) : si agrégations (mois→trimestres), noter la cohérence temporelle.")
+#'         ),
+#'         H5("Métriques supplémentaires (quand utiles)"),
+#'         UL(
+#'           tags$li(B("MASE"), " : erreur absolue mise à l’échelle par le naïf saisonnier → comparable entre séries."),
+#'           tags$li(B("WAPE"), " : ", C("sum(|y-ŷ|)/sum(|y|)"), " ; lisible comme % d’erreur agrégée."),
+#'           tags$li(B("Pinball loss (quantiles)"), " : si vous prédisez des quantiles (IC asymétriques).")
+#'         ),
+#'         H5("Transformations complémentaires"),
+#'         UL(
+#'           tags$li(B("Yeo–Johnson"), " : alternative à Box–Cox qui gère les valeurs ≤ 0."),
+#'           tags$li(B("Stabilisation de variance"), " : vérifier relation niveau–variance (nuage points moyenne locale vs ET).")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Méthodes (APA) — modèle de phrase complet"),
+#'         P("« Nous avons modélisé la série temporelle univariée ", C("y_t"),
+#'           " observée à une fréquence [..] (période saisonnière s=[..]). ",
+#'           "L’objectif était de produire des prévisions à horizon ", C("h"), "=[..]. ",
+#'           "La performance a été évaluée sur une fenêtre future selon [split temporel / rolling-origin] ",
+#'           "à l’aide de [MAE, RMSE]. Une transformation [aucune / log / Box–Cox] a été appliquée afin de [stabiliser la variance / linéariser la saisonnalité]. »"),
+#'         
+#'         H5("Conclusion & signification (comment l’expliquer)"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Notre problème est bien défini (h, métriques, protocole). »"),
+#'           tags$li(B("Signification : "), "« Toute comparaison de modèles devient juste : même horizon, même protocole, mêmes métriques. »")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Fuite temporelle"), " : utiliser des informations du futur (mauvais split) → performance artificiellement élevée."),
+#'           tags$li(B("Métrique mal choisie"), " : MAPE avec y≈0 → conclusions fausses."),
+#'           tags$li(B("Horizon incohérent"), " : un modèle bon à h=1 peut être mauvais à h=12 ; fixer l’horizon selon l’usage réel.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (2) Étape 1 — Description des données
+#'     pages[[3]] <- make_step(
+#'       step_names[3],
+#'       
+#'       actions_ui = tagList(
+#'         callout(B("But : "), "décrire la qualité des données et rendre le pipeline reproductible.", type="info"),
+#'         
+#'         Checklist(
+#'           CheckItem("Verifier que l’index temporel est regulier (pas manquants/dupliques, ordre correct)."),
+#'           CheckItem("Rapporter n, date debut/fin, frequence, et la couverture temporelle."),
+#'           CheckItem("Quantifier les manquants (k et %) et choisir une strategie (interpolation, saisonniere, Kalman) avec justification."),
+#'           CheckItem("Produire un resume statistique (moyenne, mediane, ET, min/max) et un resume saisonnier (par mois/semaine)."),
+#'           CheckItem("Documenter toute correction (doublons, valeurs aberrantes evidentes) pour garantir la reproductibilite.")
+#'         ),
+#'         
+#'         H5("Ce qu’il faut rapporter (définitions)"),
+#'         UL(
+#'           tags$li(B("n"), " : nombre total d’observations disponibles."),
+#'           tags$li(B("Couverture"), " : date début/fin."),
+#'           tags$li(B("Fréquence"), " : périodicité (mensuel/hebdo/quotidien)."),
+#'           tags$li(B("Manquants"), " : nombre k et pourcentage k/n.")
+#'         ),
+#'         
+#'         H5("Valeurs manquantes : types + implications"),
+#'         UL(
+#'           tags$li(B("MCAR"), " (Missing Completely At Random) : manquants indépendants → imputation plus défendable."),
+#'           tags$li(B("MAR"), " (At Random conditionnel) : dépend d’autres infos → imputation possible mais à justifier."),
+#'           tags$li(B("MNAR"), " (Not At Random) : dépend de la valeur elle-même → risque de biais important.")
+#'         ),
+#'         
+#'         H5("Stratégies de traitement (quand et pourquoi)"),
+#'         UL(
+#'           tags$li(B("Interpolation linéaire"), " : si manquants rares et pas de ruptures."),
+#'           tags$li(B("Interpolation saisonnière"), " : si saisonnalité stable (ex. remplacer par moyenne du même mois)."),
+#'           tags$li(B("Modèle d’état / Kalman"), " : si on veut une imputation plus probabiliste."),
+#'           tags$li(B("Suppression"), " : seulement si extrêmement rare et sans impact sur la continuité.")
+#'         ),
+#'         
+#'         H5("Descriptifs pertinents (au-delà de la moyenne)"),
+#'         UL(
+#'           tags$li("Moyenne, médiane, ET, min/max (niveau)."),
+#'           tags$li("Asymétrie (skewness) / kurtosis si utile."),
+#'           tags$li("Résumé saisonnier (ex. moyenne par mois), pour documenter saisonnalité.")
+#'         ),
+#'         
+#'         # === ADD: qualité index & manquants pratiques ===
+#'         H5("Qualité de l’index temporel (définitions)"),
+#'         UL(
+#'           tags$li(B("Régularité"), " : pas de pas manqué/dupliqué ; cadence constante."),
+#'           tags$li(B("Fuseau/DST"), " : données horaires → attention aux heures manquantes/dupliquées (passage DST)."),
+#'           tags$li(B("Doublons et horodatages hors ordre"), " : à corriger avant tout calcul d’ACF.")
+#'         ),
+#'         H5("Manquants — remarques pratiques"),
+#'         UL(
+#'           tags$li(B("Kalman/StructTS"), " : imputation probabiliste cohérente avec la dynamique ARIMA."),
+#'           tags$li(B("Imputation “saison identique”"), " : moyenne/médiane du même mois/jour si saisonnalité stable."),
+#'           tags$li(B("Zéros structurels"), " : distinguer “zéro” réel de manquant imputé à 0 (documenter).")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Résultats (APA) — description"),
+#'         P("« La série contient ", C("n"), "=[..] observations couvrant [..] à [..] à une fréquence [..]. ",
+#'           "Les valeurs manquantes représentaient [..]% (k=[..]) et ont été traitées par [..], ",
+#'           "choisie car [manquants rares / saisonnalité stable / continuité nécessaire]. ",
+#'           "La série présentait une moyenne de [..] (ET=[..]) et une médiane [..]. »"),
+#'         
+#'         H5("Conclusion & signification"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Les données sont suffisamment propres pour SARIMA » (ou non)."),
+#'           tags$li(B("Signification : "),
+#'                   "si l’index est régulier et que les manquants sont gérés explicitement, ",
+#'                   "les hypothèses du modèle (espacement régulier) deviennent plausibles.")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Imputation silencieuse"), " : toujours documenter méthode + raison."),
+#'           tags$li(B("Timestamps irréguliers"), " : SARIMA suppose une grille régulière ; corriger avant toute estimation."),
+#'           tags$li(B("Changement de définition de la variable"), " : ex. changement de mesure → rupture structurelle à traiter.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (3) Étape 2 — EDA
+#'     pages[[4]] <- make_step(
+#'       step_names[4],
+#'       
+#'       actions_ui = tagList(
+#'         callout(B("But : "), "comprendre la structure (tendance/saison/ruptures/outliers) avant d’ajuster SARIMA.", type="info"),
+#'         
+#'         Checklist(
+#'           CheckItem("Tracer la serie y_t et annoter tendance, saisonnalite, ruptures possibles et changements de variance."),
+#'           CheckItem("Construire au moins un graphique saisonnier (seasonal plot ou subseries) pour comprendre la forme par saison."),
+#'           CheckItem("Identifier les outliers (dates) et formuler une hypothese (evenement reel vs erreur)."),
+#'           CheckItem("Decider et documenter le traitement des outliers (conserver/corriger/imputer) et tester l’impact sur l’analyse."),
+#'           CheckItem("Noter ce que l’EDA implique pour la suite: transformation possible, differenciation probable, et presence de ruptures.")
+#'         ),
+#'         
+#'         H5("Définitions utiles (ce qu’on cherche)"),
+#'         UL(
+#'           tags$li(B("Tendance"), " : évolution de long terme (déterministe ou stochastique)."),
+#'           tags$li(B("Saisonnalité"), " : motif périodique de période s (ex. 12)."),
+#'           tags$li(B("Rupture structurelle"), " : changement durable de niveau/tendance/variance (ex. politique, crise)."),
+#'           tags$li(B("Outlier"), " : valeur atypique ponctuelle ; peut être réelle (fêtes) ou erreur.")
+#'         ),
+#'         
+#'         H5("Graphiques recommandés + leur but"),
+#'         UL(
+#'           tags$li(B("Courbe y_t"), " : voir tendance, variance, ruptures."),
+#'           tags$li(B("Seasonal plot"), " : comparer la forme saisonnière d’une année à l’autre."),
+#'           tags$li(B("Boxplots par saison"), " : détecter asymétrie/outliers par mois/semaine."),
+#'           tags$li(B("ACF brute"), " (optionnel) : repérer dépendances fortes et saisonnalité.")
+#'         ),
+#'         
+#'         H5("Outliers : procédure raisonnable"),
+#'         OL(
+#'           tags$li("Repérer visuellement (dates)."),
+#'           tags$li("Proposer une hypothèse (événement réel ? erreur ?)."),
+#'           tags$li("Décider : conserver / corriger / imputer (et justifier)."),
+#'           tags$li("Documenter l’impact (le modèle change-t-il beaucoup ?).")
+#'         ),
+#'         
+#'         # === ADD: outils EDA supplémentaires & typologie outliers ===
+#'         H5("Outils EDA supplémentaires"),
+#'         UL(
+#'           tags$li(B("Périodogramme / spectre"), " : met en évidence des fréquences saisonnières inattendues."),
+#'           tags$li(B("Seasonal subseries plot"), " : visualise la forme saisonnière par mois/semaine."),
+#'           tags$li(B("Nuage niveau–variance"), " : aide au choix log/Box–Cox (variance croît avec le niveau ?).")
+#'         ),
+#'         H5("Types d’outliers (interventions)"),
+#'         UL(
+#'           tags$li(B("AO"), " : Additive Outlier (pic ponctuel)."),
+#'           tags$li(B("IO"), " : Innovation Outlier (choc qui diffuse)."),
+#'           tags$li(B("LS"), " : Level Shift (changement de niveau)."),
+#'           tags$li(B("TC"), " : Temporary Change (effet transitoire).")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Résultats (APA) — EDA"),
+#'         P("« L’inspection visuelle a mis en évidence une tendance [..] et une saisonnalité récurrente de période s=[..]. ",
+#'           "La variance semblait [constante / croissante avec le niveau], motivant [aucune transformation / log / Box–Cox]. ",
+#'           "Des valeurs atypiques autour de [dates] ont été [conservées/traitées] car [événement réel / erreur probable]. »"),
+#'         
+#'         H5("Conclusion & signification"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« La structure (tendance/saison/variance/outliers) est comprise »"),
+#'           tags$li(B("Signification : "),
+#'                   "cela guide directement le choix transformation + différenciations (d, D) et évite d’ajuster un SARIMA “à l’aveugle”.")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Confondre saisonnalité et tendance"), " : une moyenne croissante ET une saisonnalité stable sont deux composantes distinctes."),
+#'           tags$li(B("Retirer des points réels"), " : si l’outlier correspond à un événement récurrent (fêtes), il doit rester."),
+#'           tags$li(B("Ignorer une rupture"), " : un SARIMA “moyenne” une structure qui a changé → mauvais futur.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (4) Étape 3 — Décomposition
+#'     pages[[5]] <- make_step(
+#'       step_names[5],
+#'       
+#'       actions_ui = tagList(
+#'         callout(B("But : "), "séparer tendance/saison/bruit pour motiver la forme (additive vs multiplicative).", type="info"),
+#'         
+#'         Checklist(
+#'           CheckItem("Comparer visuellement une hypothese additive vs multiplicative (amplitude saisonniere constante vs proportionnelle au niveau)."),
+#'           CheckItem("Tester l’idee de transformation log/Box-Cox si la variance augmente avec le niveau."),
+#'           CheckItem("Realiser une decomposition (classique ou STL) et commenter la tendance, la saisonnalite et le residu."),
+#'           CheckItem("Verifier si la saisonnalite semble stable ou evolutive (argument pour STL)."),
+#'           CheckItem("Ecrire clairement ce que la decomposition suggere pour d, D, et pour l’echelle de modelisation.")
+#'         ),
+#'         
+#'         H5("Décomposition : définitions"),
+#'         UL(
+#'           tags$li(B("Additive"), " : ", C("y_t = T_t + S_t + e_t"),
+#'                   " (amplitude saisonnière ~ constante)."),
+#'           tags$li(B("Multiplicative"), " : ", C("y_t = T_t × S_t × e_t"),
+#'                   " (amplitude saisonnière augmente avec le niveau)."),
+#'           tags$li(B("Log"), " : si multiplicatif, log transforme souvent en additif : ",
+#'                   C("log(y_t) = log(T_t) + log(S_t) + log(e_t)"), "."),
+#'           tags$li(B("STL"), " : Seasonal-Trend decomposition using Loess ; flexible, possible robuste aux outliers.")
+#'         ),
+#'         
+#'         H5("Pourquoi STL ? (objectif détaillé)"),
+#'         UL(
+#'           tags$li("Quand la saisonnalité change lentement au fil du temps (non parfaitement répétitive)."),
+#'           tags$li("Quand on veut réduire l’influence des outliers sur l’estimation saison/tendance."),
+#'           tags$li("Quand on veut une lecture pédagogique claire (tendance vs saison vs résidu).")
+#'         ),
+#'         
+#'         H5("Ce que la décomposition ne remplace pas"),
+#'         UL(
+#'           tags$li("Elle ne prouve pas la stationnarité : SARIMA exige une série stationnaire après différenciation."),
+#'           tags$li("Elle ne choisit pas automatiquement (p,q,P,Q) : ACF/PACF + diagnostics restent nécessaires.")
+#'         ),
+#'         
+#'         # === ADD: paramètres STL & règles pratiques ===
+#'         H5("Paramètres STL (lecture pédagogique)"),
+#'         UL(
+#'           tags$li(B("s.window"), " : lissage saisonnier (", C("periodic"), " = saison constante; entier = évolutive)."),
+#'           tags$li(B("t.window"), " : lissage de la tendance (fenêtre LOESS)."),
+#'           tags$li(B("robust"), " : réduit l’influence des outliers (itérations avec poids).")
+#'         ),
+#'         H5("Additif vs multiplicatif (règle pratique)"),
+#'         UL(
+#'           tags$li("Amplitude saisonnière ~ proportionnelle au niveau → penser ", B("log"), " ou modèle multiplicatif."),
+#'           tags$li("Amplitude ~ constante → additif sur niveaux.")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Méthodes (APA) — Décomposition"),
+#'         P("« Nous avons étudié une structure additive vs multiplicative en évaluant si l’amplitude saisonnière variait avec le niveau. ",
+#'           "Comme [..], nous avons retenu [modèle additif / transformation log] et réalisé une décomposition via [classique / STL]. ",
+#'           "STL a été privilégiée pour sa flexibilité (saisonnalité évolutive) et sa robustesse aux valeurs atypiques. »"),
+#'         
+#'         H5("Conclusion & signification"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Le choix additif/multiplicatif est justifié »"),
+#'           tags$li(B("Signification : "),
+#'                   "on évite des résidus hétéroscédastiques et on améliore la stabilité de l’estimation SARIMA.")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Décomposition ≠ stationnarité"), " : après décomposition, on doit encore tester/choisir d et D."),
+#'           tags$li(B("Oublier l’échelle"), " : si vous modélisez log(y), les prévisions doivent être reconverties (avec prudence)."),
+#'           tags$li(B("Confondre bruit et structure"), " : des motifs résiduels persistants suggèrent que la saison/tendance n’a pas été correctement capturée.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (5) Étape 4 — Stationnarité (très détaillé : ADF/KPSS/PP + …)
+#'     pages[[6]] <- make_step(
+#'       step_names[6],
+#'       
+#'       actions_ui = tagList(
+#'         callout(
+#'           B("Idée centrale : "),
+#'           "Dans un SARIMA, on n’essaie pas de modéliser directement une série ‘qui dérive’ : on cherche d’abord à obtenir une série stationnaire (au moins approximativement) via la différenciation. Les tests ADF, PP et KPSS ne sont pas des “juges” absolus, mais des indices complémentaires qui aident à justifier les choix (d, D) de façon argumentée.",
+#'           type = "ok"
+#'         ),
+#'         
+#'         Checklist(
+#'           CheckItem("Définir la stationnarité avec vos mots (moyenne/variance stables; dépendance qui ne change pas au cours du temps)."),
+#'           CheckItem("Appliquer ADF, KPSS et PP sur la série brute, puis écrire clairement H0 et Ha pour chacun (ils ne testent pas la même chose)."),
+#'           CheckItem("Proposer d et D de manière progressive (essayer d=1 puis D=1 si nécessaire) et re-tester après chaque transformation."),
+#'           CheckItem("Surveiller les signes de sur‑différenciation (ACF lag 1 très négative, variance gonflée, dynamique artificielle)."),
+#'           CheckItem("Justifier le choix final (d, D, s) par convergence : tests + graphiques + ACF/PACF, pas par une seule p‑value.")
+#'         ),
+#'         
+#'         
+#'         H5("Définition : stationnarité (ce que cela veut dire)"),
+#'         UL(
+#'           tags$li(B("Stationnarité faible (covariance-stationnaire)"), " : moyenne constante, variance constante, ",
+#'                   "et autocovariance dépend uniquement du retard (pas de t)."),
+#'           tags$li(B("Non-stationnarité"), " : tendance stochastique (racine unitaire), variance changeante, ou saisonnalité non traitée."),
+#'           tags$li(B("Racine unitaire"), " : choc permanent (effet ne s’éteint pas), typique d’un processus I(1).")
+#'         ),
+#'         
+#'         H5("Différenciation : rôle (d vs D)"),
+#'         UL(
+#'           tags$li(B("d"), " enlève la racine unitaire non saisonnière / tendance stochastique : ", C("(1-B)^d"), "."),
+#'           tags$li(B("D"), " enlève la racine unitaire saisonnière : ", C("(1-B^s)^D"), "."),
+#'           tags$li(B("Règle pratique"), " : d ∈ {0,1,2} (souvent 0–1) ; D ∈ {0,1} (rarement 2).")
+#'         ),
+#'         
+#'         H5("Test ADF (Augmented Dickey–Fuller) — définition & objectif"),
+#'         UL(
+#'           tags$li(B("But"), " : tester si la série contient une racine unitaire (non-stationnaire) en présence d’autocorrélation."),
+#'           tags$li(B("Régression (intuition)"), " : on teste si le coefficient de ", C("y_{t-1}"),
+#'                   " est compatible avec une racine unitaire après ajout de retards de Δy pour “absorber” l’autocorrélation."),
+#'           tags$li(B("Hypothèses"), " : ",
+#'                   B("H0"), " = racine unitaire (non-stationnaire) ; ",
+#'                   B("Ha"), " = stationnaire (autour d’une moyenne ou d’une tendance selon la spécification)."),
+#'           tags$li(B("Interprétation p-value"), " : p petit → rejet H0 → stationnarité (au sens ADF). p grand → on ne rejette pas → différenciation probablement nécessaire.")
+#'         ),
+#'         
+#'         H5("Test KPSS — définition & objectif (inverse de l’ADF)"),
+#'         UL(
+#'           tags$li(B("But"), " : tester si la série est stationnaire (niveau ou tendance)."),
+#'           tags$li(B("Hypothèses"), " : ",
+#'                   B("H0"), " = stationnaire ; ",
+#'                   B("Ha"), " = non-stationnaire (racine unitaire / stationnarité violée)."),
+#'           tags$li(B("Interprétation"), " : p petit → rejet H0 → non-stationnaire. p grand → compatible stationnarité.")
+#'         ),
+#'         
+#'         H5("Test PP (Phillips–Perron) — définition & objectif"),
+#'         UL(
+#'           tags$li(B("But"), " : test de racine unitaire comme ADF, mais corrige l’autocorrélation et l’hétéroscédasticité autrement (correction non-paramétrique)."),
+#'           tags$li(B("Hypothèses"), " : ",
+#'                   B("H0"), " = racine unitaire ; ",
+#'                   B("Ha"), " = stationnaire."),
+#'           tags$li(B("Pourquoi utile"), " : complément de robustesse ; si ADF et PP convergent, confiance accrue.")
+#'         ),
+#'         
+#'         H5("Comment conclure en combinant ADF/KPSS/PP (logique complète)"),
+#'         OL(
+#'           tags$li(B("Stationnarité forte : "), "ADF/PP rejettent H0 (p petit) ET KPSS ne rejette pas (p grand)."),
+#'           tags$li(B("Non-stationnarité forte : "), "ADF/PP ne rejettent pas (p grand) ET KPSS rejette (p petit)."),
+#'           tags$li(B("Conflit : "), "les tests divergent → regarder graphiques, ACF, résultats après une différence, et justifier par convergence d’indices (pas une seule p-value).")
+#'         ),
+#'         
+#'         H5("Procédure recommandée (pas à pas)"),
+#'         OL(
+#'           tags$li("Fixer ", B("s"), " (période saisonnière) à partir du contexte et de l’EDA."),
+#'           tags$li("Tester ADF/KPSS/PP sur la série brute."),
+#'           tags$li("Essayer d=1 si nécessaire, retester."),
+#'           tags$li("Essayer D=1 si saisonnalité/racine saisonnière, retester."),
+#'           tags$li("S’arrêter dès que stationnarité “raisonnable” ; éviter sur-différenciation.")
+#'         ),
+#'         
+#'         H5("Sur-différenciation : définition + symptômes"),
+#'         UL(
+#'           tags$li(B("Définition"), " : appliquer trop de différences → on introduit une dynamique artificielle."),
+#'           tags$li(B("Symptômes fréquents"), " : ACF au lag 1 très négative, variance gonflée, prévisions erratiques, paramètres instables."),
+#'           tags$li(B("Conséquence"), " : intervalles de prévision plus larges et modèle moins fiable.")
+#'         ),
+#'         
+#'         # === ADD: tests/bonnes pratiques complémentaires ===
+#'         H5("Tests et notions complémentaires"),
+#'         UL(
+#'           tags$li(B("Tendance déterministe vs racine unitaire"),
+#'                   " : on peut préférer un ARIMA avec ", C("d=0"), " et une tendance ", B("déterministe"),
+#'                   " (régression + ARMA sur résidus) si la tendance semble stable."),
+#'           tags$li(B("Racine unitaire saisonnière (HEGY)"), " : (annexe) test dédié aux racines à ", C("±1, ±i"), " pour ",
+#'                   C("s=4,12"), " ; utile si la saisonnalité stochastique domine."),
+#'           tags$li(B("Zivot–Andrews"), " : (annexe) racine unitaire avec rupture endogène possible.")
+#'         ),
+#'         H5("Bonnes pratiques de différenciation"),
+#'         UL(
+#'           tags$li(B("Au plus une différence"), " : commencer par ", C("d=1"), " ou ", C("D=1"),
+#'                   " ; ", B("éviter"), " ", C("d=2"), " sauf preuves fortes."),
+#'           tags$li(B("Sur-différenciation : "), "ACF lag 1 très négative, variance gonflée, MA artificiel → revenir en arrière.")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Méthodes (APA) — Tests & choix de (d, D)"),
+#'         P("« La stationnarité a été évaluée à l’aide des tests ADF, KPSS et PP afin de trianguler l’évidence, ces tests ayant des hypothèses nulles différentes. ",
+#'           "Les résultats ont été examinés sur la série originale puis après différenciations ordinaires et saisonnières. ",
+#'           "Sur la base de l’ensemble des indices (tests + diagnostics visuels), nous avons retenu d=[..] et D=[..] avec s=[..], ",
+#'           "afin d’obtenir une série approximativement stationnaire adaptée à l’estimation SARIMA, tout en évitant la sur-différenciation. »"),
+#'         
+#'         H5("Conclusion test (prête à remplir) + signification"),
+#'         UL(
+#'           tags$li(B("ADF : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+#'                   " H0 (racine unitaire). ",
+#'                   B("Signification : "),
+#'                   "si rejet → la série est compatible stationnarité (au sens ADF) ; sinon → différenciation probablement nécessaire."),
+#'           tags$li(B("KPSS : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+#'                   " H0 (stationnarité). ",
+#'                   B("Signification : "),
+#'                   "si rejet → non-stationnarité (donc d/D à augmenter ou transformation/rupture à traiter)."),
+#'           tags$li(B("PP : "), "p=[..] → ", B("[rejeter / ne pas rejeter]"),
+#'                   " H0 (racine unitaire). ",
+#'                   B("Signification : "),
+#'                   "confirme ou nuance ADF ; convergence ADF+PP renforce la conclusion.")
+#'         ),
+#'         
+#'         H5("Conclusion finale (d, D) + ce que cela implique pour SARIMA"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Nous retenons d=[..], D=[..], s=[..]. »"),
+#'           tags$li(B("Signification : "),
+#'                   "« le SARIMA sera estimé sur la série différenciée ; les paramètres AR/MA décrivent la dynamique ",
+#'                   "restante après retrait de la tendance et/ou de la saisonnalité non stationnaire. »")
+#'         ),
+#'         
+#'         # === ADD: points à expliciter
+#'         H5("À expliciter (rappel)"),
+#'         UL(
+#'           tags$li("Préciser si une constante/drift est incluse et à quel niveau (avant/après différenciation)."),
+#'           tags$li("Documenter toute rupture suspectée et ses conséquences sur le choix de ", C("d, D"), ".")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Choisir d et D “par habitude”"), " : toujours justifier par tests + EDA."),
+#'           tags$li(B("Ignorer une rupture structurelle"), " : les tests peuvent “crier non-stationnaire” alors qu’un changement de régime est en cause."),
+#'           tags$li(B("Interpréter p-value comme preuve absolue"), " : ce sont des indices ; en conflit, on s’appuie sur convergence des preuves.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (6) Étape 5 — Auto-ARIMA baseline
+#'     pages[[7]] <- make_step(
+#'       step_names[7],
+#'       
+#'       actions_ui = tagList(
+#'         callout(B("But : "), "obtenir un point de départ compétitif, puis vérifier/affiner.", type="info"),
+#'         
+#'         Checklist(
+#'           CheckItem("Executer auto-ARIMA avec des bornes raisonnables sur p,q,P,Q et noter le critere (AICc) utilise."),
+#'           CheckItem("Enregistrer le modele baseline (ordres + presence drift/constante) pour comparaison ulterieure."),
+#'           CheckItem("Verifier diagnostics residuels (ACF residus, Ljung-Box) avant de le considerer ‘acceptable’."),
+#'           CheckItem("Evaluer la performance sur la fenetre test (MAE/RMSE) et comparer au benchmark naif/SNAIVE."),
+#'           CheckItem("Decider si vous cherchez une version plus parcimonieuse (BIC plus faible ou meme performance avec moins de parametres).")
+#'         ),
+#'         
+#'         H5("Définition : auto-ARIMA (ce que fait réellement l’algorithme)"),
+#'         UL(
+#'           tags$li("Explore un ensemble de modèles candidats (p,q,P,Q) sous contraintes."),
+#'           tags$li("Choisit souvent via minimisation ", B("AICc"),
+#'                   " (AIC corrigé petits échantillons)."),
+#'           tags$li("Peut utiliser recherche stepwise (rapide) ou plus exhaustive (plus coûteuse).")
+#'         ),
+#'         
+#'         H5("Pourquoi AICc ? (objectif)"),
+#'         UL(
+#'           tags$li("Compromis entre qualité d’ajustement et complexité (pénalise les paramètres)."),
+#'           tags$li("AICc est préférable à AIC quand n n’est pas très grand par rapport au nombre de paramètres.")
+#'         ),
+#'         
+#'         H5("Procédure propre"),
+#'         OL(
+#'           tags$li("Fixer d/D (ou laisser recommander via ndiffs/nsdiffs, mais valider)."),
+#'           tags$li("Fixer bornes max p/q/P/Q ; documenter."),
+#'           tags$li("Sauvegarder le modèle baseline (pour comparaison)."),
+#'           tags$li("Vérifier diagnostics résiduels + performance sur test.")
+#'         ),
+#'         
+#'         # === ADD: détails de recherche & critères multiples ===
+#'         H5("Détails de recherche"),
+#'         UL(
+#'           tags$li(B("Stepwise vs exhaustive"), " : stepwise = rapide, peut rater un optimum global ; exhaustive = coûteux mais plus fiable."),
+#'           tags$li(B("Contraintes"), " : imposer ", C("p,q,P,Q \u2264"), " bornes raisonnables ; forcer stabilité/inversibilité."),
+#'           tags$li(B("drift/constante"), " : tester versions avec et sans drift lorsque ", C("d=1"), ".")
+#'         ),
+#'         H5("Critères multiples"),
+#'         UL(
+#'           tags$li("Comparer AICc ", B("et"), " BIC ; en cas de quasi-égalité → choisir le plus parcimonieux.")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Méthodes (APA) — baseline"),
+#'         P("« Un modèle SARIMA de référence a été sélectionné via une procédure auto-ARIMA basée sur un critère d’information (minimisation de l’AICc) parmi des ordres candidats sous contraintes [..]. ",
+#'           "La spécification obtenue a été utilisée comme baseline, puis comparée à des modèles manuels plus parcimonieux sur la base des diagnostics et de la performance de prévision. »"),
+#'         
+#'         H5("Conclusion & signification"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Auto-ARIMA fournit une baseline solide »"),
+#'           tags$li(B("Signification : "), "« on a un repère : tout modèle final doit faire au moins aussi bien. »")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Modèle “trop complexe”"), " : stepwise peut sélectionner des ordres élevés → instabilité, interprétation difficile."),
+#'           tags$li(B("AICc excellent mais résidus mauvais"), " : diagnostics priment."),
+#'           tags$li(B("Oublier la parcimonie"), " : si deux modèles prédisent pareil, garder le plus simple.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (7) Étape 6 — SARIMA manuel
+#'     pages[[8]] <- make_step(
+#'       step_names[8],
+#'       
+#'       actions_ui = tagList(
+#'         callout(B("But : "), "proposer un petit ensemble raisonné de candidats via ACF/PACF.", type="info"),
+#'         
+#'         Checklist(
+#'           CheckItem("Tracer ACF/PACF de la serie differenciee (apres choix d et D) et identifier les pics significatifs."),
+#'           CheckItem("Proposer un petit ensemble de candidats (3 a 8) en justifiant p,q,P,Q par les motifs ACF/PACF (y compris aux multiples de s)."),
+#'           CheckItem("Ajuster chaque candidat, relever AICc/BIC, et verifier stabilite/inversibilite si possible."),
+#'           CheckItem("Comparer sur diagnostics residuels ET performance predictive (pas seulement AICc)."),
+#'           CheckItem("Garder le modele le plus simple qui passe diagnostics et bat le benchmark.")
+#'         ),
+#'         
+#'         H5("Définitions : ACF / PACF (ce que mesurent ces courbes)"),
+#'         UL(
+#'           tags$li(B("ACF"), " : corrélation entre ", C("y_t"), " et ", C("y_{t-k}"),
+#'                   " → suggère MA(q) si coupure nette vers q."),
+#'           tags$li(B("PACF"), " : corrélation “pure” au retard k une fois les retards <k contrôlés ",
+#'                   "→ suggère AR(p) si coupure nette vers p.")
+#'         ),
+#'         
+#'         H5("Heuristiques (non saisonnier)"),
+#'         UL(
+#'           tags$li(B("AR(p)"), " : PACF se coupe ~p ; ACF décroît."),
+#'           tags$li(B("MA(q)"), " : ACF se coupe ~q ; PACF décroît."),
+#'           tags$li(B("ARMA"), " : ACF et PACF décroissent (pas de coupure franche).")
+#'         ),
+#'         
+#'         H5("Heuristiques saisonnières (multiples de s)"),
+#'         UL(
+#'           tags$li(B("SAR(P)"), " : pics PACF à s, 2s, ..."),
+#'           tags$li(B("SMA(Q)"), " : pics ACF à s, 2s, ...")
+#'         ),
+#'         
+#'         H5("Procédure recommandée (petit nombre de modèles)"),
+#'         OL(
+#'           tags$li("Construire 3 à 8 candidats (parcimonieux)."),
+#'           tags$li("Ajuster et comparer AICc/BIC."),
+#'           tags$li("Vérifier stabilité/inversibilité."),
+#'           tags$li("Retenir ceux qui passent diagnostics + prévision.")
+#'         ),
+#'         
+#'         # === ADD: conception de candidats & lecture fine ===
+#'         H5("Conception de candidats (rappels utiles)"),
+#'         UL(
+#'           tags$li(B("Limiter le set"), " : 3–8 modèles max, justifiés par ACF/PACF."),
+#'           tags$li(B("Stabilité/inversibilité"), " : vérifier racines des polynômes AR/MA (hors cercle unité)."),
+#'           tags$li(B("drift/constante"), " : inclure/exclure et comparer au niveau AICc/BIC + diagnostics.")
+#'         ),
+#'         H5("Lecture fine ACF/PACF"),
+#'         UL(
+#'           tags$li("Pics à ", C("s, 2s, 3s"), " dans l’ACF → penser ", B("SMA(Q)"), "."),
+#'           tags$li("Pics à ", C("s, 2s"), " dans la PACF → penser ", B("SAR(P)"), "."),
+#'           tags$li("Queue AR (décroissance géométrique) vs coupure MA (après q).")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Méthodes (APA) — sélection manuelle"),
+#'         P("« Les structures candidates ont été proposées sur la base des schémas ACF/PACF de la série différenciée. ",
+#'           "Des autocorrélations aux multiples de s indiquaient des termes saisonniers, tandis que la dynamique de court terme guidait les ordres non saisonniers. ",
+#'           "Un ensemble restreint de modèles (n=[..]) a été ajusté et comparé via AICc/BIC et diagnostics résiduels, en privilégiant la parcimonie. »"),
+#'         
+#'         H5("Conclusion & signification"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Le modèle final est soutenu par la structure ACF/PACF et les diagnostics. »"),
+#'           tags$li(B("Signification : "), "« on réduit le risque de sur-ajustement en limitant les candidats. »")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Brute-force massif"), " : tester 200 modèles puis choisir le plus petit AICc = data snooping."),
+#'           tags$li(B("Surinterpréter ACF/PACF"), " : ce sont des guides, pas des preuves."),
+#'           tags$li(B("Ignorer l’inversibilité/stabilité"), " : paramètres instables → prévisions incohérentes.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (8) Étape 7 — Diagnostics & comparaison
+#'     pages[[9]] <- make_step(
+#'       step_names[9],
+#'       
+#'       actions_ui = tagList(
+#'         callout(B("But : "), "valider que le modèle explique toute la dépendance et prédit bien.", type="ok"),
+#'         
+#'         Checklist(
+#'           CheckItem("Examiner les residus: courbe temporelle, ACF residus, et Ljung-Box a plusieurs lags L."),
+#'           CheckItem("Verifier qu’il n’y a pas de structure residuelle (p-value Ljung-Box non significative) et ajuster si necessaire."),
+#'           CheckItem("Evaluer la prediction hors-echantillon (MAE/RMSE/MASE) avec le meme horizon et le meme protocole pour tous les modeles."),
+#'           CheckItem("Comparer explicitement au benchmark (naif/SNAIVE) et conclure sur la valeur ajoutee."),
+#'           CheckItem("Documenter toute violation (ARCH, rupture, non-normalite) et expliquer l’impact sur IC et interpretation.")
+#'         ),
+#'         
+#'         H5("Diagnostics résiduels : définitions & buts"),
+#'         UL(
+#'           tags$li(B("Résidus"), " : ", C("e_t = y_t - ŷ_t"),
+#'                   " (ou résidus d’innovation selon l’implémentation)."),
+#'           tags$li(B("Bruit blanc"), " : absence d’autocorrélation résiduelle → le modèle a capturé la structure temporelle."),
+#'           tags$li(B("Ljung–Box"), " : test global d’autocorrélation des résidus jusqu’à un lag L.")
+#'         ),
+#'         
+#'         H5("Test de Ljung–Box (définition + interprétation)"),
+#'         UL(
+#'           tags$li(B("But"), " : tester si les autocorrélations résiduelles jusqu’à L sont globalement nulles."),
+#'           tags$li(B("Hypothèses"), " : ", B("H0"), " = pas d’autocorrélation résiduelle ; ", B("Ha"), " = autocorrélation résiduelle présente."),
+#'           tags$li(B("Conclusion"), " : p petit → rejet H0 → modèle incomplet (ajuster p/q/P/Q ou d/D)."),
+#'           tags$li(B("Signification pratique"), " : si autocorrélation résiduelle reste, vos intervalles/prévisions sont souvent trop optimistes.")
+#'         ),
+#'         
+#'         H5("Normalité & hétéroscédasticité (à quoi ça sert vraiment)"),
+#'         UL(
+#'           tags$li(B("Normalité"), " : utile pour l’interprétation probabiliste (IC) ; pas toujours critique si objectif = point forecast."),
+#'           tags$li(B("ARCH / variance changeante"), " : peut rendre les IC sous-estimés ; si fort, envisager modèles de variance (GARCH) selon le cours.")
+#'         ),
+#'         
+#'         H5("Évaluation prévision (définition + protocole)"),
+#'         UL(
+#'           tags$li(B("Split temporel"), " : entraîner sur le passé, tester sur le futur."),
+#'           tags$li(B("Rolling-origin"), " : répéter sur plusieurs origines → estimation plus robuste."),
+#'           tags$li(B("Benchmark"), " : naїf / drift / SNAIVE. Un SARIMA utile doit battre au moins SNAIVE à l’horizon cible.")
+#'         ),
+#'         
+#'         # === ADD: diagnostics additionnels & comparaison ===
+#'         H5("Diagnostics additionnels"),
+#'         UL(
+#'           tags$li(B("Box–Pierce vs Ljung–Box"), " : préférer Ljung–Box (meilleure petite taille)."),
+#'           tags$li(B("Normalité résiduelle"), " : Q–Q plot, Jarque–Bera ; utile pour IC mais secondaire si but = point forecast."),
+#'           tags$li(B("Hétéroscédasticité / ARCH"), " : tester ACF des résidus au carré ; si fort → discuter modèles de variance (annexe)."),
+#'           tags$li(B("Significativité des coefficients"), " : rapporter est., SE, z, p ; supprimer termes non significatifs si performance constante.")
+#'         ),
+#'         H5("Comparaison de modèles"),
+#'         UL(
+#'           tags$li(B("Tableau récapitulatif"), " : AICc/BIC, Ljung–Box (p), MAE/RMSE/MASE, nb de paramètres."),
+#'           tags$li(B("Test de Diebold–Mariano"), " : (annexe) comparer formellement 2 séries d’erreurs prédictives.")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Résultats (APA) — diagnostics"),
+#'         P("« Les diagnostics résiduels indiquaient un comportement proche du bruit blanc : l’ACF des résidus ne montrait pas de pics substantiels et le test de Ljung–Box était [non significatif/significatif] au seuil α=[..]. ",
+#'           "La performance de prévision sur la fenêtre d’évaluation donnait MAE=[..] et RMSE=[..], surpassant le benchmark [..]. »"),
+#'         
+#'         H5("Conclusion & signification (diagnostics + performance)"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Le modèle est acceptable » si Ljung–Box non significatif ET benchmark battu."),
+#'           tags$li(B("Signification : "),
+#'                   "« le modèle capte la structure temporelle (résidus ~ bruit) et apporte un gain prédictif réel (out-of-sample). »")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Bon AIC mais Ljung–Box significatif"), " : modèle incomplet → ne pas valider."),
+#'           tags$li(B("Se focaliser sur la normalité"), " : priorité = absence d’autocorrélation résiduelle."),
+#'           tags$li(B("Comparer des modèles sur des horizons différents"), " : toujours même h, même protocole.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (9) Étape 8 — Rédaction
+#'     pages[[10]] <- make_step(
+#'       step_names[10],
+#'       
+#'       actions_ui = tagList(
+#'         callout(B("But : "), "écrire un rapport clair, reproductible, aligné aux étapes 0–7.", type="info"),
+#'         
+#'         Checklist(
+#'           CheckItem("Rediger une section Methodes qui suit exactement le pipeline: donnees -> EDA -> stationnarite -> selection -> diagnostics -> prevision."),
+#'           CheckItem("Inclure figures indispensables: serie, decomposition, ACF/PACF, residus, previsions + intervalles."),
+#'           CheckItem("Inclure un tableau de comparaison (AICc/BIC, Ljung-Box, MAE/RMSE, benchmark, nb parametres)."),
+#'           CheckItem("Preciser l’echelle (niveau/log/Box-Cox) et expliquer toute reconversion des previsions."),
+#'           CheckItem("Ajouter un encadre limites + pistes (ruptures, SARIMAX, GARCH) et assurer la reproductibilite (versions).")
+#'         ),
+#'         
+#'         H5("Structure APA recommandée (définition)"),
+#'         UL(
+#'           tags$li(B("Méthodes"), " : ce que vous avez fait et pourquoi (données → EDA → stationnarité → modèles → évaluation)."),
+#'           tags$li(B("Résultats"), " : ce que vous avez observé (stats, figures, tests, métriques, modèle final)."),
+#'           tags$li(B("Discussion"), " (optionnel) : limites (ruptures, horizon, incertitudes) + pistes (SARIMAX/GARCH).")
+#'         ),
+#'         
+#'         H5("Pack livrable propre (checklist)"),
+#'         UL(
+#'           tags$li("Notebook/script reproductible (import → nettoyage → EDA → tests → modèles → diagnostics → prévisions)."),
+#'           tags$li("Figures : série, décomposition, ACF/PACF, résidus (ACF + Ljung–Box), prévisions + IC."),
+#'           tags$li("Tableau : candidats vs AICc/BIC vs Ljung–Box vs MAE/RMSE vs benchmark.")
+#'         ),
+#'         
+#'         # === ADD: rapporter correctement les prévisions ===
+#'         H5("Rapporter correctement les prévisions"),
+#'         UL(
+#'           tags$li(B("Niveau de couverture"), " : préciser 80% et/ou 95% ; indiquer si log-échelle a été reconvertie."),
+#'           tags$li(B("Biais de reconversion (log→niveau)"), " : mentionner correction ",
+#'                   C("exp(\\hat{y}) \\times exp(\\hat{\\sigma}^2/2)"), " si utilisée."),
+#'           tags$li(B("Reproductibilité"), " : versions R/packages, seed, chemin des données, date d’extraction.")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Phrase finale (APA) — modèle final + interprétation"),
+#'         P("« Sur la base de l’adéquation diagnostique et de la performance prédictive, le modèle final retenu était SARIMA((p,d,q)(P,D,Q)_s). ",
+#'           "Les résidus étant compatibles avec un bruit blanc, nous concluons que la structure temporelle principale a été capturée. ",
+#'           "Les prévisions produites à horizon h=[..] améliorent le benchmark [..] selon MAE/RMSE, ce qui soutient l’usage du modèle pour l’application ciblée. »"),
+#'         
+#'         H5("Conclusion & signification"),
+#'         UL(
+#'           tags$li(B("Conclusion : "), "« Le rapport est aligné, justifié, reproductible. »"),
+#'           tags$li(B("Signification : "),
+#'                   "« un lecteur externe peut reproduire vos résultats et comprendre chaque choix (transformation, d/D, sélection, diagnostics). »")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Ne pas relier choix → preuves"), " : chaque décision doit être liée à EDA/tests/diagnostics."),
+#'           tags$li(B("Trop de texte, pas assez de figures"), " : en séries temporelles, les figures sont des résultats."),
+#'           tags$li(B("Oublier de préciser l’échelle"), " : niveau vs log vs Box–Cox et reconversion des prévisions.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # (10) Annexes
+#'     pages[[11]] <- make_step(
+#'       step_names[11],
+#'       
+#'       actions_ui = tagList(
+#'         Checklist(
+#'           CheckItem("Reconnaitre et pouvoir ecrire les trois benchmarks (naif, drift, SNAIVE) et expliquer quand chacun est approprie."),
+#'           CheckItem("Savoir lire rapidement un resultat ADF/KPSS/PP et traduire la conclusion en choix de d et D."),
+#'           CheckItem("Savoir expliquer ce que signifie Ljung-Box significatif (structure residuelle) et quelle action entreprendre."),
+#'           CheckItem("Memoriser les formules utiles (AIC/AICc/BIC, Ljung-Box, operateurs de differenciation) et leur interpretation."),
+#'           CheckItem("Identifier quand il faut sortir du cadre SARIMA (exogenes, multiples saisonnalites, ruptures, variance conditionnelle).")
+#'         ),
+#'         
+#'         H5("Benchmarks (définitions)"),
+#'         UL(
+#'           tags$li(B("Naïf"), " : ", C("ŷ_{t+1|t} = y_t"), " (persistance)."),
+#'           tags$li(B("Drift"), " : extrapolation linéaire moyenne."),
+#'           tags$li(B("SNAIVE"), " : répète la dernière valeur de la même saison : ", C("ŷ_{t+h|t} = y_{t+h-s}"), ".")
+#'         ),
+#'         
+#'         H5("Règles d’interprétation ultra rapides"),
+#'         UL(
+#'           tags$li(B("ADF/PP rejettent"), " + ", B("KPSS ne rejette pas"), " → stationnarité plausible."),
+#'           tags$li(B("ADF/PP ne rejettent pas"), " + ", B("KPSS rejette"), " → différenciation nécessaire."),
+#'           tags$li(B("Ljung–Box significatif"), " → il reste de la structure → réviser le modèle.")
+#'         ),
+#'         
+#'         # === ADD: formules utiles & pistes avancées ===
+#'         H5("Formules utiles (mémo)"),
+#'         UL(
+#'           tags$li(B("Critères d’info"), " : ",
+#'                   C("AIC=-2\\log L+2k"), ", ",
+#'                   C("AICc= AIC + \\frac{2k(k+1)}{n-k-1}"), ", ",
+#'                   C("BIC=-2\\log L+k\\log n"), "."),
+#'           tags$li(B("MASE"), " : ", C("\\frac{\\frac{1}{T}\\sum_{t}|e_t|}{\\frac{1}{T-s}\\sum_{t}|y_t-y_{t-s}|}"), " (pour périodicité ", C("s"), ")."),
+#'           tags$li(B("Ljung–Box"), " : ", C("Q^* = n(n+2)\\sum_{k=1}^{L} \\frac{\\hat{\\rho}_k^2}{n-k}"),
+#'                   " ~ ", C("\\chi^2"), " sous ", C("H_0"), " avec ddl ≈ ", C("L - p - q - (P+Q)"), "."),
+#'           tags$li(B("Backshift & diff."), " : ",
+#'                   C("\\nabla=(1-B)"), ", ", C("\\nabla_s=(1-B^s)"), ", ",
+#'                   C("\\nabla^d \\nabla_s^D y_t"), " pour stationnariser.")
+#'         ),
+#'         H5("Pistes avancées (pour l’enseignant)"),
+#'         UL(
+#'           tags$li(B("SARIMAX / régression dynamique"), " : variables exogènes, pré-blanchiment, fonctions de transfert."),
+#'           tags$li(B("Ruptures/Interventions"), " : dummies LS/TC, estimation avec régresseurs."),
+#'           tags$li(B("Multiples saisonnalités"), " : TBATS/ETS-MS si présence de s multiples.")
+#'         )
+#'       ),
+#'       
+#'       apa_ui = tagList(
+#'         H5("Template “Conclusion tests → choix (d,D)” (copier-coller)"),
+#'         P("« Les tests ADF/PP et KPSS ont été interprétés conjointement. ",
+#'           "Comme [ADF/PP: rejettent/ne rejettent pas] la racine unitaire et [KPSS: rejette/ne rejette pas] la stationnarité, ",
+#'           "nous concluons que la série est [stationnaire/non-stationnaire] au sens des diagnostics combinés. ",
+#'           "Nous retenons donc d=[..] et D=[..] (s=[..]) pour obtenir une série stationnaire pour l’estimation SARIMA. »"),
+#'         
+#'         H5("Signification (traduction simple)"),
+#'         UL(
+#'           tags$li("« d et D disent combien de fois on doit “retirer” une tendance et une saisonnalité non stationnaire. »"),
+#'           tags$li("« Ensuite, p/q/P/Q décrivent la dépendance restante (mémoire) dans la série transformée. »")
+#'         )
+#'       ),
+#'       
+#'       pitfalls_ui = tagList(
+#'         UL(
+#'           tags$li(B("Croire qu’un test “décide” seul"), " : toujours trianguler avec EDA + ACF + comportement après différenciation."),
+#'           tags$li(B("Oublier la finalité"), " : prévision (out-of-sample) + diagnostics passent avant l’esthétique d’un AIC."),
+#'           tags$li(B("Ne pas documenter"), " : un bon modèle non documenté = inutilisable dans un cours/rapport.")
+#'         )
+#'       )
+#'     )
+#'     
+#'     # ========= Output =========
+#'     tagList(
+#'       css,
+#'       tags$h4(style="margin-top:12px;", paste0("Page ", cur, "/10 — ", step_names[cur + 1L])),
+#'       progress_ui,
+#'       pages[[cur + 1L]]
+#'     )
+#'   })
+  
+   
+  
+  
+  
+  
+  
   # --- Roadmap slider navigation (Prev/Next) ---
   observeEvent(input$road_prev, {
     cur <- input$roadmap_step
@@ -15015,22 +18789,49 @@ summary_errors <- aggregate_metrics(...)
   output$roadmap_Detailed_Fr_ui4 <- renderUI({
     
     tags$div(
+      class = "road-shell",
       style = "background:#f7f7f7;padding:14px;border-radius:10px;",
       
       tags$style(HTML("
-      .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:10px;padding:14px;margin-top:12px;}
-      .road-title {margin:0 0 8px 0;}
-      .road-sub {margin:0 0 12px 0; color:#555;}
-      .road-nav {display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
-      .road-nav .btn {min-width:46px;}
-      details {background:#ffffff;border:1px solid #eaeaea;border-radius:10px;padding:10px 12px;margin:10px 0;}
-      details > summary {cursor:pointer;font-weight:600;}
-      .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:10px 12px; border-radius:8px; margin:10px 0;}
-      .callout.warn {border-left-color:#E45756; background:#fff7f7;}
-      .callout.ok {border-left-color:#72B7B2; background:#f7fffb;}
-      code {background:#f3f3f3; padding:0 3px; border-radius:3px;}
-      .progress {height:10px; margin:10px 0 0 0;}
-    ")),
+.road-shell {background:#f7f7f7;padding:14px;border-radius:12px;border:1px solid #ececec;}
+      .road-title {margin:0 0 6px 0;font-size:22px;font-weight:800;letter-spacing:.2px;}
+      .road-sub {margin:0 0 12px 0;color:#555;line-height:1.45;}
+      .road-nav {display:flex;gap:10px;align-items:center;flex-wrap:wrap;position:sticky;top:0;z-index:50;background:#f7f7f7;padding:10px 0 8px 0;border-bottom:1px solid #ececec;}
+      .road-nav .btn {min-width:46px;border-radius:10px;padding:6px 12px;}
+      .road-nav .btn:focus {outline:none;box-shadow:0 0 0 3px rgba(76,120,168,.25);}
+      .road-nav .form-group {margin-bottom:0;}
+      /* Slider polish (Shiny uses ionRangeSlider) */
+      .road-shell .irs--shiny .irs-bar {background:#4C78A8;}
+      .road-shell .irs--shiny .irs-handle>i:first-child {background:#4C78A8;}
+      .road-shell .irs--shiny .irs-from,
+      .road-shell .irs--shiny .irs-to,
+      .road-shell .irs--shiny .irs-single {background:#4C78A8;}
+      @media (max-width: 900px) {
+        .road-nav {gap:8px;}
+        .road-nav .irs {width:100% !important;}
+        .road-nav .form-group {width:100%;}
+      }
+      .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:16px;margin-top:14px;box-shadow:0 2px 10px rgba(0,0,0,.03);}
+      .step-header {display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;}
+      .step-badge {display:inline-block;font-weight:800;font-size:12px;letter-spacing:.3px;text-transform:uppercase;padding:4px 10px;border-radius:999px;background:#eef4fb;color:#254b74;border:1px solid #d9e7f6;}
+      .step-hint {color:#666;font-size:12px;}
+      details {background:#ffffff;border:1px solid #eaeaea;border-radius:12px;padding:0;margin:10px 0;overflow:hidden;}
+      details > summary {cursor:pointer;font-weight:700;padding:10px 12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;background:linear-gradient(180deg,#ffffff 0%,#fbfbfb 100%);}
+      details > summary::-webkit-details-marker {display:none;}
+      details > summary:after {content:'▸';font-size:16px;color:#666;transform:rotate(0deg);transition:transform .12s ease;}
+      details[open] > summary:after {transform:rotate(90deg);}
+      details:hover {border-color:#dcdcdc;}
+      details[open] {border-color:#d9e7f6;box-shadow:0 2px 10px rgba(76,120,168,.08);}
+      .callout {border-left:5px solid #4C78A8;background:#fafafa;padding:12px 12px;border-radius:10px;margin:10px 0;}
+      .callout.warn {border-left-color:#E45756;background:#fff7f7;}
+      .callout.ok {border-left-color:#72B7B2;background:#f7fffb;}
+      .callout.deliver {border-left-color:#54A24B; background:#f6fff6;}
+      .callout.checklist {border-left-color:#F2CF5B;background:#fffdf4;}
+      .checklist-title {display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+      .checklist-icon {font-weight:800;}
+      code {background:#f3f3f3;padding:0 4px;border-radius:4px;}
+      .progress {height:10px;border-radius:999px;background:#ececec;overflow:hidden;margin:10px 0 0 0;}
+      .progress-bar {border-radius:999px;}")),
       
       tags$h3(class="road-title", "Feuille de route SARIMA (version pédagogique)"),
       tags$p(class="road-sub",
@@ -15083,12 +18884,24 @@ summary_errors <- aggregate_metrics(...)
     }
     Checklist <- function(...) {
       tags$div(
-        class = "callout",
-        tags$b("Checklist étudiant"),
+        class = "callout checklist",
+        tags$div(
+          class = "checklist-title",
+          tags$span(class = "checklist-icon", "☑"),
+          tags$b("Checklist étudiant")
+        ),
         tags$ul(class = "chk", ...)
       )
     }
     
+    
+    Deliverables <- function(...) {
+      tags$div(
+        class = "callout deliver",
+        tags$b("Sorties attendues (à conserver pour le rapport)"),
+        tags$ul(...)
+      )
+    }
     
     callout <- function(..., type = c("info","ok","warn")) {
       type <- match.arg(type)
@@ -15098,20 +18911,34 @@ summary_errors <- aggregate_metrics(...)
     
     # ========= CSS (internal scroll so the page stays short) =========
     css <- tags$style(HTML("
-    .road-card {background:#fff;border:1px solid #e5e5e5;border-radius:10px;padding:14px;margin-top:12px;}
-    details {background:#ffffff;border:1px solid #eaeaea;border-radius:10px;padding:10px 12px;margin:10px 0;}
-    details > summary {cursor:pointer;font-weight:700;}
-    .road-scroll {max-height: 62vh; overflow-y: auto; padding-right: 10px;}
-    .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:10px 12px; border-radius:8px; margin:10px 0;}
+.road-card {background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:16px;margin-top:14px;box-shadow:0 2px 10px rgba(0,0,0,.03);}
+    .step-header {display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;}
+    .step-badge {display:inline-block;font-weight:800;font-size:12px;letter-spacing:.3px;text-transform:uppercase;padding:4px 10px;border-radius:999px;background:#eef4fb;color:#254b74;border:1px solid #d9e7f6;}
+    .step-hint {color:#666;font-size:12px;}
+    details {background:#ffffff;border:1px solid #eaeaea;border-radius:12px;padding:0;margin:10px 0;overflow:hidden;}
+    details > summary {cursor:pointer;font-weight:700;padding:10px 12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;background:linear-gradient(180deg,#ffffff 0%,#fbfbfb 100%);}
+    details > summary::-webkit-details-marker {display:none;}
+    details > summary:after {content:'▸';font-size:16px;color:#666;transform:rotate(0deg);transition:transform .12s ease;}
+    details[open] > summary:after {transform:rotate(90deg);}
+    details:hover {border-color:#dcdcdc;}
+    details[open] {border-color:#d9e7f6;box-shadow:0 2px 10px rgba(76,120,168,.08);}
+    .road-scroll {max-height: 62vh; overflow-y: auto; padding:10px 12px 12px 12px; padding-right: 14px;}
+    .road-scroll::-webkit-scrollbar {width: 10px;}
+    .road-scroll::-webkit-scrollbar-thumb {background: #e0e0e0; border-radius: 999px; border: 3px solid #fff;}
+    .callout {border-left:5px solid #4C78A8; background:#fafafa; padding:12px 12px; border-radius:10px; margin:10px 0;}
     .callout.warn {border-left-color:#E45756; background:#fff7f7;}
     .callout.ok {border-left-color:#72B7B2; background:#f7fffb;}
-    code {background:#f3f3f3; padding:0 3px; border-radius:3px;}
-    .progress {height:10px; margin:10px 0 0 0;}
+      .callout.deliver {border-left-color:#54A24B; background:#f6fff6;}
+    .callout.checklist {border-left-color:#F2CF5B; background:#fffdf4;}
+    .checklist-title {display:flex; align-items:center; gap:8px; margin-bottom:6px;}
+    .checklist-icon {font-weight:800;}
+    code {background:#f3f3f3; padding:0 4px; border-radius:4px;}
+    .progress {height:10px; border-radius:999px; background:#ececec; overflow:hidden; margin:10px 0 0 0;}
+    .progress-bar {border-radius:999px;}
     /* Checklist: checkbox-style bullets */
     ul.chk {padding-left: 0; margin: 8px 0 0 0;}
-    ul.chk li {list-style: none; margin: 6px 0;}
-    .chkbox {display:inline-block; width: 18px; font-weight: 700; margin-right: 6px;}
-  "))
+    ul.chk li {list-style: none; margin: 7px 0; display:flex; align-items:flex-start; gap:8px;}
+    .chkbox {display:inline-block; width: 18px; font-weight: 800; margin-top: 1px;}"))
     
     # ========= Step logic =========
     cur <- input$roadmap_step
@@ -15144,9 +18971,15 @@ summary_errors <- aggregate_metrics(...)
     )
     
     make_step <- function(title, actions_ui, apa_ui, pitfalls_ui, header_ui = NULL) {
+      step_badge <- if (isTRUE(cur == 0L)) "Aperçu" else paste0("Étape ", cur, "/10")
       tags$div(
         class = "road-card",
         if (!is.null(header_ui)) header_ui,
+        tags$div(
+          class = "step-header",
+          tags$span(class = "step-badge", step_badge),
+          tags$span(class = "step-hint", "Dépliez un bloc à la fois : Actions → APA → Pièges.")
+        ),
         tags$h4(title),
         D("1) Ce que l’étudiant fait (procédure + définitions + objectifs)", actions_ui),
         D("2) Ce qu’il écrit (APA) + conclusion & signification", apa_ui),
@@ -15170,27 +19003,20 @@ summary_errors <- aggregate_metrics(...)
         ),
         
         Checklist(
-          CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir) et préciser son unité et son contexte."),
-          CheckItem("Déterminer la période saisonnière s à partir du contexte (par exemple 12 pour mensuel, 7 pour hebdomadaire, 4 pour trimestriel)."),
-          CheckItem("Lire la forme générale SARIMA et expliquer le rôle de chaque bloc : différenciation (d, D) puis composantes AR/MA (p, q, P, Q)."),
-          CheckItem("Définir ce que signifie ‘bon modèle’ dans ce cours : résidus proches d’un bruit blanc, performance hors-échantillon, et parcimonie."),
-          CheckItem("Noter le benchmark choisi (naïf/SNAIVE) pour évaluer la valeur ajoutée du SARIMA.")
+          CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir), préciser son unité, sa source et le contexte d’application (ex. ventes mensuelles, débit quotidien, température horaire)."),
+          CheckItem("Fixer la période saisonnière s à partir du contexte et vérifier qu’elle est cohérente avec l’échantillonnage (ex. s=12 pour mensuel, s=7 pour hebdomadaire, s=4 pour trimestriel)."),
+          CheckItem("Lire la forme générale du SARIMA et expliquer le rôle de chaque bloc : différenciation (d, D) pour stationnariser, puis composantes AR/MA (p, q, P, Q) pour modéliser la dépendance restante."),
+          CheckItem("Énoncer des critères de validation explicites : résidus ≈ bruit blanc (ACF résidus + Ljung–Box), performance hors‑échantillon (train/test ou rolling-origin) et parcimonie (le plus simple qui marche)."),
+          CheckItem("Choisir un benchmark (naïf / drift / SNAIVE), l’écrire noir sur blanc et expliquer pourquoi il est pertinent : sans repère, on ne peut pas juger la valeur ajoutée d’un SARIMA.")
         ),
         
-        Checklist(
-          CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir) et préciser son unité et son contexte (ex. ventes mensuelles, température quotidienne, etc.)."),
-          CheckItem("Déterminer la période saisonnière s à partir du contexte (ex. 12 pour mensuel, 7 pour hebdomadaire, 4 pour trimestriel) et vérifier qu’elle est cohérente avec la façon dont les données sont échantillonnées."),
-          CheckItem("Relire la forme générale SARIMA et expliquer, avec vos mots, le rôle des blocs : différenciation (d, D) pour stationnariser, puis composantes AR/MA (p, q, P, Q) pour modéliser la mémoire restante."),
-          CheckItem("Énoncer vos critères de ‘bon modèle’ : résidus ~ bruit blanc, performance hors-échantillon (train/test ou rolling-origin), et parcimonie (le plus simple qui marche)."),
-          CheckItem("Choisir et écrire noir sur blanc un benchmark (naïf / SNAIVE / drift) : sans ce repère, vous ne saurez pas si SARIMA apporte une vraie valeur ajoutée.")
+        Deliverables(
+          tags$li("Une fiche “Notations & objectifs” : y_t, unité de temps, période saisonnière s, et le rôle de (p,d,q)(P,D,Q)[s]."),
+          tags$li("Un protocole de validation écrit (train/test ou rolling-origin) + la métrique principale choisie (MAE/RMSE, etc.)."),
+          tags$li("Un benchmark explicite (naïf / drift / SNAIVE) qui servira de référence tout au long du projet.")
         ),
-        Checklist(
-          CheckItem("Identifier clairement la série y_t (ce que vous cherchez à prévoir) et préciser l’unité, la source, et le contexte."),
-          CheckItem("Déterminer la période saisonnière s à partir du contexte (ex. 12 pour mensuel, 7 pour hebdomadaire, 4 pour trimestriel) et vérifier qu’elle est cohérente avec les données."),
-          CheckItem("Expliquer avec vos mots la forme générale SARIMA : différenciations (d, D) pour stationnariser, puis termes AR/MA (p, q, P, Q) pour capturer la dépendance restante."),
-          CheckItem("Écrire vos critères de validation : diagnostics résiduels (ACF des résidus, Ljung–Box), performance hors-échantillon (MAE/RMSE/MASE), et parcimonie."),
-          CheckItem("Noter le benchmark retenu (naïf / drift / SNAIVE) afin de mesurer la valeur ajoutée du SARIMA.")
-        ),
+        
+        
         
         H5("Notations essentielles (définitions)"),
         UL(
@@ -15304,6 +19130,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Decider si une transformation (log / Box-Cox) est necessaire et noter la raison.")
         ),
         
+        Deliverables(
+          tags$li("Un énoncé clair du problème : “Je prévois y_t à horizon h pour [usage concret]”."),
+          tags$li("Une décision sur la stratégie d’évaluation (split chronologique ou rolling) + justification (éviter la fuite d’information)."),
+          tags$li("Une liste courte de métriques retenues + interprétation attendue (erreur moyenne, pénalisation des grosses erreurs).")
+        ),
+        
+        
         H5("Définitions (ce que chaque terme veut dire)"),
         UL(
           tags$li(B("Série réponse"), " ", C("y_t"), " : variable à prédire (univariée)."),
@@ -15403,6 +19236,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Documenter toute correction (doublons, valeurs aberrantes evidentes) pour garantir la reproductibilite.")
         ),
         
+        Deliverables(
+          tags$li("Un résumé qualité des données : N, dates début/fin, fréquence, valeurs manquantes, doublons, périodes irrégulières."),
+          tags$li("Une stratégie documentée pour les manquants/outliers (suppression, interpolation, NA-LOCF, winsorisation) + justification."),
+          tags$li("Des descriptifs simples : moyenne/variance, quantiles, min/max, et un rappel de l’unité de mesure.")
+        ),
+        
+        
         H5("Ce qu’il faut rapporter (définitions)"),
         UL(
           tags$li(B("n"), " : nombre total d’observations disponibles."),
@@ -15488,6 +19328,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Noter ce que l’EDA implique pour la suite: transformation possible, differenciation probable, et presence de ruptures.")
         ),
         
+        Deliverables(
+          tags$li("Graphiques EDA : série brute, zooms, saisonnalité (par cycle), et repérage d’anomalies (pics/creux)."),
+          tags$li("Une hypothèse argumentée sur tendance et saisonnalité (présentes ? stables ? changeantes ?)."),
+          tags$li("Une première lecture d’autocorrélation (ACF/PACF exploratoires) sans conclure trop vite sur p/q.")
+        ),
+        
+        
         H5("Définitions utiles (ce qu’on cherche)"),
         UL(
           tags$li(B("Tendance"), " : évolution de long terme (déterministe ou stochastique)."),
@@ -15566,6 +19413,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Ecrire clairement ce que la decomposition suggere pour d, D, et pour l’echelle de modelisation.")
         ),
         
+        Deliverables(
+          tags$li("Une décomposition (STL ou équivalent) + conclusion : additif vs multiplicatif, et stabilité de la saisonnalité."),
+          tags$li("Une décision de transformation (log / Box–Cox) si variance non constante + note sur la reconversion des prévisions."),
+          tags$li("Une interprétation du “reste” (résidu) : signal non expliqué vs bruit (est-ce encore structuré ?).")
+        ),
+        
+        
         H5("Décomposition : définitions"),
         UL(
           tags$li(B("Additive"), " : ", C("y_t = T_t + S_t + e_t"),
@@ -15634,18 +19488,25 @@ summary_errors <- aggregate_metrics(...)
       actions_ui = tagList(
         callout(
           B("Idée centrale : "),
-          
-          Checklist(
-            CheckItem("Definir stationnarite avec vos mots (moyenne/variance constantes, dependance qui ne change pas dans le temps)."),
-            CheckItem("Executer ADF, KPSS et PP sur la serie brute et noter les hypotheses H0/Ha de chaque test."),
-            CheckItem("Proposer d et D de maniere progressive (essayer d=1 puis D=1 si besoin) et re-tester apres chaque transformation."),
-            CheckItem("Surveiller les signes de sur-differenciation (ACF lag1 tres negative, variance gonflee, dynamique artificielle)."),
-            CheckItem("Justifier le choix final (d, D, s) par convergence: tests + graphiques + ACF/PACF.")
-          ),
-          "SARIMA suppose que la série devient (au moins) stationnaire ",
-          B("après différenciation"), ". Les tests ADF/PP/KPSS servent à justifier (d, D).",
-          type="ok"
+          "Dans un SARIMA, on n’essaie pas de modéliser directement une série ‘qui dérive’ : on cherche d’abord à obtenir une série stationnaire (au moins approximativement) via la différenciation. Les tests ADF, PP et KPSS ne sont pas des “juges” absolus, mais des indices complémentaires qui aident à justifier les choix (d, D) de façon argumentée.",
+          type = "ok"
         ),
+        
+        Checklist(
+          CheckItem("Définir la stationnarité avec vos mots (moyenne/variance stables; dépendance qui ne change pas au cours du temps)."),
+          CheckItem("Appliquer ADF, KPSS et PP sur la série brute, puis écrire clairement H0 et Ha pour chacun (ils ne testent pas la même chose)."),
+          CheckItem("Proposer d et D de manière progressive (essayer d=1 puis D=1 si nécessaire) et re-tester après chaque transformation."),
+          CheckItem("Surveiller les signes de sur‑différenciation (ACF lag 1 très négative, variance gonflée, dynamique artificielle)."),
+          CheckItem("Justifier le choix final (d, D, s) par convergence : tests + graphiques + ACF/PACF, pas par une seule p‑value.")
+        ),
+        
+        Deliverables(
+          tags$li("Résultats ADF/KPSS/PP (brut puis après différenciation) + décision sur d et D, justifiée par critères et plots."),
+          tags$li("Graphiques de la série différenciée (et éventuellement ACF/PACF sur série stationnaire) pour confirmer la décision."),
+          tags$li("Un avertissement écrit sur le sur‑différenciage (perte d’information, ACF négative forte au lag 1, etc.).")
+        ),
+        
+        
         
         H5("Définition : stationnarité (ce que cela veut dire)"),
         UL(
@@ -15795,6 +19656,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Decider si vous cherchez une version plus parcimonieuse (BIC plus faible ou meme performance avec moins de parametres).")
         ),
         
+        Deliverables(
+          tags$li("Le modèle auto.arima retenu (ordres, paramètres) + critères (AICc/BIC) + limites (point de départ, pas une vérité)."),
+          tags$li("Comparaison contre le benchmark (au minimum) sur la période test, avec tableau de métriques et commentaire."),
+          tags$li("Diagnostics résiduels essentiels : ACF des résidus + Ljung–Box + commentaire (bruit blanc ou non).")
+        ),
+        
+        
         H5("Définition : auto-ARIMA (ce que fait réellement l’algorithme)"),
         UL(
           tags$li("Explore un ensemble de modèles candidats (p,q,P,Q) sous contraintes."),
@@ -15865,6 +19733,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Comparer sur diagnostics residuels ET performance predictive (pas seulement AICc)."),
           CheckItem("Garder le modele le plus simple qui passe diagnostics et bat le benchmark.")
         ),
+        
+        Deliverables(
+          tags$li("Une liste courte de candidats SARIMA manuels (2–6 modèles) + rationale ACF/PACF + parcimonie."),
+          tags$li("Un tableau comparatif (AICc/BIC + diagnostics + performance test) pour choisir un modèle final."),
+          tags$li("L’équation du modèle final en trois versions : générale → estimée → estimée avec valeurs numériques.")
+        ),
+        
         
         H5("Définitions : ACF / PACF (ce que mesurent ces courbes)"),
         UL(
@@ -15947,6 +19822,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Documenter toute violation (ARCH, rupture, non-normalite) et expliquer l’impact sur IC et interpretation.")
         ),
         
+        Deliverables(
+          tags$li("Un rapport de diagnostics : résidus (plots), tests (Ljung–Box, normalité), et décision finale (OK / à revoir)."),
+          tags$li("Une évaluation prévisionnelle : erreurs sur test + inspection visuelle des prévisions (niveau, saisonnalité, turning points)."),
+          tags$li("Une conclusion de sélection : pourquoi ce modèle est retenu et quels compromis il implique (simplicité vs performance).")
+        ),
+        
+        
         H5("Diagnostics résiduels : définitions & buts"),
         UL(
           tags$li(B("Résidus"), " : ", C("e_t = y_t - ŷ_t"),
@@ -16028,6 +19910,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Ajouter un encadre limites + pistes (ruptures, SARIMAX, GARCH) et assurer la reproductibilite (versions).")
         ),
         
+        Deliverables(
+          tags$li("Une section Méthodes (données, split, transformations, tests, choix d’ordres) rédigée proprement."),
+          tags$li("Une section Résultats (modèle final, coefficients, diagnostics, performance, figures) + discussion/limites."),
+          tags$li("Un paquet de livrables : figures légendées, tableau des paramètres, équations, et un appendice “reproductibilité”.")
+        ),
+        
+        
         H5("Structure APA recommandée (définition)"),
         UL(
           tags$li(B("Méthodes"), " : ce que vous avez fait et pourquoi (données → EDA → stationnarité → modèles → évaluation)."),
@@ -16088,6 +19977,13 @@ summary_errors <- aggregate_metrics(...)
           CheckItem("Identifier quand il faut sortir du cadre SARIMA (exogenes, multiples saisonnalites, ruptures, variance conditionnelle).")
         ),
         
+        Deliverables(
+          tags$li("Des gabarits prêts à copier : phrases APA, tableaux de résultats, checklists, et rappels de formules."),
+          tags$li("Une mini “boîte à outils” : lecture rapide ACF/PACF, décisions d/D, et actions si diagnostics échouent."),
+          tags$li("Une liste de signaux “SARIMA insuffisant” + pistes alternatives (SARIMAX, ETS/TBATS, modèles à hétéroscédasticité, etc.).")
+        ),
+        
+        
         H5("Benchmarks (définitions)"),
         UL(
           tags$li(B("Naïf"), " : ", C("ŷ_{t+1|t} = y_t"), " (persistance)."),
@@ -16116,6 +20012,28 @@ summary_errors <- aggregate_metrics(...)
                   C("\\nabla=(1-B)"), ", ", C("\\nabla_s=(1-B^s)"), ", ",
                   C("\\nabla^d \\nabla_s^D y_t"), " pour stationnariser.")
         ),
+        
+        H5("Équation SARIMA en opérateurs (forme compacte)"),
+        P("Cette écriture est utile parce qu’elle montre clairement : (i) comment la différenciation rend la série stationnaire, et (ii) comment les polynômes AR/MA décrivent la dépendance restante."),
+        UL(
+          tags$li("Forme générale : ",
+                  C("\\Phi(B^s)\\,\\phi(B)\\,(1-B)^d(1-B^s)^D\\,y_t = \\Theta(B^s)\\,\\theta(B)\\,\\varepsilon_t")),
+          tags$li(B("Polynômes non saisonniers"), " : ",
+                  C("\\phi(B)=1-\\phi_1B-\\cdots-\\phi_pB^p"), " et ",
+                  C("\\theta(B)=1+\\theta_1B+\\cdots+\\theta_qB^q"), "."),
+          tags$li(B("Polynômes saisonniers"), " : ",
+                  C("\\Phi(B^s)=1-\\Phi_1B^s-\\cdots-\\Phi_PB^{Ps}"), " et ",
+                  C("\\Theta(B^s)=1+\\Theta_1B^s+\\cdots+\\Theta_QB^{Qs}"), "."),
+          tags$li(B("Erreur"), " : ", C("\\varepsilon_t"), " est un bruit blanc (moyenne 0, variance constante, pas d’autocorrélation).")
+        ),
+        
+        H5("ACF / PACF (rappel express)"),
+        UL(
+          tags$li(B("ACF"), " : corrélation entre ", C("y_t"), " et ", C("y_{t-k}"), " (au lag ", C("k"), "). Elle aide à détecter une structure MA et la présence de saisonnalité (pics aux multiples de ", C("s"), ")."),
+          tags$li(B("PACF"), " : corrélation “pure” entre ", C("y_t"), " et ", C("y_{t-k}"), " après avoir contrôlé les lags intermédiaires. Elle aide à détecter une structure AR."),
+          tags$li(B("Avertissement"), " : lire ACF/PACF sur une série non stationnaire conduit souvent à des ordres trop grands ; faites la différenciation avant d’interpréter les coupures.")
+        ),
+        
         H5("Pistes avancées (pour l’enseignant)"),
         UL(
           tags$li(B("SARIMAX / régression dynamique"), " : variables exogènes, pré-blanchiment, fonctions de transfert."),
@@ -16162,7 +20080,7 @@ summary_errors <- aggregate_metrics(...)
   
   
   
-   
+  
   #======================================================================================================
   #======================================================================================================
   #======================================================================================================
