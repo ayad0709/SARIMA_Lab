@@ -1,4 +1,4 @@
-# ui.R — SARIMA Scientific Writing Lab (v2)
+# ui.R — SARIMA Scientific Writing Lab (v2) 
 # FIX v2: Manual SARIMA validation forecast is forced to align with the test set horizon (h = test length).
 
 library(shiny)
@@ -59,7 +59,7 @@ ui <- fluidPage(
   
   
   
-  #   🔴 SARIMA Modeling Lab Main Panel
+  #   🟡 SARIMA Modeling Lab Main Panel 🟡
 
  
   titlePanel("SARIMA Modeling Lab (v2)"),
@@ -145,9 +145,26 @@ ui <- fluidPage(
           "Roadmap",
           tabsetPanel(
             tabPanel(title = "Roadmap", uiOutput("roadmap_ui")),
+            # tabPanel(title = "Roadmap (Detailed Ang)", uiOutput("roadmap_Detailed_Ang_ui")),
+            # tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui")),
+            # tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui2")),
+            # tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui3")),
+            tabPanel(title = "Roadmap Fr", uiOutput("roadmap_Detailed_Fr_ui4")),
+            # tabPanel(title = "Roadmap Fr", uiOutput("roadmap_Detailed_Fr_ui4_2")),
+            # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui5")),
+            # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui6")),
+            tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui7")),
+            # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui8")),
+            tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui9")),
+            
+            
+            
+            
+            # tabPanel(title = "Roadmap Ar", uiOutput("roadmap_Detailed_Ar_ui3")),
+            
             tabPanel(title = "Environment",uiOutput("package_status")),
-            tabPanel(title = "Roadmap (Detailed Ang)", uiOutput("roadmap_Detailed_Ang_ui")),
-            tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui")),
+            
+            
           )
         ),
         
@@ -159,6 +176,7 @@ ui <- fluidPage(
         #     tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui"))
         #   )
         # ),
+        
         
         #---------------------
         #  1️ 1—Descriptives
@@ -309,23 +327,7 @@ ui <- fluidPage(
                       # number of ticks (approx.)
                       sliderInput("stp_x_ticks", "Approx. number of x ticks", min = 3, max = 100, value = 8, step = 1),
                       
-                      # label format presets
-                      # selectInput(
-                      #   "stp_date_format",
-                      #   "Date label format",
-                      #   choices = c(
-                      #     "Auto" = "auto",
-                      #     "Year" = "%Y",
-                      #     "Year-Month" = "%Y-%m",
-                      #     "Month-Year" = "%b %Y",
-                      #     "Day-Month-Year" = "%d %b %Y",
-                      #     "ISO (YYYY-MM-DD)" = "%Y-%m-%d",
-                      #     "Custom (type below)" = "custom"
-                      #   ),
-                      #   selected = "auto"
-                      # ),
-                      
-                      
+
                       selectInput(
                         "stp_date_format",
                         "Date label format",
@@ -614,9 +616,8 @@ ui <- fluidPage(
               width = 8,
               tabsetPanel(
                 tabPanel("What to do", uiOutput("step4_notes")),
+                
                 # tabPanel("Results", verbatimTextOutput("stationarity_results")),
-                
-                
                 tabPanel(
                   "Results",
                   tags$head(tags$style(HTML("
@@ -633,9 +634,7 @@ ui <- fluidPage(
                   verbatimTextOutput("stationarity_results")
                 ),
                 
-
                 # tabPanel("Interpretation", verbatimTextOutput("stationarity_interpretation")),
-                
                  tabPanel(
                   "Interpretation",
                   tags$head(tags$style(HTML("
@@ -652,11 +651,8 @@ ui <- fluidPage(
                   verbatimTextOutput("stationarity_interpretation")
                 ),
                 
- 
                 tabPanel("Suggested diff.", verbatimTextOutput("diff_suggestion")),
-                
                 tabPanel("Differenced plot", plotOutput("diff_plot", height = 360)),
-                
                 tabPanel("APA paragraph", verbatimTextOutput("apa_stationarity_paragraph"))
               )
             )
