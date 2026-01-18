@@ -4,7 +4,7 @@
 library(shiny)
 library(shinythemes)
 library(shinyjs)
-
+library(DiagrammeR)
 
 ui <- fluidPage(
   theme = shinytheme("flatly"),
@@ -57,6 +57,43 @@ ui <- fluidPage(
   "))
   ),
   
+  
+  
+  tags$style(HTML("
+            /* Only style THIS details' own summary (not nested ones) */
+            .defs-details > summary {
+              list-style: none;
+              cursor: pointer;
+              font-weight: 600;
+              display: block;
+              text-align: left;
+              padding-left: 1.6em;
+              position: relative;
+            }
+            
+            .defs-details > summary::-webkit-details-marker { display: none; }
+            
+            /* closed */
+            .defs-details > summary::before {
+              content: '▶';
+              position: absolute;
+              left: 0;
+              top: 50%;
+              transform: translateY(-50%);
+              line-height: 1;
+            }
+            
+            /* open (IMPORTANT: direct child selector) */
+            .defs-details[open] > summary::before {
+              content: '▼';
+            }
+            
+            /* optional spacing for content */
+            .defs-details > *:not(summary) {
+              margin-left: 0.6em;
+              margin-top: 6px;
+            }
+        ")),
   
   
   #   🟡 SARIMA Modeling Lab Main Panel 🟡
@@ -272,6 +309,11 @@ ui <- fluidPage(
                       ),
                       
                       # extra params
+                      conditionalPanel(
+                        "input.stp_plot_type == 'ACF' || input.stp_plot_type == 'PACF' || input.stp_plot_type == 'ACF+PACF' || input.stp_plot_type == 'Time + ACF+PACF'",
+                        sliderInput("stp_corr_lag", "Max lag for ACF/PACF", min = 5, max = 200, value = 60, step = 1)
+                      ),
+                      
                       conditionalPanel(
                         "input.stp_plot_type == 'Moving average'",
                         numericInput("stp_ma_k", "MA window (k)", value = 5, min = 1, step = 1),
@@ -512,6 +554,13 @@ ui <- fluidPage(
                         selected = "Line"
                       ),
                       
+                      # ✅ NEW: conditional numeric input (shows only for ACF/PACF family)
+                      # conditionalPanel(
+                      #   condition = "input.plot_type_choice == 'ACF' || input.plot_type_choice == 'PACF' || input.plot_type_choice == 'ACF+PACF' || input.plot_type_choice == 'Time + ACF+PACF'",
+                      #   numericInput("St_Lag", "Lag (ACF/PACF)", value = 40, min = 1, step = 1)
+                      # ),
+                      
+                      
                       textInput("plot_width", "Width:", value = "800"),
                       textInput("plot_height", "Height:", value = "500"),
                       
@@ -521,6 +570,7 @@ ui <- fluidPage(
                         selected = "Minimal"
                       ),
                       
+                      numericInput("St_Lag", "Lag# (ACF/PACF)", value = 40, min = 1, step = 1),
                       numericInput("ma_k", "Moving average window k:", min = 2, step = 1, value = 5),
                       numericInput("lag_m", "Lag plot: number of lags (m):", min = 1, step = 1, value = 12),
                       
