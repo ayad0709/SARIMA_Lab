@@ -194,9 +194,6 @@ ui <- fluidPage(
             # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui8")),
             # tabPanel(title = "Roadmap (Detailed)", uiOutput("roadmap_Detailed_Fr_ui9")),
             
-            
-            
-            
             # tabPanel(title = "Roadmap Ar", uiOutput("roadmap_Detailed_Ar_ui3")),
             
             tabPanel(title = "Environment",uiOutput("package_status")),
@@ -205,14 +202,159 @@ ui <- fluidPage(
           )
         ),
         
-        # tabPanel(
-        #   "Roadmap",
-        #   tabsetPanel(
-        #     tabPanel(title = "Roadmap", uiOutput("roadmap_ui")),
-        #     tabPanel(title = "Roadmap (Detailed Ang)", uiOutput("roadmap_Detailed_Ang_ui")),
-        #     tabPanel(title = "Roadmap (Detailed Fr)", uiOutput("roadmap_Detailed_Fr_ui"))
-        #   )
-        # ),
+
+        
+        # ---------------------------------------------------
+        # -2️️️ #️⃣- Advanced Exploration tab (unchanged layout) ---
+        # ---------------------------------------------------
+        
+        tabPanel(
+          "—> Exploration",
+          br(),
+          sidebarLayout(
+            sidebarPanel(
+              width = 2,
+              
+              numericInput("d_n", label = "d (non-seasonal differencing):", min = 0, value = 0),
+              numericInput("DS_n", label = "D (seasonal differencing):", min = 0, value = 0),
+              checkboxInput("check_box", HTML("<b>log(S(t))</b>"), value = FALSE),
+              
+              tags$strong("Stationarity Test (ADF/KPSS)"),
+              
+              selectInput(
+                "adfTypeSt2", "ADF model type:",
+                choices = c("none", "drift", "trend"),
+                selected = "drift"
+              ),
+              
+              selectInput(
+                "alternd2St", "ADF alternative (tseries):",
+                choices = c("stationary", "explosive", "regression"),
+                selected = "stationary"
+              ),
+              
+              numericInput("LagOrderADFd2St", "Lag order (k):", min = 0, step = 1, value = 10),
+              selectInput("alphaSt2", "Significance level (α):",
+                          choices = c("0.01", "0.05", "0.1"), selected = "0.05"),
+              
+              checkboxInput(
+                "use_train_explore",
+                HTML("<b>Use training split (train only)</b>"),
+                value = FALSE
+              ),
+              helpText("Uncheck to use the full series on this tab.")
+            ),
+            
+            mainPanel(
+              width = 10,
+              tabsetPanel(
+                id = "transform_tabs",
+                
+                tabPanel("d?D?log?(St) (*)", uiOutput("d_D_Log_ts_Choice_UI")),
+                
+                tabPanel(
+                  "Plot (*)",
+                  sidebarLayout(
+                    sidebarPanel(
+                      width = 2,
+                      
+                      selectInput(
+                        "plot_type_choice", "Plot type:",
+                        choices = c(
+                          "Line",
+                          "Points",
+                          "Line + Points",
+                          "Smoothed (LOESS)",
+                          "Moving average",
+                          "Cumulative sum",
+                          "Seasonal plot",
+                          "Seasonal subseries",
+                          "Polar seasonal",
+                          "Seasonal boxplot",
+                          "Classical decomposition (additive)",
+                          "Classical decomposition (multiplicative)",
+                          "STL decomposition",
+                          "Histogram",
+                          "Density",
+                          "QQ plot",
+                          "Lag-1 scatter",
+                          "Lag plot (1..m)",
+                          "ACF",
+                          "PACF",
+                          "ACF+PACF",
+                          "Time + ACF+PACF",
+                          "Periodogram"
+                        ),
+                        selected = "Line"
+                      ),
+                      
+                      # ✅ NEW: conditional numeric input (shows only for ACF/PACF family)
+                      # conditionalPanel(
+                      #   condition = "input.plot_type_choice == 'ACF' || input.plot_type_choice == 'PACF' || input.plot_type_choice == 'ACF+PACF' || input.plot_type_choice == 'Time + ACF+PACF'",
+                      #   numericInput("St_Lag", "Lag (ACF/PACF)", value = 40, min = 1, step = 1)
+                      # ),
+                      
+                      
+                      textInput("plot_width", "Width:", value = "800"),
+                      textInput("plot_height", "Height:", value = "500"),
+                      
+                      selectInput(
+                        "plot_theme", "Theme:",
+                        choices = c("Gray", "Minimal", "Classic", "Light", "Dark", "BW", "Void"),
+                        selected = "Minimal"
+                      ),
+                      
+                      numericInput("St_Lag", "Lag# (ACF/PACF)", value = 40, min = 1, step = 1),
+                      numericInput("ma_k", "Moving average window k:", min = 2, step = 1, value = 5),
+                      numericInput("lag_m", "Lag plot: number of lags (m):", min = 1, step = 1, value = 12),
+                      
+                      uiOutput("ts_color_ui")
+                    ),
+                    mainPanel(
+                      width = 9,
+                      uiOutput("tsPlot_Choice_UI")
+                    )
+                  )
+                ),
+                
+                tabPanel("ACF+PACF (*)", uiOutput("difference2ACFPACF_UI")),
+                
+                tabPanel(
+                  "Stationarity [ADF + KPSS]",
+                  tags$head(tags$style(HTML("
+                    #teststationarited3St{
+                      height: 745px !important;
+                      max-height: 800px;
+                      width: 100% !important;
+                      white-space: pre;
+                      overflow-y: auto;
+                      border: 2px solid #cccccc;
+                      font-size: 13px;
+                    }
+                  "))),
+                  verbatimTextOutput("teststationarited3St")
+                ),
+                
+                tabPanel(
+                  "CHECKLIST & STEPS",
+                  tags$head(tags$style(HTML("
+                    #CHECKLIST{
+                      height: 745px !important;
+                      max-height: 800px;
+                      width: 100% !important;
+                      white-space: pre;
+                      overflow-y: auto;
+                      border: 2px solid #cccccc;
+                      font-size: 13px;
+                    }
+                  "))),
+                  verbatimTextOutput("CHECKLIST")
+                )
+              )
+            )
+          )
+        ),
+        
         
         
         #---------------------
@@ -468,158 +610,6 @@ ui <- fluidPage(
         ),
         
         
-        
-
-        # ---------------------------------------------------
-        # -2️️️ #️⃣- Advanced Exploration tab (unchanged layout) ---
-        # ---------------------------------------------------
-        
-        tabPanel(
-          "—> Exploration",
-          br(),
-          sidebarLayout(
-            sidebarPanel(
-              width = 2,
-              
-              numericInput("d_n", label = "d (non-seasonal differencing):", min = 0, value = 0),
-              numericInput("DS_n", label = "D (seasonal differencing):", min = 0, value = 0),
-              checkboxInput("check_box", HTML("<b>log(S(t))</b>"), value = FALSE),
-              
-              tags$strong("Stationarity Test (ADF/KPSS)"),
-              
-              selectInput(
-                "adfTypeSt2", "ADF model type:",
-                choices = c("none", "drift", "trend"),
-                selected = "drift"
-              ),
-              
-              selectInput(
-                "alternd2St", "ADF alternative (tseries):",
-                choices = c("stationary", "explosive", "regression"),
-                selected = "stationary"
-              ),
-              
-              numericInput("LagOrderADFd2St", "Lag order (k):", min = 0, step = 1, value = 10),
-              selectInput("alphaSt2", "Significance level (α):",
-                          choices = c("0.01", "0.05", "0.1"), selected = "0.05"),
-              
-              checkboxInput(
-                "use_train_explore",
-                HTML("<b>Use training split (train only)</b>"),
-                value = FALSE
-              ),
-              helpText("Uncheck to use the full series on this tab.")
-            ),
-            
-            mainPanel(
-              width = 10,
-              tabsetPanel(
-                id = "transform_tabs",
-                
-                tabPanel("d?D?log?(St) (*)", uiOutput("d_D_Log_ts_Choice_UI")),
-                
-                tabPanel(
-                  "Plot (*)",
-                  sidebarLayout(
-                    sidebarPanel(
-                      width = 2,
-                      
-                      selectInput(
-                        "plot_type_choice", "Plot type:",
-                        choices = c(
-                          "Line",
-                          "Points",
-                          "Line + Points",
-                          "Smoothed (LOESS)",
-                          "Moving average",
-                          "Cumulative sum",
-                          "Seasonal plot",
-                          "Seasonal subseries",
-                          "Polar seasonal",
-                          "Seasonal boxplot",
-                          "Classical decomposition (additive)",
-                          "Classical decomposition (multiplicative)",
-                          "STL decomposition",
-                          "Histogram",
-                          "Density",
-                          "QQ plot",
-                          "Lag-1 scatter",
-                          "Lag plot (1..m)",
-                          "ACF",
-                          "PACF",
-                          "ACF+PACF",
-                          "Time + ACF+PACF",
-                          "Periodogram"
-                        ),
-                        selected = "Line"
-                      ),
-                      
-                      # ✅ NEW: conditional numeric input (shows only for ACF/PACF family)
-                      # conditionalPanel(
-                      #   condition = "input.plot_type_choice == 'ACF' || input.plot_type_choice == 'PACF' || input.plot_type_choice == 'ACF+PACF' || input.plot_type_choice == 'Time + ACF+PACF'",
-                      #   numericInput("St_Lag", "Lag (ACF/PACF)", value = 40, min = 1, step = 1)
-                      # ),
-                      
-                      
-                      textInput("plot_width", "Width:", value = "800"),
-                      textInput("plot_height", "Height:", value = "500"),
-                      
-                      selectInput(
-                        "plot_theme", "Theme:",
-                        choices = c("Gray", "Minimal", "Classic", "Light", "Dark", "BW", "Void"),
-                        selected = "Minimal"
-                      ),
-                      
-                      numericInput("St_Lag", "Lag# (ACF/PACF)", value = 40, min = 1, step = 1),
-                      numericInput("ma_k", "Moving average window k:", min = 2, step = 1, value = 5),
-                      numericInput("lag_m", "Lag plot: number of lags (m):", min = 1, step = 1, value = 12),
-                      
-                      uiOutput("ts_color_ui")
-                    ),
-                    mainPanel(
-                      width = 9,
-                      uiOutput("tsPlot_Choice_UI")
-                    )
-                  )
-                ),
-                
-                tabPanel("ACF+PACF (*)", uiOutput("difference2ACFPACF_UI")),
-                
-                tabPanel(
-                  "Stationarity [ADF + KPSS]",
-                  tags$head(tags$style(HTML("
-                    #teststationarited3St{
-                      height: 745px !important;
-                      max-height: 800px;
-                      width: 100% !important;
-                      white-space: pre;
-                      overflow-y: auto;
-                      border: 2px solid #cccccc;
-                      font-size: 13px;
-                    }
-                  "))),
-                  verbatimTextOutput("teststationarited3St")
-                ),
-                
-                tabPanel(
-                  "CHECKLIST & STEPS",
-                  tags$head(tags$style(HTML("
-                    #CHECKLIST{
-                      height: 745px !important;
-                      max-height: 800px;
-                      width: 100% !important;
-                      white-space: pre;
-                      overflow-y: auto;
-                      border: 2px solid #cccccc;
-                      font-size: 13px;
-                    }
-                  "))),
-                  verbatimTextOutput("CHECKLIST")
-                )
-              )
-            )
-          )
-        ),
         
         
         # ---------------------------------------------------

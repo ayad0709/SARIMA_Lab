@@ -183,11 +183,6 @@ fmt_num <- function(x, digits = 4, trim = TRUE) {
   format(round(x, digits), nsmall = digits, trim = trim)
 }
 
-# fmt_num <- function(x, digits = 2) {
-#   if (is.na(x)) return("NA")
-#   format(round(x, digits), nsmall = digits, trim = TRUE)
-# }
-
 
 
 
@@ -198,21 +193,6 @@ fmt_pct <- function(x, digits = 1) {
 
 # ---------------- Dates & time grid ----------------
 
-# parse_dates <- function(x) {
-#   if (inherits(x, "Date")) return(x)
-#   if (is.numeric(x)) return(as.Date(x, origin = "1899-12-30"))
-#   x_chr <- as.character(x)
-# 
-#   d <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr)))
-#   if (all(is.na(d))) {
-#     d <- suppressWarnings(lubridate::parse_date_time(
-#       x_chr,
-#       orders = c("ymd", "dmy", "mdy", "Ymd", "Y-m-d", "d-m-Y", "m/d/Y", "Y", "ym", "my", "bY", "Y-b", "any")
-#     ))
-#     d <- as.Date(d)
-#   }
-#   d
-# }
 
 freq_value <- function(input) {
   if (identical(input$frequency, "other")) as.numeric(input$customFrequency) else as.numeric(input$frequency)
@@ -685,97 +665,103 @@ server <- function(input, output, session) {
         tags$br(),
       ),
       
+   
+      
+      # =========================
+      # 1 Not to change
+      # =========================
+      
       tags$details(
         class = "defs-details",
         tags$summary(tags$span("Diagramme complet — analyse SARIMA (workflow)")),
-        grVizOutput("sarima_workflow", height = "2500px")
+        grVizOutput("sarima_workflow", height = "5500px")
       ),
       
       # =========================
-      # Box 2: Package status (below roadmap)
+      # 2 Not to change
+      # =========================      
+      tags$details(
+        class = "defs-details",
+        tags$summary(tags$span("Arbre décisionnel — choix de p,d,q,P,D,Q (SARIMA)")),
+        tags$div(
+          style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+          DiagrammeR::grVizOutput("pdqpDQ_tree", height = "4000px")
+        )
+      ),     
+      
       # =========================
-      # tags$div(
-      #   style = "background:#eef5ff;padding:12px;border-radius:8px;",
-      #   tags$h4("R environment check"),
-      #   tags$p(
-      #     style = "margin-top:-6px; font-size: 13px; color:#34495e;",
-      #     "✅ installed  •  ❌ missing"
-      #   ),
-      # 
-      #   tags$br(),
-      # 
-      #   fluidRow(
-      # 
-      #     # =========================
-      #     # LEFT: Required packages
-      #     # =========================
-      #     column(
-      #       width = 2,
-      #       tags$b("Required packages"),
-      #       tags$ul(lapply(required_pkgs, pkg_status_li))
-      #     ),
-      # 
-      #     # =========================
-      #     # RIGHT: Optional packages
-      #     # =========================
-      #     column(
-      #       width = 2,
-      #       tags$b("Optional packages"),
-      #       tags$ul(lapply(optional_pkgs, pkg_status_li))
-      #     )
-      #   ),
-      # 
-      #   # Optional warning if required packages missing
-      #   if (any(!vapply(required_pkgs, has_pkg, logical(1)))) {
-      #     tags$div(
-      #       style = "margin-top:10px; color:#b71c1c; font-size:13px;",
-      #       tags$b("Some required packages are missing."),
-      #       tags$div("Install with:"),
-      #       tags$pre(
-      #         style = "background:white; padding:8px; border-radius:6px;",
-      #         paste0(
-      #           "install.packages(c(",
-      #           paste0('"', required_pkgs, '"', collapse = ", "),
-      #           "))"
-      #         )
-      #       )
-      #     )
-      #   } else NULL
-      # )
+      # 3 Not to change
+      # =========================      
+      tags$details(
+        class = "defs-details",
+        tags$summary(tags$span("Diagramme complet — Stationnarité & différenciation (ADF/KPSS/PP) + checklist étudiant")),
+        tags$div(
+          style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+          DiagrammeR::grVizOutput("stationarity_diff_workflow", height = "4000px")
+        )
+      ),
+      
+      # =========================
+      # 4 Not to change
+      # =========================
+      tags$details(
+        class = "defs-details",
+        tags$summary(tags$span("Arbre décisionnel complet — diagnostics → actions (Graph)")),
+        tags$div(
+          style = "padding:10px 12px; background:#fff;",
+          DiagrammeR::grVizOutput("diag_tree", height = "2000px")
+        )
+      ),
+      
+      # # =========================
+      # # 5 Not to change
+      # # =========================     
+      # tags$details(
+      #   class = "defs-details",
+      #   tags$summary(tags$span("Arbre décisionnel — stationnarité & différenciation (ADF/KPSS/PP)")),
+      #   tags$div(
+      #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+      #     DiagrammeR::grVizOutput("stationarity_tree2", height = "2000px")
+      #   )
+      # ),
+      
+      # # =========================
+      # # 6 Not to change
+      # # =========================     
+      # tags$details(
+      #   class = "defs-details",
+      #   tags$summary(tags$span("Arbre décisionnel — stationnarité & différenciation (ADF/KPSS/PP)")),
+      #   tags$div(
+      #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+      #     DiagrammeR::grVizOutput("stationarity_tree", height = "1500px")
+      #   )
+      # ),
+      
+      # # =========================
+      # # 7 Not to change
+      # # =========================    
+      # tags$details(
+      #   class = "defs-details",
+      #   tags$summary(tags$span("Diagramme pédagogique — combiner ADF / KPSS / PP (raisonnement)")),
+      #   tags$div(
+      #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+      #     DiagrammeR::grVizOutput("adf_kpss_pp_tree", height = "1900px")
+      #   )
+      # ),
+      
+      # # =========================
+      # # 8 Not to change
+      # # =========================     
+      # tags$details(
+      #   class = "defs-details",
+      #   tags$summary(tags$span("Diagramme complet (avec explications) — combiner ADF / KPSS / PP")),
+      #   tags$div(
+      #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+      #     DiagrammeR::grVizOutput("adf_kpss_pp_tree_full", height = "2500px")
+      #   )
+      # ),
       
       
-      
-      # tags$div(
-      #   style = "background:#eef5ff;padding:12px;border-radius:8px;",
-      #   tags$h4("R environment check"),
-      #   tags$p(
-      #     style = "margin-top:-6px; font-size: 13px; color:#34495e;",
-      #     "✅ installed  •  ❌ missing"
-      #   ),
-      #   
-      #   tags$b("Required packages"),
-      #   tags$ul(lapply(required_pkgs, pkg_status_li)),
-      #   
-      #   tags$b("Optional packages"),
-      #   tags$ul(lapply(optional_pkgs, pkg_status_li)),
-      #   
-      #   # Optional install hint (only if required missing)
-      #   if (any(!vapply(required_pkgs, has_pkg, logical(1)))) {
-      #     tags$div(
-      #       style = "margin-top:10px; color:#b71c1c; font-size: 13px;",
-      #       tags$b("Some required packages are missing."),
-      #       tags$div("Install with:"),
-      #       tags$pre(
-      #         style = "background:white; padding:8px; border-radius:6px;",
-      #         paste0(
-      #           "install.packages(c(",
-      #           paste0('"', required_pkgs, '"', collapse = ", "),
-      #           "))"
-      #         )
-      #       )
-      #     )
-      #   } else NULL
-      # )
     )
   })
   
@@ -1032,33 +1018,7 @@ server <- function(input, output, session) {
   # --- MOD: display Date columns as readable strings in the preview table ---
   # ============================================================
   
-  # output$full_data_table <- DT::renderDataTable({
-  #   req(raw_data())
-  #   
-  #   df <- raw_data()
-  #   
-  #   # optional: make Date/POSIX columns print nicely
-  #   for (nm in names(df)) {
-  #     if (inherits(df[[nm]], "Date")) df[[nm]] <- format(df[[nm]], "%Y-%m-%d")
-  #     if (inherits(df[[nm]], "POSIXt")) df[[nm]] <- format(df[[nm]], "%Y-%m-%d %H:%M:%S")
-  #   }
-  #   
-  #   DT::datatable(
-  #     df,
-  #     rownames = FALSE,
-  #     filter = "top",
-  #     extensions = c("Scroller"),
-  #     options = list(
-  #       deferRender = TRUE,
-  #       scrollX = TRUE,
-  #       scrollY = 520,
-  #       scroller = TRUE,
-  #       pageLength = 25,
-  #       lengthMenu = list(c(10, 25, 50, 100, -1), c("10", "25", "50", "100", "All"))
-  #     )
-  #   )
-  # })
-  
+
   output$full_data_table <- DT::renderDataTable({
     req(raw_data())
     
@@ -1124,19 +1084,8 @@ server <- function(input, output, session) {
   })
   
 
-  # output$data_preview <- renderTable({ req(prepared()); head(prepared()$df, 12) }, rownames = FALSE)
-  
-  
-  # output$basic_stats <- renderTable({ req(prepared()); basic_stats_df(prepared()$df$y_filled) }, rownames = FALSE)
 
-  # output$hist_plot <- renderPlot({
-  #   req(prepared())
-  #   df <- prepared()$df
-  #   ggplot(df, aes(x = y_filled)) +
-  #     geom_histogram(bins = 30) +
-  #     theme_minimal() +
-  #     labs(title = "Distribution (filled values)", x = "Value", y = "Count")
-  # })
+  
 
   output$missing_text <- renderPrint({
     req(prepared())
@@ -1202,34 +1151,6 @@ server <- function(input, output, session) {
     height = 650
   )
 
-  # output$plot_series <- renderPlot({
-  #   req(prepared(), ts_train_test())
-  #   p <- prepared()
-  #   s <- ts_train_test()
-  #   df <- s$dfm
-  #   df$set <- ifelse(seq_len(nrow(df)) <= s$train_n, "Train", "Test/Future")
-  #   ggplot(df, aes(x = x, y = y_trans, color = set)) +
-  #     geom_line(linewidth = 0.9) +
-  #     theme_minimal() +
-  #     labs(title = "Time series (transformed)", x = p$x_label, y = "Value", color = NULL) +
-  #     theme(legend.position = "bottom")
-  # })
-
-  # output$season_plot <- renderPlot({
-  #   req(ts_train_test())
-  #   s <- ts_train_test()
-  #   x <- ts(c(as.numeric(s$ts_train), as.numeric(s$ts_test)), start = 1, frequency = frequency(s$ts_train))
-  #   validate(need(frequency(x) >= 2, "Seasonal plots need frequency >= 2."))
-  #   forecast::seasonplot(x, s = frequency(x))
-  # })
-
-  # output$subseries_plot <- renderPlot({
-  #   req(ts_train_test())
-  #   s <- ts_train_test()
-  #   x <- ts(c(as.numeric(s$ts_train), as.numeric(s$ts_test)), start = 1, frequency = frequency(s$ts_train))
-  #   validate(need(frequency(x) >= 2, "Subseries plot needs frequency >= 2."))
-  #   forecast::ggsubseriesplot(x) + theme_minimal()
-  # })
 
   output$acf_plot <- renderPlot({ req(ts_train_test()); x <- ts_train_test()$ts_train; plot(acf(x, lag.max = min(60, length(x) - 1)), main = "ACF (training)") })
   output$pacf_plot <- renderPlot({ req(ts_train_test()); x <- ts_train_test()$ts_train; plot(pacf(x, lag.max = min(60, length(x) - 1)), main = "PACF (training)") })
@@ -1287,200 +1208,492 @@ server <- function(input, output, session) {
   # library(DiagrammeR)  # ou utiliser DiagrammeR:: partout
   
   
-  output$sarima_workflow <- renderGrViz({
-    grViz("
-          digraph sarima_workflow {
-          
-            graph [rankdir=TB, bgcolor='white', fontname='Helvetica'];
-            node  [shape=box, style='rounded,filled', color='#2c3e50', fillcolor='#f7f9fb',
-                   fontname='Helvetica', fontsize=11];
-            edge  [color='#34495e', fontname='Helvetica', fontsize=10];
-          
-            // =======================
-            // 0) Départ
-            // =======================
-            start [label='DÉPART\\nObjectif : prévoir y_t avec un SARIMA interprétable\\n+ diagnostics OK + performance > benchmark', fillcolor='#ecf0f1'];
-          
-            // =======================
-            // 1) Données & index
-            // =======================
-            data [label='1) Données\\n- Définir y_t (unité, source)\\n- Vérifier période & fréquence (s)\\n- Index temporel : régulier, doublons, ordre\\n- Horizon de prévision (h)', fillcolor='#e8f8f5'];
-            miss [label='2) Manquants & qualité\\n- Quantifier k et k/n\\n- Choisir traitement (drop/linéaire/saisonnier/Kalman)\\n- Documenter', fillcolor='#e8f8f5'];
-            outliers [label='3) Outliers & ruptures\\n- Repérage visuel\\n- Hypothèse (réel vs erreur)\\n- Décision (garder/corriger/imputer)\\n- Impact sur modèle', fillcolor='#e8f8f5'];
-          
-            // =======================
-            // 2) EDA
-            // =======================
-            eda [label='4) EDA (exploration)\\n- Courbe y_t\\n- Seasonal plot / subseries\\n- Boxplots par saison\\n- Variance vs niveau\\n- ACF/PACF brutes (indicatif)', fillcolor='#fdebd0'];
-          
-            // =======================
-            // 3) Transformations
-            // =======================
-            q_transform [label='Variance augmente avec le niveau ?\\n(erreur relative, saison multiplicative)', fillcolor='#fef9e7'];
-            transform [label='5) Transformation\\n- Niveaux\\n- Log\\n- Box-Cox (λ)\\nObjectif : stabiliser variance, rendre additif', fillcolor='#fdebd0'];
-          
-            // =======================
-            // 4) Stationnarité & différenciation
-            // =======================
-            station_tests [label='6) Stationnarité\\n- Tests : ADF + PP + KPSS\\n- Saison : HEGY (si besoin)\\n- Rupture : Zivot–Andrews (si suspectée)', fillcolor='#fdebd0'];
-          
-            q_need_diff [label='Non-stationnaire ?\\n(ADF/PP ne rejettent pas ET KPSS rejette)', fillcolor='#fef9e7'];
-            diff_d [label='7) Différenciation non saisonnière\\nAppliquer d (souvent 0 ou 1)\\n(1-B)^d', fillcolor='#fdebd0'];
-            diff_D [label='8) Différenciation saisonnière\\nAppliquer D (souvent 0 ou 1)\\n(1-B^s)^D', fillcolor='#fdebd0'];
-          
-            q_overdiff [label='Sur-différenciation ?\\nACF lag1 très négative\\nvariance gonflée, prévisions erratiques', fillcolor='#f5eef8'];
-            backtrack [label='Revenir en arrière\\nRéduire d ou D\\n(chercher différenciation minimale)', fillcolor='#f5eef8'];
-          
-            // =======================
-            // 5) Identification (p,q,P,Q)
-            // =======================
-            identify [label='9) Identification (p,q,P,Q)\\n- ACF/PACF sur série différenciée\\n- Repérer coupures / décroissances\\n- Saison : pics aux lags multiples de s\\n- Proposer candidats', fillcolor='#d6eaf8'];
-          
-            auto [label='10) Modèle baseline\\nAuto-ARIMA (benchmark SARIMA)\\nComparer AICc/BIC + diagnostics', fillcolor='#d6eaf8'];
-          
-            // =======================
-            // 6) Estimation
-            // =======================
-            estimate [label='11) Estimation\\n- MLE (ou CSS+MLE)\\n- Coefficients ± SE, z, p\\n- Vérifier contraintes (stationnarité/inversibilité)', fillcolor='#d6eaf8'];
-          
-            // =======================
-            // 7) Diagnostics
-            // =======================
-            diag [label='12) Diagnostics résiduels\\n- Résidus ~ bruit blanc\\n- ACF résidus\\n- Ljung–Box\\n- Normalité (optionnel)\\n- ARCH/variance (optionnel)', fillcolor='#fadbd8'];
-          
-            q_diag_ok [label='Diagnostics OK ?\\n(Ljung–Box non sig., pas de structure)', fillcolor='#fef9e7'];
-            refine [label='Ajuster le modèle\\n- Revoir p,q,P,Q\\n- Revoir d/D (si sous/sur-diff)\\n- Revoir transformation\\n- Ajouter dummies (rupture/outliers)', fillcolor='#fadbd8'];
-          
-            // =======================
-            // 8) Validation & choix final
-            // =======================
-            validate [label='13) Validation hors-échantillon\\n- Train/Test ou rolling-origin\\n- Comparer à benchmark (naïf/snaïve/drift)\\n- Métriques : MAE, RMSE (+ MASE/WAPE)', fillcolor='#e8f8f5'];
-          
-            q_beats_benchmark [label='Meilleur que benchmark ?\\n(et parcimonieux)', fillcolor='#fef9e7'];
-            choose [label='14) Choix final\\n- Modèle le plus simple\\n- Performance comparable ou meilleure\\n- Diagnostics satisfaisants', fillcolor='#e8f8f5'];
-          
-            // =======================
-            // 9) Prévisions & reporting
-            // =======================
-            forecast [label='15) Prévision\\n- Horizon h\\n- Point + intervalles (80/95%)\\n- Visualisation + table\\n- Interprétation métier', fillcolor='#ecf0f1'];
-          
-            report [label='16) Reporting (papier / APA)\\n- Données (n, période, s, manquants)\\n- Transformations & différences (d,D)\\n- Modèle (p,d,q)(P,D,Q)[s]\\n- Diagnostics\\n- Validation + métriques\\n- Conclusion', fillcolor='#ecf0f1'];
-          
-            end [label='FIN\\nSARIMA validé + justifié', fillcolor='#ecf0f1'];
-          
-            // =======================
-            // Flow
-            // =======================
-            start -> data -> miss -> outliers -> eda -> q_transform;
-            q_transform -> transform [label='Oui'];
-            q_transform -> station_tests [label='Non / variance stable'];
-            transform -> station_tests;
-          
-            station_tests -> q_need_diff;
-          
-            q_need_diff -> diff_d [label='Oui (non saisonnier)'];
-            q_need_diff -> diff_D [label='Oui (saisonnier)'];
-            q_need_diff -> identify [label='Non (stationnaire)'];
-          
-            diff_d -> diff_D [label='si saisonnalité'];
-            diff_D -> q_overdiff;
-          
-            q_overdiff -> backtrack [label='Oui'];
-            q_overdiff -> identify [label='Non'];
-            backtrack -> station_tests;
-          
-            identify -> auto -> estimate -> diag -> q_diag_ok;
-          
-            q_diag_ok -> refine [label='Non'];
-            q_diag_ok -> validate [label='Oui'];
-          
-            refine -> estimate;
-          
-            validate -> q_beats_benchmark;
-            q_beats_benchmark -> choose [label='Oui'];
-            q_beats_benchmark -> refine [label='Non (améliorer)'];
-          
-            choose -> forecast -> report -> end;
-          
-          }
-      ")
-  })
+  output$sarima_workflow <- DiagrammeR::renderGrViz({
+    DiagrammeR::grViz("
+digraph sarima_workflow_checklist {
 
+  graph [rankdir=TB, bgcolor='white', fontname='Helvetica',
+         labelloc=t, fontsize=16,
+         label='SARIMA (workflow complet) — Checklist étudiante détaillée (actions + rédaction + pièges)',
+         nodesep=0.28, ranksep=0.40, margin=0.02, pad=0.02];
+
+  node  [shape=box, style='rounded,filled', color='#2c3e50', fillcolor='#f7f9fb',
+         fontname='Helvetica', fontsize=11, penwidth=1.2];
+  edge  [color='#34495e', fontname='Helvetica', fontsize=10, arrowsize=0.8];
+
+  start [label='DÉPART\\nObjectif : prévoir y_t avec un SARIMA\\n(interprétable + diagnostics OK + perf > benchmark)\\n\\nRègle : on cherche la parcimonie + la justification (pas juste AIC)',
+         fillcolor='#ecf0f1'];
+
+  // =========================================================
+  // CHECKLIST 0 — Protocole d’évaluation (avant toute chose)
+  // =========================================================
+  c0 [label='☐ Étape 0 — Protocole (vous fixez les règles du jeu)\\n\\nCe que vous faites :\\n1) Fixer α (souvent 5%)\\n2) Fixer horizon h (ex: 12 périodes)\\n3) Choisir benchmark : NAIVE / SNAIVE (si saisonnalité) / drift\\n4) Choisir métriques : MAE, RMSE, MASE (recommandé)\\n5) Choisir validation : train/test temporel ou rolling-origin\\n\\nCe que vous écrivez :\\n• α, h, benchmark, métriques, méthode de validation\\n\\nPièges :\\n• comparer des modèles sans benchmark\\n• split aléatoire (interdit en séries temporelles)',
+      fillcolor='#eaf2f8'];
+
+  // =========================================================
+  // CHECKLIST 1 — Données & index
+  // =========================================================
+  c1 [label='☐ Étape 1 — Données & définition de y_t\\n\\nCe que vous faites :\\n1) Définir y_t : unité, source, période couverte\\n2) Vérifier fréquence et régularité (pas de trous “cachés”)\\n3) Fixer s (contexte + EDA) : mensuel=12, trimestriel=4…\\n4) Vérifier ordre, doublons, dates manquantes\\n\\nCe que vous écrivez :\\n• n, période [t_min, t_max], fréquence, s, définition de y_t\\n\\nPièges :\\n• index irrégulier non corrigé\\n• doublons de dates (fausse saisonnalité)',
+      fillcolor='#e8f8f5'];
+
+  // =========================================================
+  // CHECKLIST 2 — Manquants & qualité
+  // =========================================================
+  c2 [label='☐ Étape 2 — Manquants & qualité\\n\\nCe que vous faites :\\n1) Quantifier : k manquants, k/n\\n2) Décrire le pattern : isolés ? blocs ? saisonniers ?\\n3) Choisir traitement (selon contexte) :\\n   • drop (rare, si très peu)\\n   • interpolation linéaire\\n   • imputation saisonnière\\n   • Kalman (si dispo)\\n4) Re-tracer la série après correction\\n\\nCe que vous écrivez :\\n• k, méthode choisie, justification + impact attendu\\n\\nPièges :\\n• imputer sans le dire\\n• combler un grand bloc sans justification',
+      fillcolor='#e8f8f5'];
+
+  // =========================================================
+  // CHECKLIST 3 — Outliers & ruptures
+  // =========================================================
+  c3 [label='☐ Étape 3 — Outliers & ruptures (avant d’identifier p/q)\\n\\nCe que vous faites :\\n1) Repérer visuellement (pics / chutes / rupture de niveau)\\n2) Poser l’hypothèse : valeur réelle ou erreur de mesure ?\\n3) Décider :\\n   • garder (si réel)\\n   • corriger/imputer (si erreur)\\n   • ajouter dummy/intervention (si choc ponctuel)\\n4) Noter l’impact potentiel sur ACF/PACF et tests\\n\\nCe que vous écrivez :\\n• liste des anomalies + décision + justification\\n\\nPièges :\\n• supprimer des points “pour améliorer le modèle”\\n• ignorer une rupture (ça casse la stationnarité)',
+      fillcolor='#e8f8f5'];
+
+  // =========================================================
+  // CHECKLIST 4 — EDA
+  // =========================================================
+  c4 [label='☐ Étape 4 — EDA (Analyse Exploratoire des Données)\\n\\nCe que vous faites :\\n1) Tracer y_t et décrire : tendance, saison, cycles, volatilité\\n2) Seasonal plot / subseries plot\\n3) Boxplots par saison (variabilité par mois/trimestre)\\n4) ACF/PACF sur série brute (indicatif, pas décision finale)\\n\\nCe que vous écrivez :\\n• 4 observations concrètes (avec périodes/dates)\\n\\nPièges :\\n• sauter l’EDA (on modélise alors “à l’aveugle”)\\n• confondre tendance et saisonnalité',
+      fillcolor='#fdebd0'];
+
+  // =========================================================
+  // CHECKLIST 5 — Transformation (variance)
+  // =========================================================
+  q_transform [shape=diamond, style='rounded,filled', fillcolor='#fef9e7',
+               label='Variance augmente\\navec le niveau ?\\n(erreurs relatives\\n+ saison multiplicative)'];
+
+  c5 [label='☐ Étape 5 — Transformation (si besoin)\\n\\nPourquoi : stabiliser la variance et rendre les effets plus additifs.\\n\\nCe que vous faites :\\n1) Si variance ~ constante : pas de transformation\\n2) Si variance ↑ avec niveau : log ou Box–Cox (λ)\\n3) Re-tracer après transformation\\n4) Noter comment interpréter (log ⇒ effets en % environ)\\n\\nCe que vous écrivez :\\n• “On applique … car variance… (figure)”\\n\\nPièges :\\n• log sur données avec zéros/négatifs sans précaution\\n• transformer puis oublier de l’expliquer',
+      fillcolor='#fdebd0'];
+
+  // =========================================================
+  // CHECKLIST 6 — Stationnarité & différenciation (d, D)
+  // =========================================================
+  c6 [label='☐ Étape 6 — Stationnarité & choix de (d, D)\\n\\nCe que vous faites :\\n1) Tests ADF + PP + KPSS (spécification cohérente drift/trend)\\n2) Vérifier saison : pics ACF à s,2s,… (racine saisonnière ?)\\n3) Si rupture suspectée : Zivot–Andrews (option)\\n4) Appliquer différenciation minimale : d∈{0,1}, D∈{0,1}\\n5) Re-tester après chaque différenciation\\n\\nCe que vous écrivez :\\n• tableau tests + décision d/D + figures avant/après\\n\\nPièges :\\n• d=2 ou D=2 sans argument\\n• oublier de re-tester après D',
+      fillcolor='#fdebd0'];
+
+  q_overdiff [shape=diamond, style='rounded,filled', fillcolor='#f5eef8',
+              label='Sur-différenciation ?\\nACF lag1 très négative\\nvariance gonflée\\nprévisions erratiques'];
+
+  backtrack [label='Action si sur-diff\\n• réduire d ou D\\n• envisager trend déterministe\\n• re-vérifier spécification des tests\\n\\nÀ écrire : signe observé + correction',
+             fillcolor='#f5eef8'];
+
+  // =========================================================
+  // CHECKLIST 7 — Identification (p,q,P,Q) via ACF/PACF
+  // =========================================================
+  c7 [label='☐ Étape 7 — Identification (p,q,P,Q)\\n\\nCe que vous faites :\\n1) Tracer ACF/PACF SUR la série différenciée (après d et D)\\n2) Lags courts : proposer p/q (0..2 souvent)\\n3) Lags saisonniers (s,2s,…) : proposer P/Q (0..2 souvent)\\n4) Construire 3 à 8 candidats (baseline + variantes)\\n\\nCe que vous écrivez :\\n• hypothèses : “PACF coupe ⇒ AR”, “ACF coupe ⇒ MA”\\n• liste candidats + justification brève\\n\\nPièges :\\n• choisir p,q,P,Q grands “par précaution”\\n• identifier sur série non stationnarisée',
+      fillcolor='#d6eaf8'];
+
+  // =========================================================
+  // CHECKLIST 8 — Baseline Auto-ARIMA (benchmark SARIMA)
+  // =========================================================
+  c8 [label='☐ Étape 8 — Baseline (Auto-ARIMA)\\n\\nPourquoi : donner un point de départ et un benchmark SARIMA.\\n\\nCe que vous faites :\\n1) Ajuster auto.arima sur la même série (mêmes d/D si imposés)\\n2) Noter AICc/BIC + ordre proposé\\n3) Comparer avec vos candidats (pas remplacer la réflexion)\\n\\nCe que vous écrivez :\\n• modèle auto + critères + comment il se compare\\n\\nPièges :\\n• suivre auto-arima “comme une vérité”\\n• comparer auto vs manuel sur des données différentes',
+      fillcolor='#d6eaf8'];
+
+  // =========================================================
+  // CHECKLIST 9 — Estimation
+  // =========================================================
+  c9 [label='☐ Étape 9 — Estimation des candidats\\n\\nCe que vous faites :\\n1) Estimer chaque candidat (MLE ou CSS+MLE)\\n2) Relever AICc/BIC\\n3) Noter warnings (convergence, stationnarité, inversibilité)\\n4) Vérifier coefficients raisonnables (option : significativité)\\n\\nCe que vous écrivez :\\n• tableau : modèle | AICc/BIC | warnings | remarques\\n\\nPièges :\\n• ignorer warnings\\n• garder un modèle instable car AICc est “beau”',
+      fillcolor='#d6eaf8'];
+
+  q_num [shape=diamond, style='rounded,filled', fillcolor='#f4ecf7',
+         label='Problèmes numériques ?\\n(convergence,\\nnon-inversible,\\nnon-stationnaire)'];
+
+  act_num [label='Action si problèmes numériques\\n• simplifier p/q/P/Q\\n• vérifier sur-diff (d/D)\\n• stabiliser variance (log/Box–Cox)\\n• traiter outliers/ruptures (dummies)\\n• changer initialisation/méthode\\n\\nÀ écrire : problème + correction',
+           fillcolor='#f4ecf7'];
+
+  // =========================================================
+  // CHECKLIST 10 — Diagnostics résiduels (obligatoire)
+  // =========================================================
+  c10 [label='☐ Étape 10 — Diagnostics résiduels (OBLIGATOIRE)\\n\\nCe que vous faites :\\n1) Tracer ACF des résidus (doit être ~0)\\n2) Ljung–Box (p grand ⇒ pas d’autocorr globale)\\n3) Option : normalité (QQ-plot)\\n4) Option : ARCH/volatilité (si variance en grappes)\\n\\nCe que vous écrivez :\\n• ACF résidus + conclusion Ljung–Box\\n\\nPièges :\\n• conclure sans Ljung–Box\\n• confondre “résidus petits” et “résidus blancs”',
+       fillcolor='#fadbd8'];
+
+  q_diag_ok [shape=diamond, style='rounded,filled', fillcolor='#fef9e7',
+             label='Diagnostics OK ?\\n(pas de structure\\n+ Ljung–Box OK)'];
+
+  refine [label='Action si diagnostics NOK\\n• pics lags courts ⇒ ajuster p/q\\n• pics à s,2s… ⇒ ajuster P/Q\\n• structure lente ⇒ revoir d/D ou trend\\n• re-EDA : rupture/outliers\\n\\nÀ écrire : “pic observé → action SARIMA”',
+          fillcolor='#fadbd8'];
+
+  // =========================================================
+  // CHECKLIST 11 — Validation hors-échantillon
+  // =========================================================
+  c11 [label='☐ Étape 11 — Validation hors-échantillon\\n\\nCe que vous faites :\\n1) Train/Test temporel ou rolling-origin\\n2) Calculer MAE/RMSE/MASE (reco)\\n3) Comparer au benchmark (NAIVE/SNAIVE)\\n4) Vérifier stabilité (pas un seul split chanceux)\\n\\nCe que vous écrivez :\\n• tableau métriques + graphique prévisions vs réel\\n\\nPièges :\\n• choisir sur AICc sans test\\n• horizon h incohérent avec l’objectif',
+      fillcolor='#e8f8f5'];
+
+  q_beats [shape=diamond, style='rounded,filled', fillcolor='#fef9e7',
+           label='Meilleur que\\nbenchmark\\nET parcimonieux ?'];
+
+  choose [label='☐ Étape 12 — Choix final (convergence des preuves)\\n\\nCe que vous faites :\\n1) Retenir le plus simple qui :\\n   • passe diagnostics\\n   • bat benchmark\\n   • est stable\\n2) Départager par AICc/BIC si perf similaire\\n\\nCe que vous écrivez :\\n• conclusion : (p,d,q)(P,D,Q)[s] + justification\\n• limites (ruptures, outliers, non-linéarités, etc.)',
+      fillcolor='#e8f8f5'];
+
+  // =========================================================
+  // CHECKLIST 12 — Prévisions & reporting (papier / APA)
+  // =========================================================
+  c12 [label='☐ Étape 13 — Prévisions\\n\\nCe que vous faites :\\n1) Produire prévisions point + IC 80/95%\\n2) Visualiser + table (h)\\n3) Interpréter en langage métier (ce que cela signifie)\\n\\nCe que vous écrivez :\\n• figure finale + 3 phrases d’interprétation',
+      fillcolor='#ecf0f1'];
+
+  c13 [label='☐ Étape 14 — Reporting (structure conseillée)\\n\\nÀ inclure :\\n1) Données : n, période, s, manquants, outliers\\n2) EDA : observations\\n3) Transformation (si appliquée)\\n4) Différenciation : d, D + preuves\\n5) Modèle final : (p,d,q)(P,D,Q)[s]\\n6) Diagnostics résidus\\n7) Validation + comparaison benchmark\\n8) Conclusion + limites',
+      fillcolor='#ecf0f1'];
+
+  end [label='FIN\\nSARIMA validé + justifié\\n(et reproductible)', fillcolor='#ecf0f1'];
+
+  // =======================
+  // Flow
+  // =======================
+  start -> c0 -> c1 -> c2 -> c3 -> c4 -> q_transform;
+  q_transform -> c5 [label='Oui'];
+  q_transform -> c6 [label='Non / variance stable'];
+  c5 -> c6;
+
+  c6 -> q_overdiff;
+  q_overdiff -> backtrack [label='Oui'];
+  q_overdiff -> c7 [label='Non'];
+  backtrack -> c6;
+
+  c7 -> c8 -> c9 -> q_num;
+  q_num -> act_num [label='Oui'];
+  act_num -> c7;
+  q_num -> c10 [label='Non'];
+
+  c10 -> q_diag_ok;
+  q_diag_ok -> refine [label='Non'];
+  refine -> c7;
+  q_diag_ok -> c11 [label='Oui'];
+
+  c11 -> q_beats;
+  q_beats -> choose [label='Oui'];
+  q_beats -> refine [label='Non'];
+
+  choose -> c12 -> c13 -> end;
+}
+  ")
+  })
+  
+  
+  # output$sarima_workflow <- renderGrViz({
+  #   grViz("
+  #         digraph sarima_workflow {
+  #         
+  #           graph [rankdir=TB, bgcolor='white', fontname='Helvetica'];
+  #           node  [shape=box, style='rounded,filled', color='#2c3e50', fillcolor='#f7f9fb',
+  #                  fontname='Helvetica', fontsize=11];
+  #           edge  [color='#34495e', fontname='Helvetica', fontsize=10];
+  #         
+  #           // =======================
+  #           // 0) Départ
+  #           // =======================
+  #           start [label='DÉPART\\nObjectif : prévoir y_t avec un SARIMA interprétable\\n+ diagnostics OK + performance > benchmark', fillcolor='#ecf0f1'];
+  #         
+  #           // =======================
+  #           // 1) Données & index
+  #           // =======================
+  #           data [label='1) Données\\n- Définir y_t (unité, source)\\n- Vérifier période & fréquence (s)\\n- Index temporel : régulier, doublons, ordre\\n- Horizon de prévision (h)', fillcolor='#e8f8f5'];
+  #           miss [label='2) Manquants & qualité\\n- Quantifier k et k/n\\n- Choisir traitement (drop/linéaire/saisonnier/Kalman)\\n- Documenter', fillcolor='#e8f8f5'];
+  #           outliers [label='3) Outliers & ruptures\\n- Repérage visuel\\n- Hypothèse (réel vs erreur)\\n- Décision (garder/corriger/imputer)\\n- Impact sur modèle', fillcolor='#e8f8f5'];
+  #         
+  #           // =======================
+  #           // 2) EDA
+  #           // =======================
+  #           eda [label='4) EDA (exploration)\\n- Courbe y_t\\n- Seasonal plot / subseries\\n- Boxplots par saison\\n- Variance vs niveau\\n- ACF/PACF brutes (indicatif)', fillcolor='#fdebd0'];
+  #         
+  #           // =======================
+  #           // 3) Transformations
+  #           // =======================
+  #           q_transform [label='Variance augmente avec le niveau ?\\n(erreur relative, saison multiplicative)', fillcolor='#fef9e7'];
+  #           transform [label='5) Transformation\\n- Niveaux\\n- Log\\n- Box-Cox (λ)\\nObjectif : stabiliser variance, rendre additif', fillcolor='#fdebd0'];
+  #         
+  #           // =======================
+  #           // 4) Stationnarité & différenciation
+  #           // =======================
+  #           station_tests [label='6) Stationnarité\\n- Tests : ADF + PP + KPSS\\n- Saison : HEGY (si besoin)\\n- Rupture : Zivot–Andrews (si suspectée)', fillcolor='#fdebd0'];
+  #         
+  #           q_need_diff [label='Non-stationnaire ?\\n(ADF/PP ne rejettent pas ET KPSS rejette)', fillcolor='#fef9e7'];
+  #           diff_d [label='7) Différenciation non saisonnière\\nAppliquer d (souvent 0 ou 1)\\n(1-B)^d', fillcolor='#fdebd0'];
+  #           diff_D [label='8) Différenciation saisonnière\\nAppliquer D (souvent 0 ou 1)\\n(1-B^s)^D', fillcolor='#fdebd0'];
+  #         
+  #           q_overdiff [label='Sur-différenciation ?\\nACF lag1 très négative\\nvariance gonflée, prévisions erratiques', fillcolor='#f5eef8'];
+  #           backtrack [label='Revenir en arrière\\nRéduire d ou D\\n(chercher différenciation minimale)', fillcolor='#f5eef8'];
+  #         
+  #           // =======================
+  #           // 5) Identification (p,q,P,Q)
+  #           // =======================
+  #           identify [label='9) Identification (p,q,P,Q)\\n- ACF/PACF sur série différenciée\\n- Repérer coupures / décroissances\\n- Saison : pics aux lags multiples de s\\n- Proposer candidats', fillcolor='#d6eaf8'];
+  #         
+  #           auto [label='10) Modèle baseline\\nAuto-ARIMA (benchmark SARIMA)\\nComparer AICc/BIC + diagnostics', fillcolor='#d6eaf8'];
+  #         
+  #           // =======================
+  #           // 6) Estimation
+  #           // =======================
+  #           estimate [label='11) Estimation\\n- MLE (ou CSS+MLE)\\n- Coefficients ± SE, z, p\\n- Vérifier contraintes (stationnarité/inversibilité)', fillcolor='#d6eaf8'];
+  #         
+  #           // =======================
+  #           // 7) Diagnostics
+  #           // =======================
+  #           diag [label='12) Diagnostics résiduels\\n- Résidus ~ bruit blanc\\n- ACF résidus\\n- Ljung–Box\\n- Normalité (optionnel)\\n- ARCH/variance (optionnel)', fillcolor='#fadbd8'];
+  #         
+  #           q_diag_ok [label='Diagnostics OK ?\\n(Ljung–Box non sig., pas de structure)', fillcolor='#fef9e7'];
+  #           refine [label='Ajuster le modèle\\n- Revoir p,q,P,Q\\n- Revoir d/D (si sous/sur-diff)\\n- Revoir transformation\\n- Ajouter dummies (rupture/outliers)', fillcolor='#fadbd8'];
+  #         
+  #           // =======================
+  #           // 8) Validation & choix final
+  #           // =======================
+  #           validate [label='13) Validation hors-échantillon\\n- Train/Test ou rolling-origin\\n- Comparer à benchmark (naïf/snaïve/drift)\\n- Métriques : MAE, RMSE (+ MASE/WAPE)', fillcolor='#e8f8f5'];
+  #         
+  #           q_beats_benchmark [label='Meilleur que benchmark ?\\n(et parcimonieux)', fillcolor='#fef9e7'];
+  #           choose [label='14) Choix final\\n- Modèle le plus simple\\n- Performance comparable ou meilleure\\n- Diagnostics satisfaisants', fillcolor='#e8f8f5'];
+  #         
+  #           // =======================
+  #           // 9) Prévisions & reporting
+  #           // =======================
+  #           forecast [label='15) Prévision\\n- Horizon h\\n- Point + intervalles (80/95%)\\n- Visualisation + table\\n- Interprétation métier', fillcolor='#ecf0f1'];
+  #         
+  #           report [label='16) Reporting (papier / APA)\\n- Données (n, période, s, manquants)\\n- Transformations & différences (d,D)\\n- Modèle (p,d,q)(P,D,Q)[s]\\n- Diagnostics\\n- Validation + métriques\\n- Conclusion', fillcolor='#ecf0f1'];
+  #         
+  #           end [label='FIN\\nSARIMA validé + justifié', fillcolor='#ecf0f1'];
+  #         
+  #           // =======================
+  #           // Flow
+  #           // =======================
+  #           start -> data -> miss -> outliers -> eda -> q_transform;
+  #           q_transform -> transform [label='Oui'];
+  #           q_transform -> station_tests [label='Non / variance stable'];
+  #           transform -> station_tests;
+  #         
+  #           station_tests -> q_need_diff;
+  #         
+  #           q_need_diff -> diff_d [label='Oui (non saisonnier)'];
+  #           q_need_diff -> diff_D [label='Oui (saisonnier)'];
+  #           q_need_diff -> identify [label='Non (stationnaire)'];
+  #         
+  #           diff_d -> diff_D [label='si saisonnalité'];
+  #           diff_D -> q_overdiff;
+  #         
+  #           q_overdiff -> backtrack [label='Oui'];
+  #           q_overdiff -> identify [label='Non'];
+  #           backtrack -> station_tests;
+  #         
+  #           identify -> auto -> estimate -> diag -> q_diag_ok;
+  #         
+  #           q_diag_ok -> refine [label='Non'];
+  #           q_diag_ok -> validate [label='Oui'];
+  #         
+  #           refine -> estimate;
+  #         
+  #           validate -> q_beats_benchmark;
+  #           q_beats_benchmark -> choose [label='Oui'];
+  #           q_beats_benchmark -> refine [label='Non (améliorer)'];
+  #         
+  #           choose -> forecast -> report -> end;
+  #         
+  #         }
+  #     ")
+  # })
+
+  
   output$pdqpDQ_tree <- DiagrammeR::renderGrViz({
     DiagrammeR::grViz("
-                digraph pdqpDQ_tree {
+digraph pdqpDQ_tree {
 
-                  graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
-                         label = 'Choisir p, d, q, P, D, Q : workflow SARIMA (critères → actions)',
-                         fontname = Helvetica, bgcolor = 'transparent',
-                         nodesep = 0.35, ranksep = 0.45]
+  graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
+         label = 'SARIMA : Choisir (p,d,q)(P,D,Q)[s] — Checklist étudiante détaillée (actions + rédaction + pièges)',
+         fontname = Helvetica, bgcolor = 'transparent',
+         nodesep = 0.28, ranksep = 0.40,
+         margin = 0.02, pad = 0.02]
 
-                  node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
-                         fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
-                  edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
+  node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
+         fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
+  edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
 
-                  start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
-                  end   [shape = doublecircle, label = 'Modèle final\\n(parcimonieux + valide)', fillcolor = '#d5f5e3']
+  start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
+  end   [shape = doublecircle, label = 'Modèle final\\n(parcimonieux + valide)\\n+ rapport prêt', fillcolor = '#d5f5e3']
 
-                  s0 [label = '0) Fixer la saisonnalité s\\n(à partir du contexte + EDA)']
+  // -------------------------------------------------
+  // CHECKLIST STEP 0 — Rules / evaluation protocol
+  // -------------------------------------------------
+  c0 [label = '☐ Étape 0 — Cadre d’évaluation (AVANT de toucher p,q,P,Q)\\n\\nCe que vous faites :\\n1) Fixer α (souvent 5%) et le noter\\n2) Fixer horizon h de prévision (ex: 12 mois)\\n3) Choisir benchmark : NAIVE ou SNAIVE (si saisonnalité)\\n4) Choisir métriques : MAE, RMSE, MASE (recommandé)\\n5) Définir split temporel : train/test (pas aléatoire !)\\n\\nCe que vous écrivez (rapport) :\\n• α, h, benchmark, métriques, méthode de split\\n\\nPièges :\\n• “meilleur AIC” ≠ “meilleure prévision”\\n• split aléatoire = erreur en séries temporelles',
+      fillcolor = '#eaf2f8']
 
-                  d0 [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
-                      label = '1) Choisir d et D\\n(stationnarité : ADF/KPSS/PP\\n+ ACF aux multiples de s)']
-                  actd [label = 'Action :\\n• appliquer la différenciation minimale\\n• vérifier sur-diff (ACF lag1 très négative)\\n• retester si besoin']
+  // -------------------------------------------------
+  // CHECKLIST STEP 1 — Choose s
+  // -------------------------------------------------
+  c1 [label = '☐ Étape 1 — Fixer la saisonnalité s (contexte + EDA)\\n\\nCe que vous faites :\\n1) Utiliser le contexte (mensuel=>12, trimestriel=>4, hebdo=>52, etc.)\\n2) Vérifier sur la série : motifs répétés + pics ACF à s,2s,…\\n3) (Option) seasonal/subseries plot pour confirmer\\n\\nCe que vous écrivez :\\n• “Nous retenons s = … car … (contexte + figure/ACF)”\\n\\nPièges :\\n• inventer s “parce que ça marche”\\n• confondre cycle long et saisonnalité',
+      fillcolor = '#ecf0f1']
 
-                  acf0 [label = '2) Tracer ACF/PACF\\nSUR la série différenciée\\n(après d et D)\\n+ regarder aux lags 1.. et s,2s,…']
+  // Small decision (still checklist-style)
+  dS [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+      label = 's clair ?\\n(EDA + logique)']
+  aS [label = 'Action si s pas clair\\n• tester 2 valeurs plausibles\\n• comparer diagnostics + perf\\n• documenter la décision\\n(éviter l’arbitraire)',
+      fillcolor = '#f9e79f']
 
-                  d1 [shape = diamond, style = 'rounded,filled', fillcolor = '#e8f8f5',
-                      label = '3) Motifs ACF/PACF suggèrent\\nAR vs MA ?\\n(non-saisonnier et saisonnier)']
+  // -------------------------------------------------
+  // CHECKLIST STEP 2 — d & D fixed (from stationarity workflow)
+  // -------------------------------------------------
+  c2 [label = '☐ Étape 2 — Fixer d et D (stationnariser la série)\\n\\nCe que vous faites :\\n1) Appliquer la différenciation minimale : d∈{0,1}, D∈{0,1}\\n2) Re-tester (ADF/PP/KPSS) après chaque transformation\\n3) Vérifier ACF aux multiples de s (racine saisonnière ?)\\n4) Surveiller sur-diff : ACF lag1 très négative, variance gonflée\\n\\nCe que vous écrivez :\\n• “Avant/Après” : graph + tableau tests + décision (d,D)\\n\\nPièges :\\n• d=2 “par réflexe”\\n• oublier de re-tester après D',
+      fillcolor = '#fdebd0']
 
-                  hint [label = 'Rappels (heuristiques) :\\n• AR(p) : PACF coupure, ACF décroît\\n• MA(q) : ACF coupure, PACF décroît\\n• Saison : pics à s,2s,…\\n  PACF → P ; ACF → Q']
+  // -------------------------------------------------
+  // CHECKLIST STEP 3 — ACF/PACF on differenced series
+  // -------------------------------------------------
+  c3 [label = '☐ Étape 3 — ACF/PACF SUR la série stationnarisée (après d et D)\\n\\nCe que vous faites :\\n1) Tracer ACF et PACF de la série différenciée\\n2) Observer : lags courts (1..), et lags saisonniers (s,2s,…)\\n3) Noter où il y a des pics significatifs (et leur signe)\\n\\nCe que vous écrivez :\\n• 3 observations concrètes (ex : “pic à lag 1”, “pic à s”)\\n\\nPièges :\\n• regarder ACF/PACF AVANT différenciation\\n• sur-interpréter de petits pics isolés',
+      fillcolor = '#ecf0f1']
 
-                  cand [label = '4) Proposer un petit ensemble de candidats\\n(3 à 8 modèles)\\njustifier p,q,P,Q\\n(y compris aux multiples de s)']
+  // -------------------------------------------------
+  // CHECKLIST STEP 4 — Translate patterns into candidate ranges
+  // -------------------------------------------------
+  c4 [label = '☐ Étape 4 — Traduire motifs ACF/PACF → hypothèses (p,q,P,Q)\\n\\nRappels (heuristiques, pas des lois) :\\n• AR(p) : PACF “coupure” ~ p, ACF décroît\\n• MA(q) : ACF “coupure” ~ q, PACF décroît\\n• Saison : pics à s,2s,…\\n  PACF → P ; ACF → Q\\n\\nCe que vous faites :\\n1) Proposer p,q petits (0..2 souvent) selon lags courts\\n2) Proposer P,Q petits (0..2 souvent) selon lags saisonniers\\n3) Garder 1 modèle très simple (baseline)\\n\\nCe que vous écrivez :\\n• “Nous proposons p=… car PACF…, q=… car ACF…”\\n\\nPièges :\\n• choisir p=q=3 sans justification\\n• confondre pics saisonniers (P/Q) et non-saisonniers (p/q)',
+      fillcolor = '#d5f5e3']
 
-                  fit [label = '5) Ajuster chaque candidat\\n(p,d,q)(P,D,Q)[s]\\n+ relever AICc/BIC\\n+ vérifier stabilité/inversibilité si possible']
+  // -------------------------------------------------
+  // CHECKLIST STEP 5 — Build candidate set
+  // -------------------------------------------------
+  c5 [label = '☐ Étape 5 — Construire une petite liste de candidats (3 à 8 modèles)\\n\\nCe que vous faites :\\n1) Inclure 1 baseline : (0,d,0)(0,D,0)[s] ou proche\\n2) Ajouter 2–4 modèles guidés par ACF/PACF\\n3) Ajouter 1 modèle “alternative” (ex : AR vs MA)\\n4) Garder parcimonie : éviter trop de paramètres\\n\\nCe que vous écrivez :\\n• Liste des modèles + 1 ligne de justification chacun\\n\\nPièges :\\n• tester 40 modèles “au hasard”\\n• oublier que trop de paramètres = sur-ajustement',
+      fillcolor = '#ecf0f1']
 
-                  d2 [shape = diamond, style = 'rounded,filled', fillcolor = '#f4ecf7',
-                      label = '6) Problèmes numériques ?\\n(non-inversible / non-stationnaire\\nconvergence instable)']
-                  act2 [label = 'Actions :\\n• simplifier p/q/P/Q\\n• revoir d/D (sur-diff ?)\\n• transformer (log/Box–Cox)\\n• traiter outliers/manquants\\n• changer méthode/initialisation']
+  // -------------------------------------------------
+  // CHECKLIST STEP 6 — Fit + record criteria
+  // -------------------------------------------------
+  c6 [label = '☐ Étape 6 — Ajuster chaque candidat + consigner les résultats\\n\\nCe que vous faites :\\n1) Ajuster chaque SARIMA candidat\\n2) Noter AICc et/ou BIC (comparaison in-sample)\\n3) Vérifier coefficients raisonnables (option : significativité)\\n4) Noter warnings (convergence, inversibilité, stationnarité)\\n\\nCe que vous écrivez :\\n• Tableau : modèle | AICc | BIC | warnings | remarques\\n\\nPièges :\\n• choisir “plus petit AIC” sans diagnostics\\n• ignorer warnings de convergence',
+      fillcolor = '#ecf0f1']
 
-                  diag [label = '7) Diagnostics résiduels\\nACF résidus + Ljung–Box\\n+ normalité/ARCH (secondaire)']
+  dNum [shape = diamond, style = 'rounded,filled', fillcolor = '#f4ecf7',
+        label = 'Problèmes\\nnumériques ?\\n(convergence,\\nnon-inversible,\\nnon-stationnaire)']
+  aNum [label = 'Action si problèmes numériques\\n• simplifier p/q/P/Q\\n• vérifier sur-diff (d/D trop grands ?)\\n• stabiliser variance (log/Box–Cox)\\n• traiter outliers / ruptures\\n• changer initialisation/méthode\\n\\nÀ écrire : problème + correction',
+        fillcolor = '#f4ecf7']
 
-                  d3 [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
-                      label = '8) Résidus ~ bruit blanc ?\\n(Ljung–Box OK + ACF résidus ≈ 0)']
-                  act3 [label = 'Actions :\\n• ajuster p/q/P/Q\\n• ajouter saison si pics à s\\n• revoir d/D\\n• re-EDA (rupture/outliers)']
+  // -------------------------------------------------
+  // CHECKLIST STEP 7 — Residual diagnostics (mandatory)
+  // -------------------------------------------------
+  c7 [label = '☐ Étape 7 — Diagnostics résiduels (NON négociable)\\n\\nCe que vous faites :\\n1) Tracer ACF des résidus\\n2) Ljung–Box : tester autocorr globale (p grand ⇒ OK)\\n3) Vérifier variance : outliers / clusters (ARCH)\\n4) Normalité : secondaire (utile mais pas bloquant)\\n\\nCe que vous écrivez :\\n• Figure ACF résidus + phrase conclusion LB\\n\\nPièges :\\n• “ça a l’air bien” sans Ljung–Box\\n• confondre bon fit in-sample et résidus blancs',
+      fillcolor = '#ecf0f1']
 
-                  perf [label = '9) Évaluation prévisionnelle\\nSplit temporel / rolling-origin\\nMAE/RMSE/MASE\\nvs benchmark (naïf/SNAIVE)']
+  dWB [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+       label = 'Résidus\\n≈ bruit blanc ?\\n(ACF résidus ~0\\n+ Ljung–Box OK)']
 
-                  d4 [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
-                      label = '10) Bat le benchmark\\nET performance stable ?']
-                  act4 [label = 'Actions :\\n• simplifier / régulariser\\n• revoir candidats\\n• si aucun gain : garder benchmark\\n• ajuster horizon h / fenêtre']
+  aWB [label = 'Action si résidus PAS blancs (diagnostic → paramètre)\\n• pics lags courts ⇒ ajuster p/q\\n• pics à s,2s,… ⇒ ajuster P/Q\\n• structure lente ⇒ revoir d (ou trend)\\n• re-EDA : rupture/outliers\\n\\nÀ écrire : “pic observé → action SARIMA”',
+        fillcolor = '#fdebd0']
 
-                  choose [label = '11) Choix final\\n• retenir le plus simple\\n  qui passe diagnostics\\n  ET bat le benchmark\\n• comparer AICc/BIC à performance comparable\\n• documenter justification']
+  // -------------------------------------------------
+  // CHECKLIST STEP 8 — Forecast evaluation vs benchmark
+  // -------------------------------------------------
+  c8 [label = '☐ Étape 8 — Évaluation prévisionnelle (hors-échantillon)\\n\\nCe que vous faites :\\n1) Split temporel (train/test) OU rolling-origin\\n2) Calculer MAE/RMSE/MASE sur test\\n3) Comparer au benchmark (NAIVE/SNAIVE)\\n4) Vérifier stabilité (pas juste 1 split “chanceux”)\\n\\nCe que vous écrivez :\\n• Tableau métriques + graphique prévision vs réel\\n\\nPièges :\\n• conclure sur AICc sans test set\\n• choisir un modèle complexe pour un gain minuscule',
+      fillcolor = '#ecf0f1']
 
-                  start -> s0 -> d0
-                  d0 -> actd [label = 'itérer si besoin', color = '#34495e', fontcolor = '#34495e']
-                  actd -> acf0
-                  d0 -> acf0 [label = 'd & D fixés', color = '#1e8449', fontcolor = '#1e8449']
+  dPerf [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+         label = 'Bat le\\nbenchmark ET\\nperformance stable ?']
 
-                  acf0 -> d1 -> hint -> cand -> fit -> d2
-                  d2 -> act2 [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
-                  act2 -> cand
-                  d2 -> diag [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+  aPerf [label = 'Action si perf faible/instable\\n• simplifier (réduire paramètres)\\n• revoir candidats (p/q/P/Q)\\n• revoir split/horizon\\n• si aucun gain : garder benchmark\\n\\nÀ écrire : décision + justification',
+         fillcolor = '#fdebd0']
 
-                  diag -> d3
-                  d3 -> act3 [label = 'Non', color = '#c0392b', fontcolor = '#c0392b']
-                  act3 -> cand
-                  d3 -> perf [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+  // -------------------------------------------------
+  // CHECKLIST STEP 9 — Final choice + report package
+  // -------------------------------------------------
+  c9 [label = '☐ Étape 9 — Choix final (convergence des preuves)\\n\\nRègle pratique :\\n• garder le plus simple qui :\\n  (i) passe diagnostics résiduels\\n  (ii) bat benchmark\\n  (iii) reste stable\\n• utiliser AICc/BIC pour départager si perf ~ égale\\n\\nCe que vous écrivez :\\n• paragraphe final : (p,d,q)(P,D,Q)[s] + pourquoi\\n• limites (ruptures, outliers, non-linéarités, etc.)',
+      fillcolor = '#d5f5e3']
 
-                  perf -> d4
-                  d4 -> act4 [label = 'Non', color = '#c0392b', fontcolor = '#c0392b']
-                  act4 -> cand
-                  d4 -> choose [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+  deliver [label = '☐ Ce que l’étudiant remet (package final)\\n1) EDA + choix s\\n2) justification d/D (tests + figures)\\n3) ACF/PACF + hypothèses p,q,P,Q\\n4) tableau candidats + AICc/BIC + warnings\\n5) diagnostics résidus (ACF + Ljung–Box)\\n6) perf vs benchmark (métriques + graphique)\\n7) conclusion finale + limites',
+           fillcolor = '#eaf2f8']
 
-                  choose -> end
-                }
-              ")
-  }) 
+  // -------------------------
+  // Flow
+  // -------------------------
+  start -> c0 -> c1 -> dS
+  dS -> c2 [label='Oui', color='#1e8449', fontcolor='#1e8449']
+  dS -> aS [label='Non', color='#d68910', fontcolor='#d68910']
+  aS -> c1
+
+  c2 -> c3 -> c4 -> c5 -> c6 -> dNum
+  dNum -> aNum [label='Oui', color='#c0392b', fontcolor='#c0392b']
+  aNum -> c5
+  dNum -> c7  [label='Non', color='#1e8449', fontcolor='#1e8449']
+
+  c7 -> dWB
+  dWB -> aWB [label='Non', color='#c0392b', fontcolor='#c0392b']
+  aWB -> c5
+  dWB -> c8  [label='Oui', color='#1e8449', fontcolor='#1e8449']
+
+  c8 -> dPerf
+  dPerf -> aPerf [label='Non', color='#c0392b', fontcolor='#c0392b']
+  aPerf -> c5
+  dPerf -> c9 [label='Oui', color='#1e8449', fontcolor='#1e8449']
+
+  c9 -> deliver -> end
+}
+  ")
+  })
+  
+  
+  # output$pdqpDQ_tree <- DiagrammeR::renderGrViz({
+  #   DiagrammeR::grViz("
+  #               digraph pdqpDQ_tree {
+  # 
+  #                 graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
+  #                        label = 'Choisir p, d, q, P, D, Q : workflow SARIMA (critères → actions)',
+  #                        fontname = Helvetica, bgcolor = 'transparent',
+  #                        nodesep = 0.35, ranksep = 0.45]
+  # 
+  #                 node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
+  #                        fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
+  #                 edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
+  # 
+  #                 start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
+  #                 end   [shape = doublecircle, label = 'Modèle final\\n(parcimonieux + valide)', fillcolor = '#d5f5e3']
+  # 
+  #                 s0 [label = '0) Fixer la saisonnalité s\\n(à partir du contexte + EDA)']
+  # 
+  #                 d0 [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                     label = '1) Choisir d et D\\n(stationnarité : ADF/KPSS/PP\\n+ ACF aux multiples de s)']
+  #                 actd [label = 'Action :\\n• appliquer la différenciation minimale\\n• vérifier sur-diff (ACF lag1 très négative)\\n• retester si besoin']
+  # 
+  #                 acf0 [label = '2) Tracer ACF/PACF\\nSUR la série différenciée\\n(après d et D)\\n+ regarder aux lags 1.. et s,2s,…']
+  # 
+  #                 d1 [shape = diamond, style = 'rounded,filled', fillcolor = '#e8f8f5',
+  #                     label = '3) Motifs ACF/PACF suggèrent\\nAR vs MA ?\\n(non-saisonnier et saisonnier)']
+  # 
+  #                 hint [label = 'Rappels (heuristiques) :\\n• AR(p) : PACF coupure, ACF décroît\\n• MA(q) : ACF coupure, PACF décroît\\n• Saison : pics à s,2s,…\\n  PACF → P ; ACF → Q']
+  # 
+  #                 cand [label = '4) Proposer un petit ensemble de candidats\\n(3 à 8 modèles)\\njustifier p,q,P,Q\\n(y compris aux multiples de s)']
+  # 
+  #                 fit [label = '5) Ajuster chaque candidat\\n(p,d,q)(P,D,Q)[s]\\n+ relever AICc/BIC\\n+ vérifier stabilité/inversibilité si possible']
+  # 
+  #                 d2 [shape = diamond, style = 'rounded,filled', fillcolor = '#f4ecf7',
+  #                     label = '6) Problèmes numériques ?\\n(non-inversible / non-stationnaire\\nconvergence instable)']
+  #                 act2 [label = 'Actions :\\n• simplifier p/q/P/Q\\n• revoir d/D (sur-diff ?)\\n• transformer (log/Box–Cox)\\n• traiter outliers/manquants\\n• changer méthode/initialisation']
+  # 
+  #                 diag [label = '7) Diagnostics résiduels\\nACF résidus + Ljung–Box\\n+ normalité/ARCH (secondaire)']
+  # 
+  #                 d3 [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                     label = '8) Résidus ~ bruit blanc ?\\n(Ljung–Box OK + ACF résidus ≈ 0)']
+  #                 act3 [label = 'Actions :\\n• ajuster p/q/P/Q\\n• ajouter saison si pics à s\\n• revoir d/D\\n• re-EDA (rupture/outliers)']
+  # 
+  #                 perf [label = '9) Évaluation prévisionnelle\\nSplit temporel / rolling-origin\\nMAE/RMSE/MASE\\nvs benchmark (naïf/SNAIVE)']
+  # 
+  #                 d4 [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                     label = '10) Bat le benchmark\\nET performance stable ?']
+  #                 act4 [label = 'Actions :\\n• simplifier / régulariser\\n• revoir candidats\\n• si aucun gain : garder benchmark\\n• ajuster horizon h / fenêtre']
+  # 
+  #                 choose [label = '11) Choix final\\n• retenir le plus simple\\n  qui passe diagnostics\\n  ET bat le benchmark\\n• comparer AICc/BIC à performance comparable\\n• documenter justification']
+  # 
+  #                 start -> s0 -> d0
+  #                 d0 -> actd [label = 'itérer si besoin', color = '#34495e', fontcolor = '#34495e']
+  #                 actd -> acf0
+  #                 d0 -> acf0 [label = 'd & D fixés', color = '#1e8449', fontcolor = '#1e8449']
+  # 
+  #                 acf0 -> d1 -> hint -> cand -> fit -> d2
+  #                 d2 -> act2 [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+  #                 act2 -> cand
+  #                 d2 -> diag [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+  # 
+  #                 diag -> d3
+  #                 d3 -> act3 [label = 'Non', color = '#c0392b', fontcolor = '#c0392b']
+  #                 act3 -> cand
+  #                 d3 -> perf [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+  # 
+  #                 perf -> d4
+  #                 d4 -> act4 [label = 'Non', color = '#c0392b', fontcolor = '#c0392b']
+  #                 act4 -> cand
+  #                 d4 -> choose [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+  # 
+  #                 choose -> end
+  #               }
+  #             ")
+  # }) 
   
   output$stationarity_tree <- renderGrViz({
     grViz("
@@ -1560,89 +1773,181 @@ server <- function(input, output, session) {
       ")
   })
   
+  # output$stationarity_tree2 <- DiagrammeR::renderGrViz({
+  #   DiagrammeR::grViz("
+  #               digraph stationarity_tree2 {
+  # 
+  #                 graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
+  #                        label = 'Stationnarité & différenciation : ADF / KPSS / PP → choix de d et D',
+  #                        fontname = Helvetica, bgcolor = 'transparent',
+  #                        nodesep = 0.35, ranksep = 0.45]
+  # 
+  #                 node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
+  #                        fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
+  #                 edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
+  # 
+  #                 start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
+  #                 end   [shape = doublecircle, label = 'Décision\\n(d, D) validée', fillcolor = '#d5f5e3']
+  # 
+  #                 prep [label = 'Préparer la série\\n• fréquence s définie\\n• manquants traités\\n• transformation (log/Box–Cox) si besoin\\n• EDA (tendance / saisonnalité)']
+  # 
+  #                 spec [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                       label = 'Choisir spécification des tests\\n(constante ? tendance ?)']
+  # 
+  #                 noteSpec [label = 'Règle :\\n• si tendance visible → inclure tendance (trend)\\n• sinon drift / constante\\n• éviter ‘none’ sauf justification']
+  # 
+  #                 test0 [label = 'Tester sur la série brute\\nADF + PP (H0 : racine unitaire)\\nKPSS (H0 : stationnaire)']
+  # 
+  #                 dStrongS [shape = diamond, style = 'rounded,filled', fillcolor = '#e8f8f5',
+  #                           label = 'Stationnarité forte ?\\nADF/PP rejettent (p petit)\\nET KPSS ne rejette pas (p grand)']
+  # 
+  #                 actS [label = 'Action :\\n• d = 0\\n• vérifier saisonnalité (D ?)\\n• passer au test saisonnier']
+  # 
+  #                 dStrongNS [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                            label = 'Non-stationnarité forte ?\\nADF/PP ne rejettent pas (p grand)\\nET KPSS rejette (p petit)']
+  # 
+  #                 actNS [label = 'Action :\\n• essayer d = 1\\n• retester ADF / PP / KPSS\\n• surveiller sur-diff (ACF lag 1 très négative)']
+  # 
+  #                 dConflict [shape = diamond, style = 'rounded,filled', fillcolor = '#f4ecf7',
+  #                            label = 'Conflit / cas ambigu ?\\n(ex. ADF rejette mais KPSS rejette aussi\\nou tous non significatifs)']
+  # 
+  #                 actConflict [label = 'Actions :\\n• reconsidérer trend vs drift\\n• examiner graphiques + ACF\\n• tester après d = 1 puis comparer\\n• suspecter rupture (Zivot–Andrews)\\n• documenter (convergence d’indices)']
+  # 
+  #                 retest [label = 'Retester après d choisi\\nADF + PP + KPSS\\n(d doit être minimal)']
+  # 
+  #                 seasCheck [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                            label = 'Racine saisonnière ?\\nIndices : pics ACF à s, 2s…\\n+ KPSS / ADF sur série saisonnière\\n(ou HEGY en annexe)']
+  # 
+  #                 actSeas [label = 'Action :\\n• essayer D = 1 (diff. saisonnière)\\n• retester stationnarité\\n• D = 2 rarement justifié']
+  # 
+  #                 overdiff [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+  #                           label = 'Sur-différenciation suspectée ?\\nACF lag 1 très négative\\nvariance gonflée\\nprévisions erratiques']
+  # 
+  #                 actOver [label = 'Action :\\n• revenir en arrière (d ou D trop élevé)\\n• préférer tendance déterministe\\n• vérifier spécification des tests']
+  # 
+  #                 stop [label = 'Stop quand stationnarité raisonnable\\n+ parcimonie\\n(d ∈ {0,1} le plus souvent\\n D ∈ {0,1})']
+  # 
+  #                 start -> prep -> spec
+  #                 spec -> noteSpec -> test0
+  # 
+  #                 test0 -> dStrongS
+  #                 dStrongS -> actS      [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+  #                 dStrongS -> dStrongNS [label = 'Non']
+  # 
+  #                 dStrongNS -> actNS    [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+  #                 dStrongNS -> dConflict[label = 'Non']
+  # 
+  #                 dConflict -> actConflict [label = 'Oui', color = '#7d3c98', fontcolor = '#7d3c98']
+  #                 actConflict -> actNS     [label = 'tester d = 1 (prudence)', color = '#7d3c98', fontcolor = '#7d3c98']
+  # 
+  #                 actNS -> retest
+  #                 actS  -> seasCheck
+  #                 retest -> seasCheck
+  # 
+  #                 seasCheck -> actSeas [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+  #                 seasCheck -> stop    [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+  # 
+  #                 actSeas -> overdiff
+  #                 overdiff -> actOver [label = 'Oui', color = '#d68910', fontcolor = '#d68910']
+  #                 overdiff -> stop    [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+  # 
+  #                 actOver -> retest
+  #                 stop -> end
+  #               }
+  #       ")
+  # })
+  
+  
   output$stationarity_tree2 <- DiagrammeR::renderGrViz({
     DiagrammeR::grViz("
-                digraph stationarity_tree2 {
-
-                  graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
-                         label = 'Stationnarité & différenciation : ADF / KPSS / PP → choix de d et D',
-                         fontname = Helvetica, bgcolor = 'transparent',
-                         nodesep = 0.35, ranksep = 0.45]
-
-                  node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
-                         fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
-                  edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
-
-                  start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
-                  end   [shape = doublecircle, label = 'Décision\\n(d, D) validée', fillcolor = '#d5f5e3']
-
-                  prep [label = 'Préparer la série\\n• fréquence s définie\\n• manquants traités\\n• transformation (log/Box–Cox) si besoin\\n• EDA (tendance / saisonnalité)']
-
-                  spec [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
-                        label = 'Choisir spécification des tests\\n(constante ? tendance ?)']
-
-                  noteSpec [label = 'Règle :\\n• si tendance visible → inclure tendance (trend)\\n• sinon drift / constante\\n• éviter ‘none’ sauf justification']
-
-                  test0 [label = 'Tester sur la série brute\\nADF + PP (H0 : racine unitaire)\\nKPSS (H0 : stationnaire)']
-
-                  dStrongS [shape = diamond, style = 'rounded,filled', fillcolor = '#e8f8f5',
-                            label = 'Stationnarité forte ?\\nADF/PP rejettent (p petit)\\nET KPSS ne rejette pas (p grand)']
-
-                  actS [label = 'Action :\\n• d = 0\\n• vérifier saisonnalité (D ?)\\n• passer au test saisonnier']
-
-                  dStrongNS [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
-                             label = 'Non-stationnarité forte ?\\nADF/PP ne rejettent pas (p grand)\\nET KPSS rejette (p petit)']
-
-                  actNS [label = 'Action :\\n• essayer d = 1\\n• retester ADF / PP / KPSS\\n• surveiller sur-diff (ACF lag 1 très négative)']
-
-                  dConflict [shape = diamond, style = 'rounded,filled', fillcolor = '#f4ecf7',
-                             label = 'Conflit / cas ambigu ?\\n(ex. ADF rejette mais KPSS rejette aussi\\nou tous non significatifs)']
-
-                  actConflict [label = 'Actions :\\n• reconsidérer trend vs drift\\n• examiner graphiques + ACF\\n• tester après d = 1 puis comparer\\n• suspecter rupture (Zivot–Andrews)\\n• documenter (convergence d’indices)']
-
-                  retest [label = 'Retester après d choisi\\nADF + PP + KPSS\\n(d doit être minimal)']
-
-                  seasCheck [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
-                             label = 'Racine saisonnière ?\\nIndices : pics ACF à s, 2s…\\n+ KPSS / ADF sur série saisonnière\\n(ou HEGY en annexe)']
-
-                  actSeas [label = 'Action :\\n• essayer D = 1 (diff. saisonnière)\\n• retester stationnarité\\n• D = 2 rarement justifié']
-
-                  overdiff [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
-                            label = 'Sur-différenciation suspectée ?\\nACF lag 1 très négative\\nvariance gonflée\\nprévisions erratiques']
-
-                  actOver [label = 'Action :\\n• revenir en arrière (d ou D trop élevé)\\n• préférer tendance déterministe\\n• vérifier spécification des tests']
-
-                  stop [label = 'Stop quand stationnarité raisonnable\\n+ parcimonie\\n(d ∈ {0,1} le plus souvent\\n D ∈ {0,1})']
-
-                  start -> prep -> spec
-                  spec -> noteSpec -> test0
-
-                  test0 -> dStrongS
-                  dStrongS -> actS      [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
-                  dStrongS -> dStrongNS [label = 'Non']
-
-                  dStrongNS -> actNS    [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
-                  dStrongNS -> dConflict[label = 'Non']
-
-                  dConflict -> actConflict [label = 'Oui', color = '#7d3c98', fontcolor = '#7d3c98']
-                  actConflict -> actNS     [label = 'tester d = 1 (prudence)', color = '#7d3c98', fontcolor = '#7d3c98']
-
-                  actNS -> retest
-                  actS  -> seasCheck
-                  retest -> seasCheck
-
-                  seasCheck -> actSeas [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
-                  seasCheck -> stop    [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
-
-                  actSeas -> overdiff
-                  overdiff -> actOver [label = 'Oui', color = '#d68910', fontcolor = '#d68910']
-                  overdiff -> stop    [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
-
-                  actOver -> retest
-                  stop -> end
-                }
+              digraph stationarity_tree2 {
+              
+                graph [layout = dot, rankdir = TB,
+                       fontname = Helvetica, bgcolor = 'transparent',
+                       nodesep = 0.35, ranksep = 0.45,
+                       margin = 0.02, pad = 0.02]
+              
+                node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
+                       fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
+                edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
+              
+                title [shape=plain, fontname=Helvetica, fontsize=16,
+                       label='Stationnarité & différenciation : ADF / KPSS / PP → choix de d et D']
+                { rank = min; title }
+                title -> start [style=invis]
+              
+                start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
+                end   [shape = doublecircle, label = 'Décision\\n(d, D) validée', fillcolor = '#d5f5e3']
+              
+                prep [label = 'Préparer la série\\n• fréquence s définie\\n• manquants traités\\n• transformation (log/Box–Cox) si besoin\\n• EDA (tendance / saisonnalité)']
+              
+                spec [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+                      label = 'Choisir spécification des tests\\n(constante ? tendance ?)']
+              
+                noteSpec [label = 'Règle :\\n• si tendance visible → inclure tendance (trend)\\n• sinon drift / constante\\n• éviter ‘none’ sauf justification']
+              
+                test0 [label = 'Tester sur la série brute\\nADF + PP (H0 : racine unitaire)\\nKPSS (H0 : stationnaire)']
+              
+                dStrongS [shape = diamond, style = 'rounded,filled', fillcolor = '#e8f8f5',
+                          label = 'Stationnarité forte ?\\nADF/PP rejettent (p petit)\\nET KPSS ne rejette pas (p grand)']
+              
+                actS [label = 'Action :\\n• d = 0\\n• vérifier saisonnalité (D ?)\\n• passer au test saisonnier']
+              
+                dStrongNS [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+                           label = 'Non-stationnarité forte ?\\nADF/PP ne rejettent pas (p grand)\\nET KPSS rejette (p petit)']
+              
+                actNS [label = 'Action :\\n• essayer d = 1\\n• retester ADF / PP / KPSS\\n• surveiller sur-diff (ACF lag 1 très négative)']
+              
+                dConflict [shape = diamond, style = 'rounded,filled', fillcolor = '#f4ecf7',
+                           label = 'Conflit / cas ambigu ?\\n(ex. ADF rejette mais KPSS rejette aussi\\nou tous non significatifs)']
+              
+                actConflict [label = 'Actions :\\n• reconsidérer trend vs drift\\n• examiner graphiques + ACF\\n• tester après d = 1 puis comparer\\n• suspecter rupture (Zivot–Andrews)\\n• documenter (convergence d’indices)']
+              
+                retest [label = 'Retester après d choisi\\nADF + PP + KPSS\\n(d doit être minimal)']
+              
+                seasCheck [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+                           label = 'Racine saisonnière ?\\nIndices : pics ACF à s, 2s…\\n+ KPSS / ADF sur série saisonnière\\n(ou HEGY en annexe)']
+              
+                actSeas [label = 'Action :\\n• essayer D = 1 (diff. saisonnière)\\n• retester stationnarité\\n• D = 2 rarement justifié']
+              
+                overdiff [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+                          label = 'Sur-différenciation suspectée ?\\nACF lag 1 très négative\\nvariance gonflée\\nprévisions erratiques']
+              
+                actOver [label = 'Action :\\n• revenir en arrière (d ou D trop élevé)\\n• préférer tendance déterministe\\n• vérifier spécification des tests']
+              
+                stop [label = 'Stop quand stationnarité raisonnable\\n+ parcimonie\\n(d ∈ {0,1} le plus souvent\\n D ∈ {0,1})']
+              
+                start -> prep -> spec
+                spec -> noteSpec -> test0
+              
+                test0 -> dStrongS
+                dStrongS -> actS      [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+                dStrongS -> dStrongNS [label = 'Non']
+              
+                dStrongNS -> actNS    [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+                dStrongNS -> dConflict[label = 'Non']
+              
+                dConflict -> actConflict [label = 'Oui', color = '#7d3c98', fontcolor = '#7d3c98']
+                actConflict -> actNS     [label = 'tester d = 1 (prudence)', color = '#7d3c98', fontcolor = '#7d3c98']
+              
+                actNS -> retest
+                actS  -> seasCheck
+                retest -> seasCheck
+              
+                seasCheck -> actSeas [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+                seasCheck -> stop    [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+              
+                actSeas -> overdiff
+                overdiff -> actOver [label = 'Oui', color = '#d68910', fontcolor = '#d68910']
+                overdiff -> stop    [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+              
+                actOver -> retest
+                stop -> end
+              }
         ")
   })
+  
+  
   
   output$diag_tree <- DiagrammeR::renderGrViz({
     DiagrammeR::grViz("
@@ -1717,7 +2022,6 @@ server <- function(input, output, session) {
               }
         ")
   })
-  
   
   output$adf_kpss_pp_tree <- DiagrammeR::renderGrViz({
     DiagrammeR::grViz("
@@ -1804,7 +2108,395 @@ server <- function(input, output, session) {
       ")
   })
   
- 
+  output$adf_kpss_pp_tree_full <- DiagrammeR::renderGrViz({
+    DiagrammeR::grViz("
+            digraph adf_kpss_pp_tree_full {
+            
+              graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
+                     label = 'Combiner ADF / KPSS / PP : diagramme complet et pédagogique',
+                     fontname = Helvetica, bgcolor = 'transparent',
+                     nodesep = 0.32, ranksep = 0.42]
+            
+              node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
+                     fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
+              edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
+            
+              start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
+            
+              remind [label = 'Rappels (hypothèses)\\nADF / PP : H0 = racine unitaire (non-stationnaire)\\nKPSS : H0 = stationnaire\\n→ tests complémentaires (logiques inversées)',
+                      fillcolor = '#eaf2f8']
+            
+              prep [label = 'Étape 0 : préparer\\n• choisir la spécification (drift / trend)\\n• traiter manquants / outliers majeurs\\n• EDA (tendance, saisonnalité, ruptures)',
+                    fillcolor = '#ecf0f1']
+            
+              tests [label = 'Étape 1 : tests sur série brute\\n• ADF + PP\\n• KPSS\\n(avec une spécification cohérente)',
+                     fillcolor = '#ecf0f1']
+            
+              specSens [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+                        label = 'Sensibilité à la spécification ?\\nRésultats changent\\nsi drift vs trend']
+            
+              specAct [label = 'Action :\\n• tester drift ET trend\\n• conserver la spec cohérente avec l’EDA\\n• documenter (pourquoi cette spec)',
+                       fillcolor = '#f9e79f']
+            
+              ## --- Cas de convergence forte ---
+              stStrong [shape = diamond, style = 'rounded,filled', fillcolor = '#d5f5e3',
+                        label = 'Convergence stationnarité ?\\nADF/PP rejettent H0 (p petit)\\nET KPSS ne rejette pas (p grand)']
+            
+              stExplain [label = 'Explication :\\nLes tests “racine unitaire” ne voient pas de racine unitaire\\nET le test “stationnarité” est compatible avec stationnarité\\n→ conclusion forte',
+                         fillcolor = '#d5f5e3']
+            
+              stDecision [label = 'Décision :\\nSérie stationnaire\\n→ d = 0 (ne pas différencier)',
+                          fillcolor = '#d5f5e3']
+            
+              nsStrong [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+                        label = 'Convergence non-stationnarité ?\\nADF/PP ne rejettent pas (p grand)\\nET KPSS rejette (p petit)']
+            
+              nsExplain [label = 'Explication :\\nLes tests indiquent une racine unitaire probable\\nET KPSS rejette la stationnarité\\n→ conclusion forte de non-stationnarité',
+                         fillcolor = '#fdebd0']
+            
+              nsDecision [label = 'Décision :\\nEssayer d = 1\\n(puis retester)\\nPrincipe : différenciation minimale',
+                          fillcolor = '#fdebd0']
+            
+              ## --- Cas conflictuels ---
+              conflict [shape = diamond, style = 'rounded,filled', fillcolor = '#f4ecf7',
+                        label = 'Conflit ?\\n(ADF/PP rejettent)\\nET (KPSS rejette aussi)']
+            
+              conflictExplain [label = 'Explication :\\nSouvent stationnarité autour d’une tendance\\nou spécification inadéquate (drift vs trend)\\nou rupture structurelle\\n→ on ne tranche pas automatiquement',
+                               fillcolor = '#f4ecf7']
+            
+              conflictAct [label = 'Actions recommandées :\\n1) re-spécifier ADF/PP/KPSS (trend vs drift)\\n2) regarder série + ACF\\n3) tester après d=1 et comparer\\n4) suspecter rupture (Zivot–Andrews)',
+                           fillcolor = '#f4ecf7']
+            
+              ## --- Cas inconclusif ---
+              inconclusive [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+                            label = 'Inconclusif ?\\nADF/PP ne rejettent pas\\nET KPSS ne rejette pas']
+            
+              inconExplain [label = 'Explication :\\nFaible puissance (petit n) ou série très bruitée\\n→ tests peu informatifs\\n→ l’EDA/ACF et la parcimonie guident la décision',
+                           fillcolor = '#f9e79f']
+            
+              inconAct [label = 'Actions :\\n• s’appuyer sur EDA + ACF\\n• tester d=1 (prudence) puis comparer\\n• documenter l’incertitude',
+                        fillcolor = '#f9e79f']
+            
+              ## --- Après d=1 ---
+              afterd [label = 'Étape 2 : après d = 1 (si appliqué)\\nRetester ADF/PP/KPSS',
+                      fillcolor = '#ecf0f1']
+            
+              okAfter [shape = diamond, style = 'rounded,filled', fillcolor = '#d5f5e3',
+                       label = 'Après d=1 :\\nADF/PP rejettent\\nET KPSS ne rejette plus ?']
+            
+              okAfterExplain [label = 'Explication :\\nLa différenciation a supprimé la racine unitaire\\n→ stationnarité atteinte\\n→ ne pas aller à d=2',
+                              fillcolor = '#d5f5e3']
+            
+              okAfterDecision [label = 'Conclusion :\\nSérie I(1) confirmée\\n→ conserver d = 1',
+                               fillcolor = '#d5f5e3']
+            
+              ## --- Ruptures / cas extrêmes ---
+              breakSuspect [shape = diamond, style = 'rounded,filled', fillcolor = '#f5b7b1',
+                            label = 'Rupture structurelle suspectée ?\\n• résultats incohérents\\n• changement brutal visuel\\n• rejets “forts” contradictoires']
+            
+              breakExplain [label = 'Explication :\\nLes tests standards supposent paramètres stables\\nUne rupture peut imiter une racine unitaire\\n→ utiliser des tests avec rupture',
+                            fillcolor = '#f5b7b1']
+            
+              breakAct [label = 'Action :\\n• Zivot–Andrews (rupture endogène)\\n• discuter le contexte (date, événement)\\n• éventuellement inclure variables de rupture\\n  plutôt que différencier',
+                        fillcolor = '#f5b7b1']
+            
+              end [shape = doublecircle, label = 'Décision finale\\nargumentée + documentée', fillcolor = '#d5f5e3']
+            
+            
+              start -> remind -> prep -> tests -> specSens
+              specSens -> specAct [label = 'Oui', color = '#d68910', fontcolor = '#d68910']
+              specAct -> tests
+              specSens -> stStrong [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+            
+              stStrong -> stExplain [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+              stExplain -> stDecision -> end
+            
+              stStrong -> nsStrong [label = 'Non']
+              nsStrong -> nsExplain [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+              nsExplain -> nsDecision -> afterd
+            
+              nsStrong -> conflict [label = 'Non']
+              conflict -> conflictExplain [label = 'Oui', color = '#7d3c98', fontcolor = '#7d3c98']
+              conflictExplain -> conflictAct -> breakSuspect
+            
+              conflict -> inconclusive [label = 'Non']
+            
+              inconclusive -> inconExplain [label = 'Oui', color = '#d68910', fontcolor = '#d68910']
+              inconExplain -> inconAct -> afterd
+            
+              afterd -> okAfter
+              okAfter -> okAfterExplain [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+              okAfterExplain -> okAfterDecision -> end
+            
+              okAfter -> breakSuspect [label = 'Non']
+            
+              breakSuspect -> breakExplain [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+              breakExplain -> breakAct -> end
+            
+              breakSuspect -> end [label = 'Non']
+            }
+      ")
+  })
+  
+  
+  output$stationarity_diff_workflow <- DiagrammeR::renderGrViz({
+    DiagrammeR::grViz("
+digraph stationarity_diff_workflow {
+
+  graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
+         label = 'Stationnarité & différenciation : ADF / KPSS / PP → choix de (d, D)\\n(workflow très explicite + checklist étudiant + quoi écrire)',
+         fontname = Helvetica, bgcolor = 'transparent',
+         nodesep = 0.30, ranksep = 0.40]
+
+  node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
+         fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
+  edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
+
+  start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
+  end   [shape = doublecircle, label = 'Choix final\\n(d, D, s) justifié\\n+ prêt pour (p,q,P,Q)', fillcolor = '#d5f5e3']
+
+  alpha [label = '☐ Checklist 0 (réglages)\\nFixer α (souvent 5%)\\n• règle générale : p < α ⇒ rejet H0\\n• noter α dans le rapport',
+         fillcolor = '#eaf2f8']
+
+  c1 [label = '☐ Checklist 1 (concept)\\nDéfinir la stationnarité (avec vos mots)\\n• moyenne stable\\n• variance stable\\n• dépendance/autocorr stable\\n\\nÀ écrire : 2–3 phrases + un exemple (série non-stationnaire)',
+      fillcolor = '#eaf2f8']
+
+  setup [label = 'Préparer les données (avant tout test)\\n• fixer s (contexte + EDA)\\n• vérifier index date & pas de doublons\\n• gérer manquants (na.approx/locf/suppression)\\n• (option) stabiliser variance : log / Box–Cox\\n• tracer série + ACF/PACF + saisonnalité',
+          fillcolor = '#ecf0f1']
+
+  eda [label = 'EDA guidée (ce que l’étudiant observe)\\n• tendance ? (hausse/baisse durable)\\n• saisonnalité ? (période s, pics réguliers)\\n• outliers / ruptures ? (chocs, changement régime)\\n\\nÀ écrire : 3 observations concrètes (dates/périodes + ce qu’on voit)',
+       fillcolor = '#ecf0f1']
+
+  c2 [label = '☐ Checklist 2 (tests : H0/Ha à écrire)\\nADF/PP : H0 = racine unitaire (non-stationnaire)\\nKPSS : H0 = stationnaire\\n\\nÀ écrire : H0 et Ha pour chaque test + règle p<α',
+      fillcolor = '#eaf2f8']
+
+  spec0 [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+         label = 'Choix drift/trend\\nLa série montre une tendance déterministe ?']
+
+  specAct0 [label = 'Action (spécification cohérente)\\nSi tendance visible ⇒ inclure trend\\nSinon ⇒ drift (constante) ou none\\n\\nÀ écrire : justification (1 phrase) basée sur l’EDA',
+            fillcolor = '#f9e79f']
+
+  lags [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+        label = 'Choix du nombre de retards (lags)\\nADF/PP sensibles au lag-length\\nAvez-vous une règle ?']
+
+  lagsAct [label = 'Action (lags)\\n• utiliser AIC/BIC auto si dispo\\n• ou règle simple : assez de lags pour résidus ~ blancs\\n• vérifier que l’ADF ne laisse pas d’autocorr résiduelle\\n\\nÀ écrire : méthode + valeur retenue',
+           fillcolor = '#f9e79f']
+
+  tests0 [label = 'Tests sur série brute\\nADF + PP + KPSS\\n(spécification cohérente : drift/trend + lags)\\n\\nÀ écrire : tableau (stat, p-value, décision)',
+          fillcolor = '#ecf0f1']
+
+  specSens [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+            label = 'Résultats instables\\nselon drift vs trend\\nou selon lags ?']
+
+  specAct [label = 'Action (robustesse)\\n• retester 2 specs plausibles\\n• retester lags voisins\\n• préférer la spec cohérente avec l’EDA\\n• documenter les 2 résultats (pas juste celui qui arrange)',
+           fillcolor = '#f9e79f']
+
+  dStationary [shape = diamond, style = 'rounded,filled', fillcolor = '#d5f5e3',
+               label = 'Stationnarité plausible ?\\nADF/PP rejettent (p petit)\\nET KPSS ne rejette pas (p grand)']
+
+  expS [label = 'Interprétation\\n• pas de racine unitaire détectée (ADF/PP)\\n• stationnarité compatible (KPSS)\\n=> d=0 (provisoirement)',
+         fillcolor = '#d5f5e3']
+
+  actS [label = 'Décision provisoire\\n• d = 0\\n• maintenant regarder racines saisonnières (D ?)\\n• contrôler ACF aux multiples de s',
+         fillcolor = '#d5f5e3']
+
+  dNonStat [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+            label = 'Non-stationnarité plausible ?\\nADF/PP ne rejettent pas\\nET KPSS rejette']
+
+  expNS [label = 'Interprétation\\n• racine unitaire probable\\n• chocs persistants\\n=> différenciation justifiée (d ou D)',
+          fillcolor = '#fdebd0']
+
+  conflict [shape = diamond, style = 'rounded,filled', fillcolor = '#f5cba7',
+            label = 'Cas ambigu / conflit ?\\n(ADF rejette mais KPSS rejette aussi,\\nou aucun n’est clair)']
+
+  conflictAct [label = 'Action (si conflit)\\n• s’appuyer sur graphiques + ACF\\n• vérifier outliers / ruptures (breaks)\\n• tester après transformation variance (log/BoxCox)\\n• éventuellement : test avec rupture (Zivot-Andrews)\\n\\nÀ écrire : pourquoi c’est ambigu + décision prudente',
+               fillcolor = '#f5cba7']
+
+  c3 [label = '☐ Checklist 3 (diff progressive)\\nProposer d et D progressivement\\n• essayer d=1 (souvent max)\\n• puis D=1 si racine saisonnière\\n• retester après CHAQUE transformation\\n\\nÀ écrire : “Avant/Après” (graph + tests)',
+      fillcolor = '#eaf2f8']
+
+  do_d1 [label = 'Appliquer d = 1\\nΔ y_t = y_t − y_{t−1}\\nPuis re-plot + re-tests\\n(éviter d=2 sauf justification forte)',
+         fillcolor = '#ecf0f1']
+
+  tests_d [label = 'Après d = 1\\n• tracer Δy_t\\n• ADF + PP + KPSS\\n• vérifier ACF/PACF (structure résiduelle)',
+           fillcolor = '#ecf0f1']
+
+  seas [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+        label = 'Racine saisonnière probable ?\\nIndices : pics ACF à s, 2s…\\nSaisonnalité stochastique (pas juste moyenne saisonnière)']
+
+  do_D1 [label = 'Appliquer D = 1\\nΔ_s y_t = y_t − y_{t−s}\\nPuis re-plot + re-tests\\n(garder D≤1 en général)',
+         fillcolor = '#ecf0f1']
+
+  tests_D [label = 'Après D = 1 (sur série transformée)\\n• tracer Δ_s (ou ΔΔ_s)\\n• ADF/PP/KPSS\\n• vérifier ACF aux lags saisonniers',
+           fillcolor = '#ecf0f1']
+
+  over [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+        label = 'Sur-différenciation ?\\n• ACF lag 1 très négative\\n• variance gonflée\\n• oscillations artificielles\\n• modèle instable']
+
+  c4 [label = '☐ Checklist 4 (anti-sur-diff)\\nSurveiller les signes\\n(et revenir en arrière si besoin)\\n\\nÀ écrire : signe observé + correction',
+      fillcolor = '#eaf2f8']
+
+  overAct [label = 'Actions si sur-diff\\n• réduire d ou D\\n• préférer tendance déterministe (trend)\\n• re-vérifier drift/trend & lags\\n• re-tester après correction',
+           fillcolor = '#f9e79f']
+
+  stop [label = 'Stop : stationnarité raisonnable + parcimonie\\nEn pratique : d∈{0,1} ; D∈{0,1}\\n(augmenter uniquement si argument solide)',
+        fillcolor = '#d5f5e3']
+
+  justify [label = '☐ Checklist 5 (justification finale)\\nConclure sur (d, D, s) avec convergence :\\n• tests (ADF/PP/KPSS)\\n• graphiques avant/après\\n• ACF/PACF (dont lags saisonniers)\\n• pas UNE seule p-value\\n\\nÀ écrire : mini-paragraphe + tableau des tests',
+          fillcolor = '#eaf2f8']
+
+  bridge [label = 'Pont vers l’étape suivante (SARIMA)\\nMaintenant identifier (p,q,P,Q) sur la série stationnarisée\\n• ACF/PACF pour candidats\\n• puis estimation + diagnostics résidus',
+          fillcolor = '#d6eaf8']
+
+  // ----- Edges -----
+  start -> alpha -> c1 -> setup -> eda -> c2 -> spec0
+  spec0 -> specAct0 [label='Oui', color='#d68910', fontcolor='#d68910']
+  spec0 -> lags      [label='Non', color='#1e8449', fontcolor='#1e8449']
+  specAct0 -> lags
+
+  lags -> lagsAct [label='Oui', color='#d68910', fontcolor='#d68910']
+  lags -> tests0  [label='Non', color='#1e8449', fontcolor='#1e8449']
+  lagsAct -> tests0
+
+  tests0 -> specSens
+  specSens -> specAct [label='Oui', color='#d68910', fontcolor='#d68910']
+  specAct -> tests0
+  specSens -> dStationary [label='Non', color='#1e8449', fontcolor='#1e8449']
+
+  dStationary -> expS [label='Oui', color='#1e8449', fontcolor='#1e8449']
+  expS -> actS -> seas
+
+  dStationary -> dNonStat [label='Non']
+  dNonStat -> expNS [label='Oui', color='#c0392b', fontcolor='#c0392b']
+  expNS -> conflict
+
+  dNonStat -> conflict [label='Non (mixte)', color='#7d3c98', fontcolor='#7d3c98']
+
+  conflict -> conflictAct [label='Oui', color='#7d3c98', fontcolor='#7d3c98']
+  conflictAct -> c3
+
+  conflict -> c3 [label='Décision prudente', color='#34495e', fontcolor='#34495e']
+
+  c3 -> do_d1 -> tests_d -> seas
+
+  seas -> do_D1 [label='Oui', color='#c0392b', fontcolor='#c0392b']
+  do_D1 -> tests_D -> over
+  seas -> over   [label='Non', color='#1e8449', fontcolor='#1e8449']
+
+  over -> c4 [label='Oui', color='#d68910', fontcolor='#d68910']
+  c4 -> overAct -> tests0
+  over -> stop [label='Non', color='#1e8449', fontcolor='#1e8449']
+
+  stop -> justify -> bridge -> end
+}
+  ")
+  })
+  
+  
+  # output$stationarity_diff_workflow <- DiagrammeR::renderGrViz({
+  #   DiagrammeR::grViz("
+  #             digraph stationarity_diff_workflow {
+  #             
+  #               graph [layout = dot, rankdir = TB, fontsize = 16, labelloc = t,
+  #                      label = 'Stationnarité & différenciation : ADF / KPSS / PP → choix de (d, D) (workflow + checklist étudiant)',
+  #                      fontname = Helvetica, bgcolor = 'transparent',
+  #                      nodesep = 0.32, ranksep = 0.42]
+  #             
+  #               node  [shape = box, style = 'rounded,filled', fontname = Helvetica,
+  #                      fontsize = 11, color = '#2c3e50', fillcolor = '#ecf0f1', penwidth = 1.2]
+  #               edge  [fontname = Helvetica, fontsize = 10, color = '#34495e', arrowsize = 0.8]
+  #             
+  #               start [shape = circle, label = 'Départ', fillcolor = '#d6eaf8']
+  #               end   [shape = doublecircle, label = 'Choix final\\n(d, D, s) justifié', fillcolor = '#d5f5e3']
+  #             
+  #               c1 [label = '☐ Checklist 1\\nDéfinir la stationnarité (avec vos mots)\\n• moyenne stable\\n• variance stable\\n• dépendance qui ne change pas avec le temps',
+  #                     fillcolor = '#eaf2f8']
+  #             
+  #               setup [label = 'Préparer\\n• fixer s (contexte + EDA)\\n• vérifier index & manquants\\n• (option) transformation variance (log/Box–Cox)\\n• tracer série + ACF/PACF',
+  #                       fillcolor = '#ecf0f1']
+  #             
+  #               c2 [label = '☐ Checklist 2\\nAppliquer ADF, PP, KPSS sur la série brute\\nÉcrire H0/Ha pour chacun\\nADF/PP : H0 = racine unitaire\\nKPSS : H0 = stationnaire',
+  #                   fillcolor = '#eaf2f8']
+  #             
+  #               tests0 [label = 'Tests sur série brute\\nADF + PP + KPSS\\n(utiliser une spécification cohérente : drift / trend)',
+  #                       fillcolor = '#ecf0f1']
+  #             
+  #               spec [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+  #                     label = 'Résultats sensibles\\nà drift vs trend ?']
+  #               specAct [label = 'Action\\n• tester drift ET trend\\n• garder la spec cohérente avec l’EDA\\n• documenter le choix',
+  #                        fillcolor = '#f9e79f']
+  #             
+  #               dStationary [shape = diamond, style = 'rounded,filled', fillcolor = '#d5f5e3',
+  #                            label = 'Stationnarité forte ?\\nADF/PP rejettent (p petit)\\nET KPSS ne rejette pas (p grand)']
+  #               expS [label = 'Explication\\nConvergence : pas de racine unitaire détectée\\nET stationnarité compatible',
+  #                      fillcolor = '#d5f5e3']
+  #               actS [label = 'Décision provisoire\\n• d = 0\\nPuis examiner saisonnalité\\n(racine saisonnière ?)',
+  #                      fillcolor = '#d5f5e3']
+  #             
+  #               dNonStat [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                         label = 'Non-stationnarité forte ?\\nADF/PP ne rejettent pas\\nET KPSS rejette']
+  #               expNS [label = 'Explication\\nConvergence : racine unitaire probable\\n→ différenciation justifiée',
+  #                      fillcolor = '#fdebd0']
+  #               c3 [label = '☐ Checklist 3\\nProposer d et D progressivement\\nEssayer d=1, puis D=1 si nécessaire\\nRetester après chaque transformation',
+  #                   fillcolor = '#eaf2f8']
+  #             
+  #               do_d1 [label = 'Appliquer d = 1\\n(Δ y_t = y_t − y_{t−1})\\nPuis retester ADF/PP/KPSS',
+  #                      fillcolor = '#ecf0f1']
+  #             
+  #               tests_d [label = 'Tests après d = 1\\nADF + PP + KPSS',
+  #                        fillcolor = '#ecf0f1']
+  #             
+  #               seas [shape = diamond, style = 'rounded,filled', fillcolor = '#fdebd0',
+  #                     label = 'Racine saisonnière probable ?\\nIndices : pics ACF à s, 2s…\\nSaisonnalité stochastique']
+  #               do_D1 [label = 'Appliquer D = 1\\n(Δ_s y_t = y_t − y_{t−s})\\nPuis retester',
+  #                      fillcolor = '#ecf0f1']
+  #             
+  #               tests_D [label = 'Tests après D = 1\\nADF/PP/KPSS (sur série transformée)',
+  #                        fillcolor = '#ecf0f1']
+  #             
+  #               over [shape = diamond, style = 'rounded,filled', fillcolor = '#f9e79f',
+  #                     label = 'Sur-différenciation ?\\n• ACF lag 1 très négative\\n• variance gonflée\\n• dynamique artificielle']
+  #               c4 [label = '☐ Checklist 4\\nSurveiller les signes de sur-différenciation\\n(et revenir en arrière si besoin)',
+  #                   fillcolor = '#eaf2f8']
+  #               overAct [label = 'Actions\\n• réduire d ou D\\n• préférer tendance déterministe\\n• re-vérifier la spécification des tests',
+  #                        fillcolor = '#f9e79f']
+  #             
+  #               justify [label = '☐ Checklist 5\\nJustifier le choix final (d, D, s)\\npar convergence :\\n• tests + graphiques\\n• ACF/PACF\\n• pas une seule p-value',
+  #                        fillcolor = '#eaf2f8']
+  #             
+  #               stop [label = 'Stop dès que stationnarité raisonnable\\n+ parcimonie\\n(d ∈ {0,1} souvent ; D ∈ {0,1} souvent)',
+  #                     fillcolor = '#d5f5e3']
+  #             
+  #               start -> c1 -> setup -> c2 -> tests0 -> spec
+  #               spec -> specAct [label = 'Oui', color = '#d68910', fontcolor = '#d68910']
+  #               specAct -> tests0
+  #             
+  #               spec -> dStationary [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+  #             
+  #               dStationary -> expS [label = 'Oui', color = '#1e8449', fontcolor = '#1e8449']
+  #               expS -> actS -> seas
+  #             
+  #               dStationary -> dNonStat [label = 'Non']
+  #             
+  #               dNonStat -> expNS [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+  #               expNS -> c3 -> do_d1 -> tests_d -> seas
+  #             
+  #               dNonStat -> c3 [label = 'Non (cas ambigu)', color = '#7d3c98', fontcolor = '#7d3c98']
+  #               c3 -> do_d1
+  #             
+  #               seas -> do_D1 [label = 'Oui', color = '#c0392b', fontcolor = '#c0392b']
+  #               do_D1 -> tests_D -> over
+  #               seas -> over [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+  #             
+  #               over -> c4 [label = 'Oui', color = '#d68910', fontcolor = '#d68910']
+  #               c4 -> overAct -> tests0
+  #               over -> stop [label = 'Non', color = '#1e8449', fontcolor = '#1e8449']
+  #             
+  #               stop -> justify -> end
+  #             }
+  #     ")
+  # })
+  
   
   
 #   output$pdqpDQ_tree <- DiagrammeR::renderGrViz({
@@ -22288,14 +22980,51 @@ summary_errors <- aggregate_metrics(...)
             ),
             
             
-            tags$details(
-              class = "defs-details",
-              tags$summary(tags$span("Diagramme pédagogique — combiner ADF / KPSS / PP (raisonnement)")),
-              tags$div(
-                style = "padding:10px 12px; background:#fff; overflow-x:auto;",
-                DiagrammeR::grVizOutput("adf_kpss_pp_tree", height = "2000px")
-              )
-            ),
+            # tags$details(
+            #   class = "defs-details",
+            #   tags$summary(tags$span("Diagramme pédagogique — combiner ADF / KPSS / PP (raisonnement)")),
+            #   tags$div(
+            #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+            #     DiagrammeR::grVizOutput("adf_kpss_pp_tree", height = "1900px")
+            #   )
+            # ),
+            
+            
+            # tags$details(
+            #   class = "defs-details",
+            #   tags$summary(tags$span("Diagramme complet (avec explications) — combiner ADF / KPSS / PP")),
+            #   tags$div(
+            #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+            #     DiagrammeR::grVizOutput("adf_kpss_pp_tree_full", height = "2500px")
+            #   )
+            # ),
+            
+            # tags$details(
+            #   class = "defs-details",
+            #   tags$summary(tags$span("Diagramme complet (avec explications) — combiner ADF / KPSS / PP")),
+            #   
+            #   tags$p(
+            #     style = "margin: 8px 0 10px 0;",
+            #     tags$b("But : "), "arriver à une décision argumentée sur la stationnarité. ",
+            #     "ADF et PP testent ",
+            #     tags$b("H0 : racine unitaire"),
+            #     ", KPSS teste ",
+            #     tags$b("H0 : stationnarité"),
+            #     " → ils sont complémentaires."
+            #   ),
+            #   
+            #   tags$div(
+            #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+            #     DiagrammeR::grVizOutput("adf_kpss_pp_tree_full", height = "1100px")
+            #   ),
+            #   
+            #   tags$p(
+            #     style = "margin: 10px 0 0 0;",
+            #     tags$b("Règle pédagogique : "),
+            #     "si les tests convergent → conclusion forte. ",
+            #     "Si conflit → vérifier spécification (drift/trend), EDA/ACF, ruptures, puis décider avec parcimonie."
+            #   )
+            # ),
             
             
           )
@@ -22618,14 +23347,14 @@ summary_errors <- aggregate_metrics(...)
           )
         ),
         
-        tags$details(
-          class = "defs-details",
-          tags$summary(tags$span("Arbre décisionnel — stationnarité & différenciation (ADF/KPSS/PP)")),
-          tags$div(
-            style = "padding:10px 12px; background:#fff; overflow-x:auto;",
-            DiagrammeR::grVizOutput("stationarity_tree2", height = "1500px")
-          )
-        )
+        # tags$details(
+        #   class = "defs-details",
+        #   tags$summary(tags$span("Arbre décisionnel — stationnarité & différenciation (ADF/KPSS/PP)")),
+        #   tags$div(
+        #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+        #     DiagrammeR::grVizOutput("stationarity_tree2", height = "1500px")
+        #   )
+        # ),
         
       ),
       
@@ -23208,18 +23937,16 @@ summary_errors <- aggregate_metrics(...)
           )
         ),
         
+
         
-        
-        
-        
-        tags$details(
-          class = "defs-details",
-          tags$summary(tags$span("Arbre décisionnel — choix de p,d,q,P,D,Q (SARIMA)")),
-          tags$div(
-            style = "padding:10px 12px; background:#fff; overflow-x:auto;",
-            DiagrammeR::grVizOutput("pdqpDQ_tree", height = "2000px")
-          )
-        ),
+        # tags$details(
+        #   class = "defs-details",
+        #   tags$summary(tags$span("Arbre décisionnel — choix de p,d,q,P,D,Q (SARIMA)")),
+        #   tags$div(
+        #     style = "padding:10px 12px; background:#fff; overflow-x:auto;",
+        #     DiagrammeR::grVizOutput("pdqpDQ_tree", height = "2000px")
+        #   )
+        # ),
         
         
       ),
@@ -24233,14 +24960,14 @@ summary_errors <- aggregate_metrics(...)
           )
         ),
         
-        tags$details(
-          class = "defs-details",
-          tags$summary(tags$span("Arbre décisionnel complet — diagnostics → actions (Graph)")),
-          tags$div(
-            style = "padding:10px 12px; background:#fff;",
-            DiagrammeR::grVizOutput("diag_tree", height = "1500px")
-          )
-        ),
+        # tags$details(
+        #   class = "defs-details",
+        #   tags$summary(tags$span("Arbre décisionnel complet — diagnostics → actions (Graph)")),
+        #   tags$div(
+        #     style = "padding:10px 12px; background:#fff;",
+        #     DiagrammeR::grVizOutput("diag_tree", height = "1500px")
+        #   )
+        # ),
         
       ),
       
