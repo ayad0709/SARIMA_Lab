@@ -130,37 +130,138 @@ build_xreg_split <- function(df, cols, train_n, test_n, scale_x = FALSE) {
 # ============================================================
 # --- MOD: Robust date parsing (R Date / POSIX / Excel serial / text) ---
 # ============================================================
-parse_dates <- function(x) {
+
+
+parse_dates <- function(x, by_hint = NULL) {
+  # Returns a Date vector. Handles Date/POSIX, Excel serials, and common text formats.
   if (inherits(x, "Date")) return(x)
   if (inherits(x, "POSIXt")) return(as.Date(x))
-  
+
+  # Numeric: either R Date (days since 1970-01-01) or Excel serial (days since 1899-12-30)
   if (is.numeric(x)) {
-    # MOD: heuristic to distinguish R Date numeric vs Excel serial
-    # - R Date numeric typically around [-60000, 60000] (days since 1970-01-01)
-    # - Excel serial is typically large positive (days since 1899-12-30)
     med <- suppressWarnings(stats::median(x, na.rm = TRUE))
     if (is.finite(med) && med > -60000 && med < 60000) {
       return(as.Date(x, origin = "1970-01-01"))
     }
     return(as.Date(x, origin = "1899-12-30"))
   }
-  
-  x_chr <- as.character(x)
-  
-  d <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr)))
-  if (all(is.na(d))) {
-    d <- suppressWarnings(lubridate::parse_date_time(
-      x_chr,
-      orders = c(
-        "ymd", "dmy", "mdy", "Ymd", "Y-m-d", "d-m-Y", "m/d/Y",
-        "Y", "ym", "my", "bY", "Y-b", "any"
-      )
-    ))
-    d <- as.Date(d)
+
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "NaN")] <- NA_character_
+
+  # reject "small integer" strings like "2", "12", "03"
+  is_small_int <- grepl("^\\d{1,2}$", x_chr)
+  x_chr[is_small_int] <- NA_character_
+
+  # only use yearmon when it looks like year-month
+  looks_yearmon <- grepl("^\\d{4}[-/](\\d{1,2})$", x_chr) |
+    grepl("^[A-Za-z]{3,}\\s*\\d{4}$", x_chr)
+
+  d <- rep(as.Date(NA), length(x_chr))
+
+  if (any(looks_yearmon, na.rm = TRUE)) {
+    d[looks_yearmon] <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr[looks_yearmon])))
   }
-  
+
+  # ---- Robust day/month ambiguity handling ----
+  idx <- which(is.na(d) & !is.na(x_chr))
+  if (length(idx)) {
+    s <- x_chr[idx]
+
+    # candidate formats (we'll filter based on separators seen in the data)
+    candidates_all <- c(
+      "%Y-%m-%d", "%Y/%m/%d",
+      "%m-%d-%Y", "%d-%m-%Y",
+      "%m/%d/%Y", "%d/%m/%Y",
+      "%m-%d-%y", "%d-%m-%y",
+      "%m/%d/%y", "%d/%m/%y"
+    )
+
+    has_dash <- any(grepl("-", s), na.rm = TRUE)
+    has_slash <- any(grepl("/", s), na.rm = TRUE)
+    candidates <- candidates_all
+    if (!has_dash)  candidates <- candidates[!grepl("-", candidates)]
+    if (!has_slash) candidates <- candidates[!grepl("/", candidates)]
+
+    expected_days <- switch(
+      as.character(by_hint),
+      "month"   = 30,
+      "quarter" = 91,
+      "week"    = 7,
+      "day"     = 1,
+      NA_real_
+    )
+
+    score_dt <- function(dt) {
+      n_ok <- sum(!is.na(dt))
+      if (n_ok < 3) return(c(n_ok, -Inf, -Inf))
+
+      u <- sort(unique(dt[!is.na(dt)]))
+      if (length(u) < 3) return(c(n_ok, -Inf, -Inf))
+
+      med_step <- suppressWarnings(stats::median(as.numeric(diff(u))))
+      if (!is.finite(med_step)) med_step <- -Inf
+
+      # prefer spacing that matches the chosen frequency (monthly vs daily ambiguity)
+      closeness <- if (is.finite(expected_days)) -abs(med_step - expected_days) else med_step
+
+      c(n_ok, closeness, med_step)
+    }
+
+    parsed_list <- lapply(candidates, function(fmt) suppressWarnings(as.Date(s, format = fmt)))
+    scores <- do.call(rbind, lapply(parsed_list, score_dt))
+
+    best <- order(scores[, 1], scores[, 2], scores[, 3], decreasing = TRUE)[1]
+    d[idx] <- parsed_list[[best]]
+  }
+
+  # fallback for remaining NAs (avoid re-introducing dmy/mdy ambiguity here)
+  idx2 <- which(is.na(d) & !is.na(x_chr))
+  if (length(idx2)) {
+    d2 <- suppressWarnings(lubridate::parse_date_time(
+      x_chr[idx2],
+      orders = c("ymd", "Ymd", "Y-m-d", "Y/m/d", "bdY", "bY", "Y")
+    ))
+    d[idx2] <- as.Date(d2)
+  }
+
   d
 }
+
+
+
+
+# parse_dates <- function(x) {
+#   if (inherits(x, "Date")) return(x)
+#   if (inherits(x, "POSIXt")) return(as.Date(x))
+#   
+#   if (is.numeric(x)) {
+#     # MOD: heuristic to distinguish R Date numeric vs Excel serial
+#     # - R Date numeric typically around [-60000, 60000] (days since 1970-01-01)
+#     # - Excel serial is typically large positive (days since 1899-12-30)
+#     med <- suppressWarnings(stats::median(x, na.rm = TRUE))
+#     if (is.finite(med) && med > -60000 && med < 60000) {
+#       return(as.Date(x, origin = "1970-01-01"))
+#     }
+#     return(as.Date(x, origin = "1899-12-30"))
+#   }
+#   
+#   x_chr <- as.character(x)
+#   
+#   d <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr)))
+#   if (all(is.na(d))) {
+#     d <- suppressWarnings(lubridate::parse_date_time(
+#       x_chr,
+#       orders = c(
+#         "ymd", "dmy", "mdy", "Ymd", "Y-m-d", "d-m-Y", "m/d/Y",
+#         "Y", "ym", "my", "bY", "Y-b", "any"
+#       )
+#     ))
+#     d <- as.Date(d)
+#   }
+#   
+#   d
+# }
 
 
 
@@ -865,28 +966,80 @@ server <- function(input, output, session) {
   # ============================================================
   # --- MOD: Use robust date parsing inside prepared() ---
   # ============================================================
+  
   prepared <- reactive({
     req(raw_data(), input$dateCol, input$valueCol)
     
-    f <- freq_value(input)
+    f  <- freq_value(input)
     by <- freq_to_by(f)
     
     df <- raw_data()
     
-    # MOD: robust conversion to Date
-    d <- parse_dates(df[[input$dateCol]])
+    # --- Robust conversion to Date ---
+    d <- parse_dates(df[[input$dateCol]], by_hint = by)
     
-    y <- suppressWarnings(as.numeric(df[[input$valueCol]]))
-    
-    keep <- !is.na(d)
-    df2 <- data.frame(date = as.Date(d[keep]), y_raw = y[keep])
-    df2 <- df2[order(df2$date), , drop = FALSE]
-    
-    if (isTRUE(input$align_regular) && !is.null(by)) {
-      grid <- make_regular_grid(df2$date, by = by)
-      df2 <- merge(data.frame(date = grid), df2, by = "date", all.x = TRUE, sort = TRUE)
+    # --- Debug: show a few unparsed values (small sample only) ---
+    bad <- which(is.na(d) & !is.na(df[[input$dateCol]]))
+    if (length(bad) > 0) {
+      cat("[prepared] Unparsed date values (first 30):\n")
+      print(head(df[[input$dateCol]][bad], 30))
     }
     
+    # --- Guardrail: detect bogus dates like year 0002, 0012, etc. ---
+    is_bad_year <- function(dd) {
+      ok <- !is.na(dd)
+      if (!any(ok)) return(TRUE)
+      yy <- suppressWarnings(as.integer(format(dd[ok], "%Y")))
+      all(!is.finite(yy)) || median(yy, na.rm = TRUE) < 1900 || median(yy, na.rm = TRUE) > 2100
+    }
+    
+    bad_dates <- is_bad_year(d)
+    
+    # If dates look bogus, switch to index mode (do NOT pretend it’s Date)
+    if (isTRUE(bad_dates)) {
+      by <- NULL
+    }
+    
+    # --- Value column ---
+    y <- suppressWarnings(as.numeric(df[[input$valueCol]]))
+    
+    # Keep only rows with valid dates (or if by == NULL, we still keep date NA rows out)
+    keep <- !is.na(d)
+    df2 <- data.frame(date = as.Date(d[keep]), y_raw = y[keep], stringsAsFactors = FALSE)
+    
+    # Sort by date
+    df2 <- df2[order(df2$date), , drop = FALSE]
+    
+    # --- FIX: Collapse duplicate dates (prevents vertical spikes in geom_line) ---
+    dup_n <- sum(duplicated(df2$date))
+    if (dup_n > 0) {
+      cat("[prepared] Duplicate dates detected:", dup_n, " (collapsing to one value per date)\n")
+      
+      # Show a small sample of duplicated dates
+      dup_dates <- unique(df2$date[duplicated(df2$date)])
+      print(head(dup_dates, 20))
+      
+      # Choose aggregation method:
+      # - mean = typical for measurements
+      # - sum  = totals like sales/volume per day
+      # - last = last observation per day (needs original ordering)
+      df2 <- aggregate(
+        y_raw ~ date,
+        data = df2,
+        FUN = function(v) mean(v, na.rm = TRUE)
+      )
+      
+      # Keep sorted after aggregation
+      df2 <- df2[order(df2$date), , drop = FALSE]
+    }
+    
+    # --- Align to regular calendar grid (only when we’re in Date mode) ---
+    if (isTRUE(input$align_regular) && !is.null(by)) {
+      grid <- make_regular_grid(df2$date, by = by)
+      df2  <- merge(data.frame(date = grid), df2, by = "date", all.x = TRUE, sort = TRUE)
+    }
+    
+    # --- Missing handling + transform ---
     df2$y_filled <- fill_missing(df2$y_raw, input$missing_policy, f)
     
     df2$y_trans <- tryCatch(
@@ -894,7 +1047,7 @@ server <- function(input, output, session) {
       error = function(e) { validate(e$message); df2$y_filled }
     )
     
-    # MOD: If we have a Date-based grid, use Date on x
+    # --- X axis ---
     if (!is.null(by)) {
       df2$x <- df2$date
       x_label <- "Date"
@@ -905,6 +1058,76 @@ server <- function(input, output, session) {
     
     list(df = df2, freq = f, by = by, x_label = x_label)
   })
+  
+  
+  
+  # prepared <- reactive({
+  #   req(raw_data(), input$dateCol, input$valueCol)
+  #   
+  #   f <- freq_value(input)
+  #   by <- freq_to_by(f)
+  #   
+  #   df <- raw_data()
+  #   
+  #   # MOD: robust conversion to Date
+  #   d <- parse_dates(df[[input$dateCol]], by_hint = by)
+  #   
+  #   bad <- which(is.na(d) & !is.na(raw_data()[[input$dateCol]]))
+  #   if (length(bad)) {
+  #     print(head(raw_data()[[input$dateCol]][bad], 30))
+  #   }
+  #   
+  #   # ---- Guardrail: detect bogus dates like year 0002, 0012 etc ----
+  #   is_bad_year <- function(dd) {
+  #     ok <- !is.na(dd)
+  #     if (!any(ok)) return(TRUE)
+  #     yy <- suppressWarnings(as.integer(format(dd[ok], "%Y")))
+  #     # treat years outside a reasonable range as "not a real calendar date"
+  #     all(!is.finite(yy)) || median(yy, na.rm = TRUE) < 1900 || median(yy, na.rm = TRUE) > 2100
+  #   }
+  #   
+  #   bad_dates <- is_bad_year(d)
+  #   
+  #   # If dates look bogus, switch to index mode (do NOT pretend it’s Date)
+  #   if (bad_dates) {
+  #     by <- NULL
+  #   }
+  #   
+  #   
+  #   y <- suppressWarnings(as.numeric(df[[input$valueCol]]))
+  #   
+  #   keep <- !is.na(d)
+  #   df2 <- data.frame(date = as.Date(d[keep]), y_raw = y[keep])
+  #   df2 <- df2[order(df2$date), , drop = FALSE]
+  #   
+  #   # after: df2 <- df2[order(df2$date), , drop = FALSE]
+  #   dup_n <- sum(duplicated(df2$date))
+  #   cat("Rows:", nrow(df2), " | Duplicate dates:", dup_n, "\n")
+  #   if (dup_n > 0) print(head(df2[df2$date %in% df2$date[duplicated(df2$date)], ], 20))
+  #   
+  #   if (isTRUE(input$align_regular) && !is.null(by)) {
+  #     grid <- make_regular_grid(df2$date, by = by)
+  #     df2 <- merge(data.frame(date = grid), df2, by = "date", all.x = TRUE, sort = TRUE)
+  #   }
+  #   
+  #   df2$y_filled <- fill_missing(df2$y_raw, input$missing_policy, f)
+  #   
+  #   df2$y_trans <- tryCatch(
+  #     apply_transform(df2$y_filled, input$transform, input$lambda),
+  #     error = function(e) { validate(e$message); df2$y_filled }
+  #   )
+  #   
+  #   # MOD: If we have a Date-based grid, use Date on x
+  #   if (!is.null(by)) {
+  #     df2$x <- df2$date
+  #     x_label <- "Date"
+  #   } else {
+  #     df2$x <- seq_len(nrow(df2))
+  #     x_label <- "Index"
+  #   }
+  #   
+  #   list(df = df2, freq = f, by = by, x_label = x_label)
+  # })
   
   
 
