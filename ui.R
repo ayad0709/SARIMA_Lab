@@ -6,6 +6,9 @@ library(shinythemes)
 library(shinyjs)
 library(DiagrammeR)
 
+
+
+
 ui <- fluidPage(
   theme = shinytheme("flatly"),
   useShinyjs(),
@@ -81,6 +84,28 @@ ui <- fluidPage(
         if (el) MathJax.typesetPromise([el]);
       }
     });
+    
+    
+    // Toggle Fit Auto-ARIMA busy state using classes stored on the button (data-* attrs)
+    window.setFitAutoBusy = function(isBusy) {
+      var b = $('#fit_auto');
+      if (!b.length) return;
+  
+      var idleClass = b.attr('data-idle-class') || 'blue-btn-1';
+      var busyClass = b.attr('data-busy-class') || 'red-btn-1';
+  
+      if (isBusy) {
+        b.removeClass(idleClass).addClass(busyClass);
+        b.prop('disabled', true);
+        $('#auto_progress_wrap').show();
+      } else {
+        b.removeClass(busyClass).addClass(idleClass);
+        b.prop('disabled', false);
+        $('#auto_progress_wrap').hide();
+      }
+    };
+    
+    
   ")),
     
   ),
@@ -169,6 +194,12 @@ ui <- fluidPage(
             .purple-btn-4{background-color:#4F46E5;color:white;border:none}.purple-btn-4:hover{background-color:#4338CA;color:white}
             .purple-btn-5{background-color:#A855F7;color:white;border:none}.purple-btn-5:hover{background-color:#9333EA;color:white}
             
+            /* ===== Initial ===== */
+            .GrayT-btn-1{background-color:#AAB7B8;color:white;border:none}.GrayT-btn-1:hover{background-color:#95A5A6;color:white}
+            .GrayT-btn-2{background-color:#95A5A6;color:white;border:none}.GrayT-btn-2:hover{background-color:#7F8C8D;color:white}
+            .GrayT-btn-3{background-color:#85929E;color:white;border:none}.GrayT-btn-3:hover{background-color:#707B7C;color:white}
+            .GrayT-btn-4{background-color:#7B8A8B;color:white;border:none}.GrayT-btn-4:hover{background-color:#626E70;color:white}
+            .GrayT-btn-5{background-color:#6C7A7B;color:white;border:none}.GrayT-btn-5:hover{background-color:#566573;color:white}
 
             
             
@@ -849,32 +880,44 @@ ui <- fluidPage(
               checkboxInput("auto_allow_mean", "Allow mean/drift", value = TRUE),
               numericInput("auto_max_order", "max.order", value = 10, min = 3, step = 1),
               numericInput("auto_h", "Future horizon h (used when no test set)", value = NA, min = 1, step = 1),
-              # actionButton("fit_auto", "Fit Auto-ARIMA", icon = icon("magic")),
-              
-              
-              # actionButton(
-              #   "fit_auto",
-              #   label = HTML("&nbsp;&nbsp;Fit<br>Auto-ARIMA"),
-              #   # label = HTML("Fit<br>Auto-ARIMA"),
-              #   icon = icon("magic")
-              # ),
-              
+ 
               tags$div(
-                style = "text-align: center;",
-                actionButton(
-                  "fit_auto",
-                  label = HTML("Fit<br>Auto-ARIMA"),
-                  icon  = icon("magic"),
-                  width = "90%",
-                  # class = "blue-btn-1"
+                 style = "text-align: center;",
+                 actionButton(
+                   "fit_auto",
+                   label = HTML("&nbsp;&nbsp;Fit<br>Auto-ARIMA"),
+                   icon  = icon("magic"),
+                   width = "90%",
+                   class = "btn GrayT-btn-2",                 # default idle look
+                   `data-idle-class` = "GrayT-btn-2",         # <-- change ONLY here if you rename styles
+                   `data-busy-class` = "red-btn-1",          # <-- change ONLY here if you rename styles
+                   onclick = "setFitAutoBusy(true);"         # no class names here
+               )),
+             
+             
+             # Progress bar
+             div(
+               id = "auto_progress_wrap",
+               style = "display:none; margin-top:10px;",
+               div(
+                 class = "progress progress-striped active",
+                 div(class = "progress-bar progress-bar-info", style = "width:100%")
+               ),
+               tags$small(
+                 "Fitting Auto-ARIMA… please wait.",
+                 style = "
+                          display:block;
+                          text-align:center;
+                          color:#8B0000;
+                          font-weight:500;
+                          margin-top:10px;
+                          margin-bottom:12px;
+                       "
                 )
-              ),
-              
-              
-              
-              
-              
-            ),
+              )
+          ),
+            
+            
             mainPanel(
               width = 8,
               tabsetPanel(
@@ -981,8 +1024,8 @@ ui <- fluidPage(
                 style = "text-align: center;",
                 actionButton(
                   "fit_manual",
-                  label = HTML("__Fit__"),
-                  icon  = icon("cogs"),
+                  label = HTML("&nbsp &nbsp Fit &nbsp &nbsp"),
+                  icon  = icon("sliders-h"),
                   width = "90%"
                 )
               ),
@@ -1017,18 +1060,11 @@ ui <- fluidPage(
                   )
                 ),
                 
-                
                 tabPanel(
                   "Infos",
                   verbatimTextOutput("manual_split_text"),
                   plotOutput("manual_split_plot", height = 320)
                 ),
-                
-                # tabPanel(
-                #   "Model specification",
-                #   verbatimTextOutput("manual_model_spec"),
-                #   tableOutput("manual_coef_table")
-                # ),
                 
                 tabPanel(
                   "Model equation",
@@ -1037,10 +1073,8 @@ ui <- fluidPage(
 
                 tabPanel(
                   "Diagnostics",
-                  
                   # Allow page horizontal scroll when container width exceeds screen
                   tags$head(tags$style(HTML("body { overflow-x: auto; }"))),
-                  
                   # The whole Diagnostics layout will be created by server so width can be reactive
                   uiOutput("diag_container_ui")
                 ),

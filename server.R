@@ -11,10 +11,15 @@ library(urca)
 library(DT)
 library(scales)
 
-library(gridExtra)
-library(colourpicker)
-library(patchwork)
+# library(gridExtra)
+# library(colourpicker)
+# library(patchwork)
 
+for (pkg in c("gridExtra", "colourpicker", "patchwork")) {
+  if (requireNamespace(pkg, quietly = TRUE)) {
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  }
+}
 
 
 has_pkg <- function(pkg) requireNamespace(pkg, quietly = TRUE)
@@ -129,11 +134,9 @@ build_xreg_split <- function(df, cols, train_n, test_n, scale_x = FALSE) {
 # ============================================================
 
 parse_dates <- function(x, by_hint = NULL) {
-  # Returns a Date vector. Handles Date/POSIX, Excel serials, and common text formats.
-  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "Date"))  return(x)
   if (inherits(x, "POSIXt")) return(as.Date(x))
   
-  # Numeric: either R Date (days since 1970-01-01) or Excel serial (days since 1899-12-30)
   if (is.numeric(x)) {
     med <- suppressWarnings(stats::median(x, na.rm = TRUE))
     if (is.finite(med) && med > -60000 && med < 60000) {
@@ -145,37 +148,30 @@ parse_dates <- function(x, by_hint = NULL) {
   x_chr <- trimws(as.character(x))
   x_chr[x_chr %in% c("", "NA", "NaN")] <- NA_character_
   
-  # ✅ create d BEFORE any d[...] assignment
   d <- rep(as.Date(NA), length(x_chr))
   
-  is_month_year <- grepl("^\\d{1,2}[-/]\\d{2,4}$", x_chr) &!grepl("^\\d{1,2}[-/]\\d{1,2}[-/]\\d{2,4}$", x_chr)
-  
+  # month/year like 02/2020 or 2-2020 (require 4-digit year to avoid ambiguity)
+  is_month_year <- grepl("^\\d{1,2}[-/]\\d{4}$", x_chr)
   if (any(is_month_year, na.rm = TRUE)) {
     tmp <- gsub("-", "/", x_chr[is_month_year])
-    # prefer 4-digit year; if 2-digit, interpret as 20xx is risky—better to require 4 digits or document it
     d[is_month_year] <- suppressWarnings(as.Date(zoo::as.yearmon(tmp, format = "%m/%Y")))
   }
-
-  # reject "small integer" strings like "2", "12", "03"
+  
+  # reject tiny integer strings like "2", "12", "03"
   is_small_int <- grepl("^\\d{1,2}$", x_chr)
   x_chr[is_small_int] <- NA_character_
-
-  # only use yearmon when it looks like year-month
-  looks_yearmon <- grepl("^\\d{4}[-/](\\d{1,2})$", x_chr) |
-    grepl("^[A-Za-z]{3,}\\s*\\d{4}$", x_chr)
-
-  d <- rep(as.Date(NA), length(x_chr))
-
+  
+  # year-month like 2020-02 or "Jan 2020"
+  looks_yearmon <- grepl("^\\d{4}[-/](\\d{1,2})$", x_chr) | grepl("^[A-Za-z]{3,}\\s*\\d{4}$", x_chr)
   if (any(looks_yearmon, na.rm = TRUE)) {
-    d[looks_yearmon] <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr[looks_yearmon])))
+    idx_ym <- which(looks_yearmon & is.na(d) & !is.na(x_chr))
+    d[idx_ym] <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr[idx_ym])))
   }
-
-  # ---- Robust day/month ambiguity handling ----
+  
+  # day/month ambiguity handling (only where still NA)
   idx <- which(is.na(d) & !is.na(x_chr))
   if (length(idx)) {
     s <- x_chr[idx]
-
-    # candidate formats (we'll filter based on separators seen in the data)
     candidates_all <- c(
       "%Y-%m-%d", "%Y/%m/%d",
       "%m-%d-%Y", "%d-%m-%Y",
@@ -183,46 +179,36 @@ parse_dates <- function(x, by_hint = NULL) {
       "%m-%d-%y", "%d-%m-%y",
       "%m/%d/%y", "%d/%m/%y"
     )
-
-    has_dash <- any(grepl("-", s), na.rm = TRUE)
+    
+    has_dash  <- any(grepl("-", s), na.rm = TRUE)
     has_slash <- any(grepl("/", s), na.rm = TRUE)
     candidates <- candidates_all
     if (!has_dash)  candidates <- candidates[!grepl("-", candidates)]
     if (!has_slash) candidates <- candidates[!grepl("/", candidates)]
-
+    
     expected_days <- switch(
       as.character(by_hint),
-      "month"   = 30,
-      "quarter" = 91,
-      "week"    = 7,
-      "day"     = 1,
+      "month" = 30, "quarter" = 91, "week" = 7, "day" = 1,
       NA_real_
     )
-
+    
     score_dt <- function(dt) {
       n_ok <- sum(!is.na(dt))
       if (n_ok < 3) return(c(n_ok, -Inf, -Inf))
-
       u <- sort(unique(dt[!is.na(dt)]))
       if (length(u) < 3) return(c(n_ok, -Inf, -Inf))
-
       med_step <- suppressWarnings(stats::median(as.numeric(diff(u))))
       if (!is.finite(med_step)) med_step <- -Inf
-
-      # prefer spacing that matches the chosen frequency (monthly vs daily ambiguity)
       closeness <- if (is.finite(expected_days)) -abs(med_step - expected_days) else med_step
-
       c(n_ok, closeness, med_step)
     }
-
+    
     parsed_list <- lapply(candidates, function(fmt) suppressWarnings(as.Date(s, format = fmt)))
     scores <- do.call(rbind, lapply(parsed_list, score_dt))
-
     best <- order(scores[, 1], scores[, 2], scores[, 3], decreasing = TRUE)[1]
     d[idx] <- parsed_list[[best]]
   }
-
-  # fallback for remaining NAs (avoid re-introducing dmy/mdy ambiguity here)
+  
   idx2 <- which(is.na(d) & !is.na(x_chr))
   if (length(idx2)) {
     d2 <- suppressWarnings(lubridate::parse_date_time(
@@ -231,9 +217,119 @@ parse_dates <- function(x, by_hint = NULL) {
     ))
     d[idx2] <- as.Date(d2)
   }
-
+  
   d
 }
+
+
+
+
+# parse_dates <- function(x, by_hint = NULL) {
+#   # Returns a Date vector. Handles Date/POSIX, Excel serials, and common text formats.
+#   if (inherits(x, "Date")) return(x)
+#   if (inherits(x, "POSIXt")) return(as.Date(x))
+#   
+#   # Numeric: either R Date (days since 1970-01-01) or Excel serial (days since 1899-12-30)
+#   if (is.numeric(x)) {
+#     med <- suppressWarnings(stats::median(x, na.rm = TRUE))
+#     if (is.finite(med) && med > -60000 && med < 60000) {
+#       return(as.Date(x, origin = "1970-01-01"))
+#     }
+#     return(as.Date(x, origin = "1899-12-30"))
+#   }
+#   
+#   x_chr <- trimws(as.character(x))
+#   x_chr[x_chr %in% c("", "NA", "NaN")] <- NA_character_
+#   
+#   # ✅ create d BEFORE any d[...] assignment
+#   d <- rep(as.Date(NA), length(x_chr))
+#   
+#   is_month_year <- grepl("^\\d{1,2}[-/]\\d{2,4}$", x_chr) &!grepl("^\\d{1,2}[-/]\\d{1,2}[-/]\\d{2,4}$", x_chr)
+#   
+#   if (any(is_month_year, na.rm = TRUE)) {
+#     tmp <- gsub("-", "/", x_chr[is_month_year])
+#     # prefer 4-digit year; if 2-digit, interpret as 20xx is risky—better to require 4 digits or document it
+#     d[is_month_year] <- suppressWarnings(as.Date(zoo::as.yearmon(tmp, format = "%m/%Y")))
+#   }
+# 
+#   # reject "small integer" strings like "2", "12", "03"
+#   is_small_int <- grepl("^\\d{1,2}$", x_chr)
+#   x_chr[is_small_int] <- NA_character_
+# 
+#   # only use yearmon when it looks like year-month
+#   looks_yearmon <- grepl("^\\d{4}[-/](\\d{1,2})$", x_chr) |
+#     grepl("^[A-Za-z]{3,}\\s*\\d{4}$", x_chr)
+# 
+#   d <- rep(as.Date(NA), length(x_chr))
+# 
+#   if (any(looks_yearmon, na.rm = TRUE)) {
+#     d[looks_yearmon] <- suppressWarnings(as.Date(zoo::as.yearmon(x_chr[looks_yearmon])))
+#   }
+# 
+#   # ---- Robust day/month ambiguity handling ----
+#   idx <- which(is.na(d) & !is.na(x_chr))
+#   if (length(idx)) {
+#     s <- x_chr[idx]
+# 
+#     # candidate formats (we'll filter based on separators seen in the data)
+#     candidates_all <- c(
+#       "%Y-%m-%d", "%Y/%m/%d",
+#       "%m-%d-%Y", "%d-%m-%Y",
+#       "%m/%d/%Y", "%d/%m/%Y",
+#       "%m-%d-%y", "%d-%m-%y",
+#       "%m/%d/%y", "%d/%m/%y"
+#     )
+# 
+#     has_dash <- any(grepl("-", s), na.rm = TRUE)
+#     has_slash <- any(grepl("/", s), na.rm = TRUE)
+#     candidates <- candidates_all
+#     if (!has_dash)  candidates <- candidates[!grepl("-", candidates)]
+#     if (!has_slash) candidates <- candidates[!grepl("/", candidates)]
+# 
+#     expected_days <- switch(
+#       as.character(by_hint),
+#       "month"   = 30,
+#       "quarter" = 91,
+#       "week"    = 7,
+#       "day"     = 1,
+#       NA_real_
+#     )
+# 
+#     score_dt <- function(dt) {
+#       n_ok <- sum(!is.na(dt))
+#       if (n_ok < 3) return(c(n_ok, -Inf, -Inf))
+# 
+#       u <- sort(unique(dt[!is.na(dt)]))
+#       if (length(u) < 3) return(c(n_ok, -Inf, -Inf))
+# 
+#       med_step <- suppressWarnings(stats::median(as.numeric(diff(u))))
+#       if (!is.finite(med_step)) med_step <- -Inf
+# 
+#       # prefer spacing that matches the chosen frequency (monthly vs daily ambiguity)
+#       closeness <- if (is.finite(expected_days)) -abs(med_step - expected_days) else med_step
+# 
+#       c(n_ok, closeness, med_step)
+#     }
+# 
+#     parsed_list <- lapply(candidates, function(fmt) suppressWarnings(as.Date(s, format = fmt)))
+#     scores <- do.call(rbind, lapply(parsed_list, score_dt))
+# 
+#     best <- order(scores[, 1], scores[, 2], scores[, 3], decreasing = TRUE)[1]
+#     d[idx] <- parsed_list[[best]]
+#   }
+# 
+#   # fallback for remaining NAs (avoid re-introducing dmy/mdy ambiguity here)
+#   idx2 <- which(is.na(d) & !is.na(x_chr))
+#   if (length(idx2)) {
+#     d2 <- suppressWarnings(lubridate::parse_date_time(
+#       x_chr[idx2],
+#       orders = c("ymd", "Ymd", "Y-m-d", "Y/m/d", "bdY", "bY", "Y")
+#     ))
+#     d[idx2] <- as.Date(d2)
+#   }
+# 
+#   d
+# }
 
 
 # ---------------- APA helpers ----------------
@@ -645,10 +741,12 @@ server <- function(input, output, session) {
       "shinythemes",  # UI theme
       "shinyjs",      # JS helpers (disable/enable UI)
       "nortest",      # Anderson–Darling normality test
-      "FinTS"         # ARCH LM test
+      "FinTS",         # ARCH LM test
+      "DiagrammeR"
     )
     
-    tags$div(
+
+        tags$div(
       style = "background:#eef5ff;padding:12px;border-radius:8px;",
       tags$h4("R environment check"),
       tags$p(
@@ -666,7 +764,7 @@ server <- function(input, output, session) {
         ),
         column(
           width = 6,
-          tags$b("Optional packages"),
+          tags$b(""),
           tags$ul(lapply(optional_pkgs, pkg_status_li))
         )
       ),
@@ -4866,19 +4964,225 @@ digraph stationarity_diff_workflow {
 
   # ---- Step 5 Auto-ARIMA ----
 
-  auto_fit <- eventReactive(input$fit_auto, {
-    s <- ts_train_test()
-    forecast::auto.arima(
-      s$ts_train,
-      seasonal = isTRUE(input$auto_seasonal),
-      stepwise = isTRUE(input$auto_stepwise),
-      approximation = isTRUE(input$auto_approx),
-      allowmean = isTRUE(input$auto_allow_mean),
-      allowdrift = isTRUE(input$auto_allow_mean),
-      max.order = as.numeric(input$auto_max_order)
-    )
-  })
+  # auto_fit <- eventReactive(input$fit_auto, {
+  #   s <- ts_train_test()
+  #   forecast::auto.arima(
+  #     s$ts_train,
+  #     seasonal = isTRUE(input$auto_seasonal),
+  #     stepwise = isTRUE(input$auto_stepwise),
+  #     approximation = isTRUE(input$auto_approx),
+  #     allowmean = isTRUE(input$auto_allow_mean),
+  #     allowdrift = isTRUE(input$auto_allow_mean),
+  #     max.order = as.numeric(input$auto_max_order)
+  #   )
+  # })
 
+  
+  # ---- Step 5 Auto-ARIMA ----
+  
+  # auto_fit_rv <- reactiveVal(NULL)
+  # 
+  # observeEvent(input$fit_auto, {
+  #   req(ts_train_test())
+  #   
+  #   # in case JS onclick didn't run (or for safety)
+  #   shinyjs::show("auto_progress_wrap")
+  #   shinyjs::disable("fit_auto")
+  #   
+  #   # ALWAYS clean up (even if auto.arima errors)
+  #   on.exit({
+  #     shinyjs::hide("auto_progress_wrap")
+  #     shinyjs::enable("fit_auto")
+  #   }, add = TRUE)
+  #   
+  #   s <- ts_train_test()
+  #   
+  #   fit <- tryCatch(
+  #     forecast::auto.arima(
+  #       s$ts_train,
+  #       seasonal      = isTRUE(input$auto_seasonal),
+  #       stepwise      = isTRUE(input$auto_stepwise),
+  #       approximation = isTRUE(input$auto_approx),
+  #       allowmean     = isTRUE(input$auto_allow_mean),
+  #       allowdrift    = isTRUE(input$auto_allow_mean),
+  #       max.order     = as.numeric(input$auto_max_order)
+  #     ),
+  #     error = function(e) {
+  #       showNotification(paste("Auto-ARIMA failed:", e$message), type = "error", duration = NULL)
+  #       NULL
+  #     }
+  #   )
+  #   
+  #   req(!is.null(fit))
+  #   auto_fit_rv(fit)
+  # })
+  # 
+  # # keep the same name your other code already uses
+  # auto_fit <- reactive({
+  #   req(auto_fit_rv())
+  #   auto_fit_rv()
+  # })
+  
+  
+  
+  
+  # auto_fit_rv <- reactiveVal(NULL)
+  # 
+  # observeEvent(input$fit_auto, {
+  #   req(ts_train_test())
+  #   
+  #   # Safety: in case the UI onclick didn't run (or user triggers from server)
+  #   shinyjs::show("auto_progress_wrap")
+  #   shinyjs::disable("fit_auto")
+  #   shinyjs::runjs("$('#fit_auto').removeClass('btn-primary').addClass('btn-danger');")
+  #   
+  #   # ALWAYS clean up (even if auto.arima errors or req() stops)
+  #   on.exit({
+  #     shinyjs::hide("auto_progress_wrap")
+  #     shinyjs::enable("fit_auto")
+  #     shinyjs::runjs("$('#fit_auto').removeClass('btn-danger').addClass('btn-primary');")
+  #   }, add = TRUE)
+  #   
+  #   s <- ts_train_test()
+  #   
+  #   fit <- tryCatch(
+  #     forecast::auto.arima(
+  #       s$ts_train,
+  #       seasonal      = isTRUE(input$auto_seasonal),
+  #       stepwise      = isTRUE(input$auto_stepwise),
+  #       approximation = isTRUE(input$auto_approx),
+  #       allowmean     = isTRUE(input$auto_allow_mean),
+  #       allowdrift    = isTRUE(input$auto_allow_mean),
+  #       max.order     = as.numeric(input$auto_max_order)
+  #     ),
+  #     error = function(e) {
+  #       showNotification(
+  #         paste("Auto-ARIMA failed:", e$message),
+  #         type = "error",
+  #         duration = NULL
+  #       )
+  #       NULL
+  #     }
+  #   )
+  #   
+  #   if (is.null(fit)) return()  # avoid req() stop noise; on.exit still runs
+  #   auto_fit_rv(fit)
+  # })
+  # 
+  # # keep the same name your other code already uses
+  # auto_fit <- reactive({
+  #   req(auto_fit_rv())
+  #   auto_fit_rv()
+  # })
+  
+  
+  
+  
+  # auto_fit_rv <- reactiveVal(NULL)
+  # 
+  # observeEvent(input$fit_auto, {
+  #   req(ts_train_test())
+  #   
+  #   # Safety: in case the UI onclick didn't run
+  #   shinyjs::show("auto_progress_wrap")
+  #   shinyjs::disable("fit_auto")
+  #   shinyjs::runjs("$('#fit_auto').removeClass('blue-btn-1').addClass('red-btn-1');")
+  #   
+  #   # ALWAYS clean up (success, error, req stop)
+  #   on.exit({
+  #     shinyjs::hide("auto_progress_wrap")
+  #     shinyjs::enable("fit_auto")
+  #     shinyjs::runjs("$('#fit_auto').removeClass('red-btn-1').addClass('blue-btn-1');")
+  #   }, add = TRUE)
+  #   
+  #   s <- ts_train_test()
+  #   
+  #   fit <- tryCatch(
+  #     forecast::auto.arima(
+  #       s$ts_train,
+  #       seasonal      = isTRUE(input$auto_seasonal),
+  #       stepwise      = isTRUE(input$auto_stepwise),
+  #       approximation = isTRUE(input$auto_approx),
+  #       allowmean     = isTRUE(input$auto_allow_mean),
+  #       allowdrift    = isTRUE(input$auto_allow_mean),
+  #       max.order     = as.numeric(input$auto_max_order)
+  #     ),
+  #     error = function(e) {
+  #       showNotification(paste("Auto-ARIMA failed:", e$message), type = "error", duration = NULL)
+  #       NULL
+  #     }
+  #   )
+  #   
+  #   if (is.null(fit)) return()
+  #   auto_fit_rv(fit)
+  # })
+  # 
+  # auto_fit <- reactive({
+  #   req(auto_fit_rv())
+  #   auto_fit_rv()
+  # })
+  
+  
+  
+  auto_fit_rv <- reactiveVal(NULL)
+  
+  observeEvent(input$fit_auto, {
+    req(ts_train_test())
+    
+    # Safety (if onclick didn't fire for some reason)
+    shinyjs::runjs("setFitAutoBusy(true);")
+    
+    # ALWAYS clean up
+    on.exit({
+      shinyjs::runjs("setFitAutoBusy(false);")
+    }, add = TRUE)
+    
+    s <- ts_train_test()
+    
+    fit <- tryCatch(
+      forecast::auto.arima(
+        s$ts_train,
+        seasonal      = isTRUE(input$auto_seasonal),
+        stepwise      = isTRUE(input$auto_stepwise),
+        approximation = isTRUE(input$auto_approx),
+        allowmean     = isTRUE(input$auto_allow_mean),
+        allowdrift    = isTRUE(input$auto_allow_mean),
+        max.order     = as.numeric(input$auto_max_order)
+      ),
+      error = function(e) {
+        showNotification(paste("Auto-ARIMA failed:", e$message), type = "error", duration = NULL)
+        NULL
+      }
+    )
+    
+    if (is.null(fit)) return()
+    auto_fit_rv(fit)
+  })
+  
+  auto_fit <- reactive({
+    req(auto_fit_rv())
+    auto_fit_rv()
+  })
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   auto_fc <- reactive({
     req(auto_fit(), ts_train_test(), prepared())
     s <- ts_train_test()
@@ -6305,7 +6609,7 @@ digraph stationarity_diff_workflow {
         )
       ),
       title = NULL,
-      theme = "sky",
+      theme = "blue",
       body_is_html = FALSE
     )
   })
@@ -7579,10 +7883,92 @@ digraph stationarity_diff_workflow {
                      title = "Manual SARIMA forecast (train/test + intervals)")
   })
   
+  
+  # output$manual_forecast_table_concl <- renderTable({
+  #   req(manual_fc())
+  #   head(forecast_table(manual_fc()$fc), 25)
+  # }, rownames = FALSE)
+  
+  
+  # output$manual_forecast_table_concl <- renderTable({
+  #   req(manual_fc())
+  # 
+  #   ft <- forecast_table(manual_fc()$fc)
+  # 
+  #   # Make sure we have an "h" column (optional, but nice)
+  #   if (!"h" %in% names(ft)) ft <- cbind(h = seq_len(nrow(ft)), ft)
+  # 
+  #   # Show all horizons up to auto_h
+  #   h_show <- if (!is.null(input$auto_h) && is.finite(input$auto_h)) input$auto_h else nrow(ft)
+  #   ft <- ft[seq_len(min(nrow(ft), h_show)), , drop = FALSE]
+  # 
+  #   ft
+  # }, rownames = FALSE)
+  
+  # output$manual_forecast_table_concl <- renderTable({
+  #   req(manual_fc(), ts_train_test(), prepared())
+  #   
+  #   s <- ts_train_test()
+  #   p <- prepared()
+  #   fc <- manual_fc()$fc
+  #   
+  #   obs_df <- s$dfm[, c("x", "y_trans")]
+  #   names(obs_df) <- c("x", "y")
+  #   
+  #   ft <- plot_forecast_df(obs_df, s$train_n, fc, by = p$by)
+  #   
+  #   ft <- ft[, c("x", setdiff(names(ft), "x")), drop = FALSE]
+  #   names(ft)[1] <- if (!is.null(p$by)) "date" else "index"
+  #   if (inherits(ft[[1]], "Date")) ft[[1]] <- format(ft[[1]], "%d-%m-%Y")
+  #   
+  #   ft
+  # }, rownames = FALSE)
+  
+  
   output$manual_forecast_table_concl <- renderTable({
-    req(manual_fc())
-    head(forecast_table(manual_fc()$fc), 25)
+    req(manual_fc(), ts_train_test(), prepared())
+    
+    s  <- ts_train_test()
+    p  <- prepared()
+    fc <- manual_fc()$fc
+    
+    obs_df <- s$dfm[, c("x", "y_trans")]
+    names(obs_df) <- c("x", "y")
+    
+    ft <- plot_forecast_df(obs_df, s$train_n, fc, by = p$by)
+    
+    # Rename x -> date/index
+    ft <- ft[, c("x", setdiff(names(ft), "x")), drop = FALSE]
+    names(ft)[1] <- if (!is.null(p$by)) "date" else "index"
+    if (inherits(ft[[1]], "Date")) ft[[1]] <- format(ft[[1]], "%d-%m-%Y")
+    
+    # Reorder: step first, then date/index
+    second <- if ("date" %in% names(ft)) "date" else if ("index" %in% names(ft)) "index" else NULL
+    if (!is.null(second) && "step" %in% names(ft)) {
+      ft <- ft[, c("step", second, setdiff(names(ft), c("step", second))), drop = FALSE]
+    }
+    
+    ft
   }, rownames = FALSE)
+  
+  
+  
+  # output$manual_forecast_table_concl <- DT::renderDataTable({
+  #   req(manual_fc())
+  #   ft <- forecast_table(manual_fc()$fc)
+  #   if (!"h" %in% names(ft)) ft <- cbind(h = seq_len(nrow(ft)), ft)
+  #   
+  #   h_show <- if (!is.null(input$auto_h) && is.finite(input$auto_h)) input$auto_h else nrow(ft)
+  #   ft <- ft[seq_len(min(nrow(ft), h_show)), , drop = FALSE]
+  #   
+  #   DT::datatable(ft,
+  #                 options = list(pageLength = min(nrow(ft), h_show), paging = FALSE, scrollY = 400),
+  #                 rownames = FALSE
+  #   )
+  # })
+  
+  
+  
   
   output$manual_accuracy_table_concl <- renderTable({
     req(manual_fc(), ts_train_test())
@@ -7653,8 +8039,73 @@ digraph stationarity_diff_workflow {
   
   
 
-  output$manual_forecast_table <- renderTable({ req(manual_fc()); head(forecast_table(manual_fc()$fc), 25) }, rownames = FALSE)
+  # output$manual_forecast_table <- renderTable({ req(manual_fc()); head(forecast_table(manual_fc()$fc), 25) }, rownames = FALSE)
 
+  # output$manual_forecast_table <- renderTable({
+  #   req(manual_fc())
+  #   ft <- forecast_table(manual_fc()$fc)
+  #   
+  #   # add h column if forecast_table() doesn't include it
+  #   if (!"h" %in% names(ft)) ft <- cbind(h = seq_len(nrow(ft)), ft)
+  #   
+  #   ft
+  # }, rownames = FALSE)
+  
+  
+  # output$manual_forecast_table <- renderTable({
+  #   req(manual_fc(), ts_train_test(), prepared())
+  #   
+  #   s <- ts_train_test()
+  #   p <- prepared()
+  #   fc <- manual_fc()$fc
+  #   
+  #   # observed series (x is Date when your input has valid dates)
+  #   obs_df <- s$dfm[, c("x", "y_trans")]
+  #   names(obs_df) <- c("x", "y")
+  #   
+  #   # forecast table + aligned/extended x (dates)
+  #   ft <- plot_forecast_df(obs_df, s$train_n, fc, by = p$by)
+  #   
+  #   # Put x first and rename it nicely
+  #   ft <- ft[, c("x", setdiff(names(ft), "x")), drop = FALSE]
+  #   names(ft)[1] <- if (!is.null(p$by)) "date" else "index"
+  #   
+  #   # Optional: format the date column (keeps continuation, just prettier)
+  #   if (inherits(ft[[1]], "Date")) ft[[1]] <- format(ft[[1]], "%d-%m-%Y")
+  #   
+  #   ft
+  # }, rownames = FALSE)
+  
+  
+  output$manual_forecast_table <- renderTable({
+    req(manual_fc(), ts_train_test(), prepared())
+    
+    s  <- ts_train_test()
+    p  <- prepared()
+    fc <- manual_fc()$fc
+    
+    # Use the same x (date) logic as your forecast plot
+    obs_df <- s$dfm[, c("x", "y_trans")]
+    names(obs_df) <- c("x", "y")
+    
+    ft <- plot_forecast_df(obs_df, s$train_n, fc, by = p$by)  # adds ft$x (dates/index)
+    
+    # Rename x to date (or index) and reorder: step first, date second
+    if (inherits(ft$x, "Date")) {
+      ft$date <- ft$x
+      ft$date <- format(ft$date, "%d-%m-%Y")  # optional formatting
+      second <- "date"
+    } else {
+      ft$index <- ft$x
+      second <- "index"
+    }
+    ft$x <- NULL
+    
+    ft <- ft[, c("step", second, setdiff(names(ft), c("step", second))), drop = FALSE]
+    
+    ft
+  }, rownames = FALSE)
+  
   
   
   output$manual_accuracy_table <- renderTable({
@@ -8779,7 +9230,7 @@ digraph stationarity_diff_workflow {
       callout(
         square_ul(interpretation_bullets),
         title = "Academic interpretation.",
-        theme = "indigo",
+        theme = "blue",
         body_is_html = FALSE
       ),
       
@@ -9766,7 +10217,7 @@ digraph stationarity_diff_workflow {
           )
         ),
         title = "Academic interpretation",
-        theme = "indigo",
+        theme = "blue",
         body_is_html = FALSE
       )
     })
@@ -10052,7 +10503,9 @@ digraph stationarity_diff_workflow {
       tags$hr(), tags$br(),
       tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Forecast table")),
       # tableOutput("manual_forecast_table"),
+      
       tableOutput("manual_forecast_table_concl"),
+      # DT::dataTableOutput("manual_forecast_table_concl"),
      
        tags$hr(), tags$br(),
       tags$h5(strong(" \u00A0\u00A0 \u25A0 \u00A0 Accuracy table (your app output)")),
