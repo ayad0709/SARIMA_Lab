@@ -40,6 +40,33 @@ ui <- fluidPage(
       margin-top: 8px;
       margin-bottom: 8px;
     }
+    
+    
+    /* “left border Color + background Color” callout wrapper around your text */
+    .callout {
+      padding: 10px;
+      border-left: 4px solid;
+      border-radius: 6px;
+      margin-top: 8px;
+      background: #f8fbff;
+    }
+    .callout-teal   { border-left-color:#14B8A6; background:#F0FDFA; }
+    .callout-green  { border-left-color:#22C55E; background:#F0FDF4; }
+    .callout-amber  { border-left-color:#F59E0B; background:#FFFBEB; }
+    .callout-rose   { border-left-color:#F43F5E; background:#FFF1F2; }
+    .callout-purple { border-left-color:#8B5CF6; background:#F5F3FF; }
+    .callout-slate  { border-left-color:#64748B; background:#F8FAFC; }
+    .callout-blue   { border-left-color:#3B82F6; background:#F8FBFF; }
+    .callout-cyan    { border-left-color:#06B6D4; background:#ECFEFF; }
+    .callout-sky     { border-left-color:#0EA5E9; background:#F0F9FF; }
+    .callout-indigo  { border-left-color:#4F46E5; background:#EEF2FF; }
+    .callout-violet  { border-left-color:#7C3AED; background:#F5F3FF; }
+    .callout-fuchsia { border-left-color:#D946EF; background:#FDF4FF; }
+    .callout-lime    { border-left-color:#84CC16; background:#F7FEE7; }
+    .callout-orange  { border-left-color:#F97316; background:#FFF7ED; }
+    .callout-red     { border-left-color:#EF4444; background:#FEF2F2; }
+    .callout-stone   { border-left-color:#78716C; background:#FAFAF9; }
+    .callout-zinc    { border-left-color:#71717A; background:#FAFAFA; }
   ")),
     
     tags$script(HTML("
@@ -54,7 +81,8 @@ ui <- fluidPage(
         if (el) MathJax.typesetPromise([el]);
       }
     });
-  "))
+  ")),
+    
   ),
   
   
@@ -93,7 +121,62 @@ ui <- fluidPage(
               margin-left: 0.6em;
               margin-top: 6px;
             }
+            
+            
+            /* ============= */
+            /* Buttons Color */
+            /* ============= */
+
+            /* ===== BLUE ===== */
+            .blue-btn-1{background-color:#0d6efd;color:white;border:none}.blue-btn-1:hover{background-color:#0b5ed7;color:white}
+            .blue-btn-2{background-color:#2C7BE5;color:white;border:none}.blue-btn-2:hover{background-color:#1A5BB8;color:white}
+            .blue-btn-3{background-color:#1976D2;color:white;border:none}.blue-btn-3:hover{background-color:#115293;color:white}
+            .blue-btn-4{background-color:#2563EB;color:white;border:none}.blue-btn-4:hover{background-color:#1D4ED8;color:white}
+            .blue-btn-5{background-color:#0EA5E9;color:white;border:none}.blue-btn-5:hover{background-color:#0284C7;color:white}
+            
+            /* ===== GREEN ===== */
+            .green-btn-1{background-color:#198754;color:white;border:none}.green-btn-1:hover{background-color:#157347;color:white}
+            .green-btn-2{background-color:#2E7D32;color:white;border:none}.green-btn-2:hover{background-color:#1B5E20;color:white}
+            .green-btn-3{background-color:#22C55E;color:white;border:none}.green-btn-3:hover{background-color:#16A34A;color:white}
+            .green-btn-4{background-color:#16A34A;color:white;border:none}.green-btn-4:hover{background-color:#15803D;color:white}
+            .green-btn-5{background-color:#059669;color:white;border:none}.green-btn-5:hover{background-color:#047857;color:white}
+            
+            /* ===== ORANGE ===== */
+            .orange-btn-1{background-color:#fd7e14;color:white;border:none}.orange-btn-1:hover{background-color:#e96b03;color:white}
+            .orange-btn-2{background-color:#F59E0B;color:white;border:none}.orange-btn-2:hover{background-color:#D97706;color:white}
+            .orange-btn-3{background-color:#FB923C;color:white;border:none}.orange-btn-3:hover{background-color:#F97316;color:white}
+            .orange-btn-4{background-color:#EA580C;color:white;border:none}.orange-btn-4:hover{background-color:#C2410C;color:white}
+            .orange-btn-5{background-color:#FF9800;color:white;border:none}.orange-btn-5:hover{background-color:#F57C00;color:white}
+            
+            /* ===== RED ===== */
+            .red-btn-1{background-color:#dc3545;color:white;border:none}.red-btn-1:hover{background-color:#bb2d3b;color:white}
+            .red-btn-2{background-color:#B91C1C;color:white;border:none}.red-btn-2:hover{background-color:#991B1B;color:white}
+            .red-btn-3{background-color:#EF4444;color:white;border:none}.red-btn-3:hover{background-color:#DC2626;color:white}
+            .red-btn-4{background-color:#F87171;color:white;border:none}.red-btn-4:hover{background-color:#EF4444;color:white}
+            .red-btn-5{background-color:#E53935;color:white;border:none}.red-btn-5:hover{background-color:#C62828;color:white}
+            
+            /* ===== GRAY ===== */
+            .gray-btn-1{background-color:#6c757d;color:white;border:none}.gray-btn-1:hover{background-color:#5c636a;color:white}
+            .gray-btn-2{background-color:#4B5563;color:white;border:none}.gray-btn-2:hover{background-color:#374151;color:white}
+            .gray-btn-3{background-color:#64748B;color:white;border:none}.gray-btn-3:hover{background-color:#475569;color:white}
+            .gray-btn-4{background-color:#334155;color:white;border:none}.gray-btn-4:hover{background-color:#1E293B;color:white}
+            .gray-btn-5{background-color:#9CA3AF;color:white;border:none}.gray-btn-5:hover{background-color:#6B7280;color:white}
+            
+            /* ===== PURPLE ===== */
+            .purple-btn-1{background-color:#6f42c1;color:white;border:none}.purple-btn-1:hover{background-color:#59339d;color:white}
+            .purple-btn-2{background-color:#7C3AED;color:white;border:none}.purple-btn-2:hover{background-color:#5B21B6;color:white}
+            .purple-btn-3{background-color:#8B5CF6;color:white;border:none}.purple-btn-3:hover{background-color:#7C3AED;color:white}
+            .purple-btn-4{background-color:#4F46E5;color:white;border:none}.purple-btn-4:hover{background-color:#4338CA;color:white}
+            .purple-btn-5{background-color:#A855F7;color:white;border:none}.purple-btn-5:hover{background-color:#9333EA;color:white}
+            
+
+            
+            
         ")),
+  
+  
+  
+  
   
   
   #   🟡 SARIMA Modeling Lab Main Panel 🟡
@@ -165,7 +248,29 @@ ui <- fluidPage(
       checkboxInput("show_teaching_notes", "Show teaching notes", value = TRUE),
       
       hr(),
-      actionButton("refresh_all", "Refresh workflow", icon = icon("sync"))
+      
+      # tags$div(
+      #   style = "text-align: center;",
+      #   actionButton(
+      #     "refresh_all",
+      #     label = HTML("Refresh workflow"),
+      #     icon  = icon("sync"),
+      #     width = "90%"
+      #   )
+      # ),
+      
+      tags$div(
+        style = "text-align: center;",
+        actionButton(
+          "refresh_all",
+          label = HTML("Refresh workflow"),
+          icon  = icon("sync"),
+          width = "90%",
+          # class = "gray-btn-1"
+        )
+      ),
+
+      
     ),
     
     mainPanel(
@@ -641,16 +746,45 @@ ui <- fluidPage(
               selectInput("adf_type", "ADF type (ur.df)", choices = c("none", "drift", "trend"), selected = "trend"),
               numericInput("adf_lags", "ADF lags (k)", value = 10, min = 0, step = 1),
               selectInput("kpss_type", "KPSS null", choices = c("mu", "tau"), selected = "mu"),
-              actionButton("run_tests", "Run tests", icon = icon("vial")),
+              
+              # actionButton("run_tests", "Run tests", icon = icon("vial")),
+              
+              tags$div(
+                style = "text-align: center;",
+                actionButton(
+                  "run_tests",
+                  label = HTML("Run tests"),
+                  icon  = icon("vial"),
+                  width = "90%",
+                  # class = "blue-btn-1"
+                )
+              ),
+              
+              
+              
               hr(),
               h5("Differencing preview"),
               numericInput("d_preview", "Non-seasonal difference (d)", value = 0, min = 0, step = 1),
               numericInput("D_preview", "Seasonal difference (D)", value = 0, min = 0, step = 1),
-              actionButton(
-                "preview_diff",
-                label = HTML("Preview<br>differenced<br>series"),
-                icon = icon("chart-line")
-              )
+              
+              # actionButton(
+              #   "preview_diff",
+              #   label = HTML("Preview<br>differenced<br>series"),
+              #   icon = icon("chart-line")
+              # ),
+              
+              
+              tags$div(
+                style = "text-align: center;",
+                actionButton(
+                  "preview_diff",
+                  label = HTML("Preview<br>differenced<br>series"),
+                  icon  = icon("chart-line"),
+                  width = "90%",
+                  # class = "blue-btn-1"
+                )
+              ),
+              
             ),
             mainPanel(
               width = 8,
@@ -716,23 +850,41 @@ ui <- fluidPage(
               numericInput("auto_max_order", "max.order", value = 10, min = 3, step = 1),
               numericInput("auto_h", "Future horizon h (used when no test set)", value = NA, min = 1, step = 1),
               # actionButton("fit_auto", "Fit Auto-ARIMA", icon = icon("magic")),
-              actionButton(
-                "fit_auto",
-                label = HTML("&nbsp;&nbsp;Fit<br>Auto-ARIMA"),
-                # label = HTML("Fit<br>Auto-ARIMA"),
-                icon = icon("magic")
-              )
+              
+              
+              # actionButton(
+              #   "fit_auto",
+              #   label = HTML("&nbsp;&nbsp;Fit<br>Auto-ARIMA"),
+              #   # label = HTML("Fit<br>Auto-ARIMA"),
+              #   icon = icon("magic")
+              # ),
+              
+              tags$div(
+                style = "text-align: center;",
+                actionButton(
+                  "fit_auto",
+                  label = HTML("Fit<br>Auto-ARIMA"),
+                  icon  = icon("magic"),
+                  width = "90%",
+                  # class = "blue-btn-1"
+                )
+              ),
+              
+              
+              
+              
+              
             ),
             mainPanel(
               width = 8,
               tabsetPanel(
                 tabPanel("What to do", uiOutput("step5_notes")),
                 
-                tabPanel(
-                  "Model specification",
-                  verbatimTextOutput("auto_model_spec"),
-                  tableOutput("auto_coef_table")
-                ),
+                # tabPanel(
+                #   "Model specification",
+                #   verbatimTextOutput("auto_model_spec"),
+                #   tableOutput("auto_coef_table")
+                # ),
                 
                 tabPanel(
                   "Model equation",
@@ -745,7 +897,7 @@ ui <- fluidPage(
                 ),
                 
                 tabPanel(
-                  "Diagnostics (plots)",
+                  "Diagnostics",
                   fluidRow(
                     column(6, plotOutput("auto_resid_ts",   height = 240)),
                     column(6, plotOutput("auto_resid_acf",  height = 240))
@@ -779,17 +931,17 @@ ui <- fluidPage(
                 ),
                 
                 tabPanel(
-                  "Forecast & accuracy",
+                  "Forecast",
                   verbatimTextOutput("auto_horizon_note"),
                   plotOutput("auto_forecast_plot", height = 420),
                   tableOutput("auto_accuracy_table"),
                   tableOutput("auto_forecast_table")
                 ),
                 
-                tabPanel("APA paragraph", verbatimTextOutput("apa_auto_paragraph")),
+                tabPanel("APA", verbatimTextOutput("apa_auto_paragraph")),
                 
                 tabPanel(
-                  "Academic conclusion (full)",
+                  "Conclusion",
                   tags$head(tags$style(HTML("
                       #auto_conclusion_box{
                         height: 760px !important;
@@ -824,11 +976,18 @@ ui <- fluidPage(
           sidebarLayout(
             sidebarPanel(
               width = 2,
-              actionButton(
-                "fit_manual",
-                label = HTML("__Fit__"),
-                icon = icon("cogs")
+              
+              tags$div(
+                style = "text-align: center;",
+                actionButton(
+                  "fit_manual",
+                  label = HTML("__Fit__"),
+                  icon  = icon("cogs"),
+                  width = "90%"
+                )
               ),
+              
+              
               h5("Non-seasonal (p,d,q)"),
               numericInput("p", "p", value = 1, min = 0, step = 1),
               numericInput("d", "d", value = 0, min = 0, step = 1),
@@ -846,19 +1005,30 @@ ui <- fluidPage(
             mainPanel(
               width = 8,
               tabsetPanel(
-                tabPanel("What to do", uiOutput("step6_notes")),
+                # tabPanel("What to do", uiOutput("step6_notes")),
                 
                 tabPanel(
-                  "Train/Test split",
+                  "What to do",
+                  tags$div(
+                    style = "
+                              width: 120%;
+                            ",
+                    uiOutput("step6_notes")
+                  )
+                ),
+                
+                
+                tabPanel(
+                  "Infos",
                   verbatimTextOutput("manual_split_text"),
                   plotOutput("manual_split_plot", height = 320)
                 ),
                 
-                tabPanel(
-                  "Model specification",
-                  verbatimTextOutput("manual_model_spec"),
-                  tableOutput("manual_coef_table")
-                ),
+                # tabPanel(
+                #   "Model specification",
+                #   verbatimTextOutput("manual_model_spec"),
+                #   tableOutput("manual_coef_table")
+                # ),
                 
                 tabPanel(
                   "Model equation",
@@ -893,17 +1063,17 @@ ui <- fluidPage(
                 ),
                 
                 tabPanel(
-                  "Forecast & accuracy",
+                  "Forecast",
                   verbatimTextOutput("manual_horizon_note"),
                   plotOutput("manual_forecast_plot", height = 420),
                   tableOutput("manual_accuracy_table"),
                   tableOutput("manual_forecast_table")
                 ),
                 
-                tabPanel("APA paragraph", verbatimTextOutput("apa_manual_paragraph")),
+                # tabPanel("APA paragraph", verbatimTextOutput("apa_manual_paragraph")),
                 
                 tabPanel(
-                  "Academic conclusion (full)",
+                  "Conclusion",
                   tags$head(tags$style(HTML("
                       #manual_conclusion_box{
                         height: 760px !important;
