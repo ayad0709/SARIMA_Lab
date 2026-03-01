@@ -8889,18 +8889,7 @@ digraph stationarity_diff_workflow {
     )
     
     
-    
-    # academic_interpretation <- paste0(
-    #   "This section evaluates whether the training series becomes stationary after applying the currently selected differencing orders, because SARIMA identification and statistical inference assume a stationary working series once transformations and differencing have been applied. ",
-    #   "The training sample contained n = ", n_before, " observations before differencing and n = ", n_after,
-    #   " observations after applying (d = ", input$d, ", D = ", input$D, ", s = ", s_use, "). ",
-    #   "Two unit-root tests were used—ADF and Phillips–Perron—where H0 states that the differenced series still contains a unit root (i.e., remains non-stationary). ",
-    #   "Two KPSS tests were also used—KPSS(Level) and KPSS(Trend)—where H0 states that the series is stationary (level-stationary or trend-stationary, respectively). ",
-    #   "Because differencing reduces the effective sample size, the ADF test used k = ", k_adf, " lagged differences to mitigate residual autocorrelation in the test regression. ",
-    #   adf_line, pp_line, kpssL_line, kpssT_line,
-    #   "For teaching, emphasize that the goal of differencing is not to force a particular p-value outcome but to remove long-memory trend/seasonal persistence so that the remaining dependence is short-memory and can be captured by AR and MA terms; the final check is whether fitted-model residuals behave like white noise and whether forecasting performance is stable on a holdout set."
-    # )
-    
+   
     # ---- More detailed conclusion (conditional; still tied to synthesis flags) ----
     conclusion <- if (unit_root_rejected && kpss_ok) {
       paste0(
@@ -8962,7 +8951,7 @@ digraph stationarity_diff_workflow {
         title = "Conclusion.",
         theme = "orange",
         body_is_html = TRUE
-      ),
+      )
       
       
     )
@@ -9192,17 +9181,7 @@ digraph stationarity_diff_workflow {
     }
     
     tagList(
-      # tags$h4(tags$strong(paste0(
-      #   "Stationarity assessment after differencing (d=", input$d,
-      #   ", D=", input$D, ", s=", s_use, ")"
-      # ))),
-      
-      # tags$p(intro_txt),
-      # tags$br(),
-      
-      # html_tbl,
-      
-      
+
       callout(
         square_ul(interpretation_bullets),
         title = "Academic interpretation.",
