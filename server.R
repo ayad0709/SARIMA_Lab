@@ -8234,9 +8234,15 @@ digraph stationarity_diff_workflow {
     s_obj <- ts_train_test()
     
     # Use training series for stationarity assessment
-    x <- as.numeric(s_obj$ts_train)
-    x <- x[is.finite(x)]
-    validate(need(length(x) >= 10, "Not enough training observations to run stationarity tests (need \u2265 10)."))
+    x_raw <- as.numeric(s_obj$ts_train)
+    
+    # IMPORTANT: Do NOT drop values; it splices time and changes test statistics.
+    validate(need(sum(!is.finite(x_raw)) == 0,
+                  "Training series contains NA/Inf. Clean or impute before stationarity tests; dropping points breaks time structure."))
+    
+    x <- x_raw
+    validate(need(length(x) >= 10,
+                  "Not enough training observations to run stationarity tests (need ≥ 10)."))
     
     fmt_num <- function(z, d = 3) {
       z <- suppressWarnings(as.numeric(z))
@@ -8249,8 +8255,8 @@ digraph stationarity_diff_workflow {
       if (p[1] < .001) "p < .001" else paste0("p = ", sub("^0\\.", ".", sprintf("%.3f", p[1])))
     }
     
-    # safe lag choice for ADF
-    k_adf <- max(0, min(12, floor((length(x) - 1)^(1/3))))
+    # safe lag choice for ADF (avoid arbitrary cap that can change results for longer series)
+    k_adf <- max(0, trunc((length(x) - 1)^(1/3)))
     
     adf <- tryCatch(tseries::adf.test(x, k = k_adf), error = function(e) NULL)
     pp  <- tryCatch(tseries::pp.test(x, lshort = TRUE), error = function(e) NULL)
@@ -8315,31 +8321,36 @@ digraph stationarity_diff_workflow {
     
     st_df <- do.call(rbind, rows)
     
-    # synthesis
+    # synthesis (use BOTH KPSS tests; avoid overly-permissive unit-root rejection)
     adf_p <- if (!is.null(adf)) adf$p.value else NA_real_
     pp_p  <- if (!is.null(pp))  pp$p.value  else NA_real_
     kL_p  <- if (!is.null(kpss_level)) kpss_level$p.value else NA_real_
+    kT_p  <- if (!is.null(kpss_trend)) kpss_trend$p.value else NA_real_
     
-    unit_root_rejected <- any(c(adf_p, pp_p) < 0.05, na.rm = TRUE)
-    kpss_ok <- is.finite(kL_p) && kL_p >= 0.05
+    unit_root_rejected <- if (is.finite(adf_p) && is.finite(pp_p)) {
+      (adf_p < 0.05) && (pp_p < 0.05)
+    } else {
+      any(c(adf_p, pp_p) < 0.05, na.rm = TRUE)
+    }
     
-   
+    # accept stationarity if either level-stationarity OR trend-stationarity is plausible
+    kpss_ok <- if (is.finite(kL_p) && is.finite(kT_p)) {
+      (kL_p >= 0.05) || (kT_p >= 0.05)
+    } else {
+      any(c(kL_p, kT_p) >= 0.05, na.rm = TRUE)
+    }
     
     conclusion <- if (unit_root_rejected && kpss_ok) {
       paste0(
         "<b>Conclusion (joint evidence at α = .05): Stationarity supported.</b><br><br>",
-        
         "<b>What the tests indicate:</b>",
         "<ul style='margin-top:6px; margin-bottom:6px; padding-left:18px; list-style-type:square;'>",
-        "<li>At least one unit-root test (ADF and/or PP) rejects the unit-root null (p &lt; .05), arguing against stochastic trend persistence.</li>",
-        "<li>KPSS(Level) does not reject its null of level stationarity (p ≥ .05), providing corroboration from a test with the opposite null.</li>",
+        "<li>Unit-root tests (ADF/PP) provide evidence against a unit root (p &lt; .05).</li>",
+        "<li>At least one KPSS null (level- or trend-stationarity) is not rejected (p ≥ .05), corroborating a stationary-type structure.</li>",
         "</ul>",
-        
-        "<b>Interpretation:</b> Taken together, this concordant pattern is consistent with a stationary series on the current scale, ",
-        "so further differencing is not suggested by these diagnostics.<br><br>",
-        
+        "<b>Interpretation:</b> Taken together, this pattern is consistent with a stationary (or trend-stationary) series on the current scale, ",
+        "so additional differencing is not suggested by these diagnostics alone.<br><br>",
         "<b>Implication for SARIMA workflow:</b> Proceed to AR/MA and seasonal AR/MA order identification, and confirm adequacy using residual whiteness (e.g., Ljung–Box) and holdout forecast performance.<br><br>",
-        
         "<b>ACTIONABLE NEXT STEPS (What to do now):</b>",
         "<ol style='margin-top:6px; margin-bottom:0; padding-left:18px;'>",
         "<li>Keep differencing as-is (do not increase d or D based on these tests).</li>",
@@ -8352,17 +8363,13 @@ digraph stationarity_diff_workflow {
     } else if (!unit_root_rejected && !kpss_ok) {
       paste0(
         "<b>Conclusion (joint evidence at α = .05): Non-stationarity supported.</b><br><br>",
-        
         "<b>What the tests indicate:</b>",
         "<ul style='margin-top:6px; margin-bottom:6px; padding-left:18px; list-style-type:square;'>",
         "<li>ADF/PP do not reject the unit-root null (p ≥ .05), so stochastic non-stationarity remains plausible.</li>",
-        "<li>KPSS(Level) rejects level stationarity (p &lt; .05), independently supporting instability in the level (mean).</li>",
+        "<li>Both KPSS tests reject their stationarity nulls (p &lt; .05), supporting instability in level and/or trend.</li>",
         "</ul>",
-        
-        "<b>Interpretation:</b> This agreement across tests with opposing null hypotheses provides strong evidence that the working series is not yet stationary.<br><br>",
-        
-        "<b>Implication for SARIMA workflow:</b> Apply additional differencing (typically start with non-seasonal d = 1; consider seasonal D = 1 if persistence is concentrated at seasonal multiples), then reassess stationarity and continue identification on the differenced series.<br><br>",
-        
+        "<b>Interpretation:</b> This agreement across tests with opposing null hypotheses supports that the working series is not yet stationary.<br><br>",
+        "<b>Implication for SARIMA workflow:</b> Apply additional differencing (start with non-seasonal d = 1; consider seasonal D = 1 if persistence is concentrated at seasonal multiples), then reassess stationarity and continue identification on the differenced series.<br><br>",
         "<b>ACTIONABLE NEXT STEPS (What to do now):</b>",
         "<ol style='margin-top:6px; margin-bottom:0; padding-left:18px;'>",
         "<li>Increase differencing in a controlled way: first test non-seasonal differencing (d = 1) if not already applied.</li>",
@@ -8375,17 +8382,13 @@ digraph stationarity_diff_workflow {
     } else if (unit_root_rejected && !kpss_ok) {
       paste0(
         "<b>Conclusion (joint evidence at α = .05): Mixed evidence (interpret with caution).</b><br><br>",
-        
         "<b>What the tests indicate:</b>",
         "<ul style='margin-top:6px; margin-bottom:6px; padding-left:18px; list-style-type:square;'>",
         "<li>ADF/PP reject the unit-root null (p &lt; .05), suggesting stationarity from the unit-root perspective.</li>",
-        "<li>KPSS(Level) rejects level stationarity (p &lt; .05), indicating evidence against a stable mean from the opposite-null perspective.</li>",
+        "<li>KPSS rejects both stationarity nulls (p &lt; .05), indicating evidence against stable level/trend stationarity.</li>",
         "</ul>",
-        
         "<b>Interpretation:</b> Conflicts like this can occur under structural breaks, strong seasonality, near-unit-root dynamics, or finite-sample sensitivity.<br><br>",
-        
-        "<b>Implication for SARIMA workflow:</b> Do not rely on tests alone. Triangulate with time plots and ACF/PACF decay, and compare nearby differencing choices. Prefer the simplest specification that yields approximately white-noise residuals and stable out-of-sample forecasting.<br><br>",
-        
+        "<b>Implication for SARIMA workflow:</b> Triangulate with time plots and ACF/PACF decay, and compare nearby differencing choices. Prefer the simplest specification that yields approximately white-noise residuals and stable out-of-sample forecasting.<br><br>",
         "<b>ACTIONABLE NEXT STEPS (What to do now):</b>",
         "<ol style='margin-top:6px; margin-bottom:0; padding-left:18px;'>",
         "<li>Inspect the time-series plot for level shifts/breaks and verify that the seasonal period and seasonal structure are correctly specified.</li>",
@@ -8398,17 +8401,13 @@ digraph stationarity_diff_workflow {
     } else {
       paste0(
         "<b>Conclusion (joint evidence at α = .05): Inconclusive evidence.</b><br><br>",
-        
         "<b>What the tests indicate:</b>",
         "<ul style='margin-top:6px; margin-bottom:6px; padding-left:18px; list-style-type:square;'>",
         "<li>ADF/PP do not reject a unit root (p ≥ .05), so non-stationarity cannot be ruled out.</li>",
-        "<li>KPSS(Level) also does not reject stationarity (p ≥ .05), so stationarity remains plausible.</li>",
+        "<li>At least one KPSS test does not reject stationarity (p ≥ .05), so stationarity (level or trend) remains plausible.</li>",
         "</ul>",
-        
         "<b>Interpretation:</b> This pattern is common in finite samples or when the process is close to the unit-root boundary, where test power is limited.<br><br>",
-        
         "<b>Implication for SARIMA workflow:</b> Complement these tests with differencing diagnostics and ACF/PACF behavior, and compare nearby settings (e.g., d = 0 vs d = 1, and D = 0 vs D = 1 when seasonality is present). Select the simplest configuration that yields stable plots, improved residual whiteness, and satisfactory holdout forecast accuracy.<br><br>",
-        
         "<b>ACTIONABLE NEXT STEPS (What to do now):</b>",
         "<ol style='margin-top:6px; margin-bottom:0; padding-left:18px;'>",
         "<li>Compare nearby differencing choices (d = 0 vs d = 1; and D = 0 vs D = 1 if seasonality is present) rather than making large jumps.</li>",
@@ -8418,10 +8417,6 @@ digraph stationarity_diff_workflow {
         "</ol>"
       )
     }
-    
-    
-    
-    
     
     # ---- Detailed academic paragraph (uses actual results) ----
     n_train <- length(x)
@@ -8446,16 +8441,12 @@ digraph stationarity_diff_workflow {
              ", ", fmt_p(kpss_trend$p.value), ". ")
     } else "KPSS(Trend) was not available. "
     
-  
-    
     academic_paragraph <- paste0(
-      "Stationarity was assessed on the training portion (n = ", n_train, 
+      "Stationarity was assessed on the training portion (n = ", n_train,
       ") because SARIMA identification and inference assume that, after any transformation and differencing, the series has a stable mean and autocovariance structure.",
       "<br>",
-      
       "We applied two unit-root tests (ADF and Phillips-Perron), where H0 is a unit root (non-stationarity), and two KPSS tests, where H0 is stationarity (level- or trend-stationary).",
       "<br>",
-      
       "<ul style='margin-top:0; margin-bottom:0; padding-left:18px; list-style-type:square;'>",
       "<li>", adf_line, "</li>",
       "<li>", pp_line, "</li>",
@@ -8463,17 +8454,12 @@ digraph stationarity_diff_workflow {
       "<li>", kpssT_line, "</li>",
       "</ul>",
       "<br>",
-      
-      "Interpreting these jointly is important for teaching: when ADF/PP reject H0 while KPSS(Level) fails to reject, the evidence supports stationarity and suggests using minimal differencing (d = 0, and D = 0 unless seasonal non-stationarity is present).",
+      "Interpreting these jointly is important for teaching: when ADF/PP reject H0 while KPSS(Level) or KPSS(Trend) fails to reject, the evidence supports a stationary-type structure and suggests using minimal differencing (d = 0, and D = 0 unless seasonal non-stationarity is present).",
       "<br>",
-      
-      "When ADF/PP fail to reject and KPSS(Level) rejects, the evidence supports non-stationarity and motivates differencing (typically start with d = 1, and consider D = 1 if seasonal persistence at lag s is strong).",
+      "When ADF/PP fail to reject and KPSS tests reject, the evidence supports non-stationarity and motivates differencing (typically start with d = 1, and consider D = 1 if seasonal persistence at lag s is strong).",
       "<br>",
-      
       "Mixed outcomes can arise from structural breaks, near-unit-root behavior, or limited power, so students should triangulate with time plots, ACF/PACF decay patterns, and ultimately residual whiteness after fitting."
     )
-    
-    
     
     # table renderer (HTML)
     html_tbl <- tags$table(
@@ -8489,19 +8475,12 @@ digraph stationarity_diff_workflow {
     tagList(
       html_tbl,
       
-      # tags$div(class = "callout callout-blue",
-      #          tags$h5("Explicit stationarity conclusion (ADF / PP / KPSS by result)"),
-      #          tags$p(HTML(stationarity_explicit_conclusion))),
-      
-      
       callout(
         academic_paragraph,
         title = "Academic interpretation.",
         theme = "blue",
         body_is_html = TRUE
       ),
-      
-      # tags$p(tags$b("Academic interpretation. "), HTML(academic_paragraph)),
       
       tags$br(),
       
@@ -8510,12 +8489,9 @@ digraph stationarity_diff_workflow {
         title = "Conclusion. ",
         theme = "orange",
         body_is_html = TRUE
-      ),
-      
-      # tags$p(tags$b("Conclusion. "), conclusion)
+      )
     )
-  })
-  
+  })  
   
   
   
